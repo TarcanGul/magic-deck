@@ -5,7 +5,7 @@ import type { NexusEntity } from '@audiotool/nexus/document'
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
 const REDIRECT_URL = 'http://127.0.0.1:5173/'
-const SCOPE = 'project:write'
+const SCOPE = 'project:write sample:write'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface MidiNote { pitch: number; startTime: number; endTime: number; velocity: number }
@@ -119,6 +119,29 @@ async function disconnectAll() {
 }
 
 // ── PROJECT ───────────────────────────────────────────────────────────────────
+async function createNewProject() {
+  if (!at) { setStatus('error', 'NOT LOGGED IN'); return }
+  const name = prompt('Project name?', 'My DJ Set')
+  if (!name) return
+  setStatus('connecting', `CREATING PROJECT "${name}"…`)
+  try {
+    const response = await at.projects.createProject({
+      project: { displayName: name, description: 'Created from NEXUS DJ' },
+    })
+    if (response instanceof Error) throw response
+    const project = response.project
+    if (!project) throw new Error('No project returned')
+
+    const uuid = project.name.replace(/^projects\//, '')
+    const url = `https://beta.audiotool.com/studio?project=${uuid}`
+    inputProjectUrl.value = url
+    localStorage.setItem('nexus_project_url', url)
+    setStatus('connected', `PROJECT "${name}" CREATED — CLICK CONNECT PROJECT`)
+  } catch (e: unknown) {
+    setStatus('error', `CREATE FAILED: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
 async function connectProject() {
   if (!at) { setStatus('error', 'NOT LOGGED IN'); return }
   const projectUrl = inputProjectUrl.value.trim()
@@ -324,6 +347,7 @@ function initApp() {
   projectUrlRow.style.display = 'none'
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
+  el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()
 
   setupDropZone('drop-1', 0)
   setupDropZone('drop-2', 1)
