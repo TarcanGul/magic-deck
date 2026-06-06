@@ -1,0 +1,125 @@
+"""
+Magenta RT2 FastAPI Server
+--------------------------
+Endpoints:
+  POST /generate  — generate audio from audio file + text prompt
+  GET  /health    — health check
+"""
+
+import io
+import math
+import tempfile
+import os
+import numpy as np
+
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
+import uvicorn
+
+# Magenta imports
+from magenta_rt import audio, musiccoca
+from magenta_rt.mlx import system
+
+# ---------------------------------------------------------------------------
+# App & model initialisation
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Magenta RT2 API", version="1.0.0")
+
+print("Loading MusicCoCa style model...")
+style_model = musiccoca.MusicCoCa()
+
+print("Loading MagentaRT2SystemMlxfn (mrt2_small)...")
+mrt = system.MagentaRT2SystemMlxfn(size="mrt2_small")
+
+print("Models loaded. Server ready.")
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "mrt2_small"}
+
+
+@app.post("/generate")
+async def generate(
+    audio_file: UploadFile = File(..., description="Reference audio file (WAV, 48kHz preferred)"),
+    prompt: str = Form(..., description="Text style prompt e.g. 'dark trap 808s'"),
+    audio_weight: float = Form(2.0, description="Weight for audio prompt (default 2.0)"),
+    text_weight: float = Form(1.0, description="Weight for text prompt (default 1.0)"),
+    duration_seconds: float = Form(10.0, description="Output duration in seconds (default 10.0)"),
+):
+    """
+    Generate music blending an uploaded audio file with a text prompt.
+    Returns a WAV file.
+    """
+
+    # --- Validate duration ---
+    if duration_seconds <= 0 or duration_seconds > 120:
+        raise HTTPException(status_code=400, detail="duration_seconds must be between 1 and 120.")
+
+    # --- Save uploaded file to temp ---
+    suffix = os.path.splitext(audio_file.filename)[-1] or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await audio_file.read())
+        tmp_path = tmp.name
+
+    try:
+        # --- Load audio ---
+        try:
+            my_audio = audio.Waveform.from_file(tmp_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read audio file: {e}")
+
+        # --- Blend styles ---
+        weighted_styles = [
+            (audio_weight, my_audio),
+            (text_weight, prompt),
+        ]
+        weights = np.array([w for w, _ in weighted_styles])
+        styles = style_model.embed([s for _, s in weighted_styles])
+        weights_norm = weights / weights.sum()
+        blended_style = (weights_norm[:, np.newaxis] * styles).mean(axis=0).astype(np.float32)
+
+        # --- Generate chunks ---
+        # Each call to mrt.generate() produces ~2 seconds (25 frames)
+        frames_per_chunk = 25
+        seconds_per_chunk = 2.0
+        num_chunks = math.ceil(duration_seconds / seconds_per_chunk)
+
+        chunks = []
+        state = None
+        for _ in range(num_chunks):
+            chunk, state = mrt.generate(
+                style=blended_style,
+                state=state,
+                frames=frames_per_chunk,
+            )
+            chunks.append(chunk)
+
+        # --- Concatenate & return as WAV bytes ---
+        output_waveform = audio.concatenate(chunks)
+
+        buf = io.BytesIO()
+        output_waveform.write(buf)
+        buf.seek(0)
+
+        filename = f"magenta_{prompt[:30].replace(' ', '_')}.wav"
+        return StreamingResponse(
+            buf,
+            media_type="audio/wav",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    finally:
+        os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    uvicorn.run("magenta_server:app", host="0.0.0.0", port=8000, reload=False)
