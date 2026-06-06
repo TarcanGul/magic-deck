@@ -101,6 +101,112 @@ html, body {
 }
 
 /* ============================
+   PROJECT CREATION
+   ============================ */
+.project-screen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  background:
+    linear-gradient(180deg, rgba(204, 0, 0, 0.08), transparent 35%),
+    var(--black);
+  overflow-y: auto;
+}
+
+.project-form {
+  width: min(560px, 100%);
+  border: 1px solid var(--red-dim);
+  border-left: 2px solid var(--red);
+  background: var(--grey);
+  box-shadow: 0 0 30px var(--red-glow2);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.project-kicker {
+  font-family: var(--font-data);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--red);
+}
+
+.project-form h1 {
+  font-family: var(--font-header);
+  font-size: 42px;
+  line-height: 1;
+  letter-spacing: 4px;
+  color: var(--white);
+  font-weight: 400;
+}
+
+.project-copy {
+  font-family: var(--font-live);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--grey-text);
+}
+
+.project-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.project-field label {
+  font-family: var(--font-data);
+  font-size: 10px;
+  color: var(--grey-text);
+  letter-spacing: 1px;
+}
+
+.project-field label span {
+  color: var(--red-dim);
+}
+
+.project-input {
+  width: 100%;
+  background: var(--black);
+  border: 1px solid var(--grey-light);
+  color: var(--white);
+  font-family: var(--font-data);
+  font-size: 13px;
+  padding: 10px 12px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.project-input:focus {
+  border-color: var(--red);
+  box-shadow: 0 0 8px var(--red-glow2);
+}
+
+.project-textarea {
+  resize: vertical;
+  min-height: 92px;
+}
+
+.project-error {
+  min-height: 14px;
+  font-family: var(--font-live);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--red);
+}
+
+.project-submit {
+  align-self: flex-start;
+  margin-top: 4px;
+}
+
+.is-hidden {
+  display: none !important;
+}
+
+/* ============================
    CONNECTION PANEL
    ============================ */
 #connection-panel {

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/src/style.css">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div id="app">
@@ -20,6 +20,28 @@
       </div>
       <div id="status-user"></div>
     </div>
+
+    <!-- PROJECT CREATION -->
+    <section id="project-create-screen" class="project-screen" aria-labelledby="project-create-title">
+      <form id="project-create-form" class="project-form" novalidate>
+        <div class="project-kicker">AUDIOTOOL API</div>
+        <h1 id="project-create-title">Create a New Project</h1>
+        <p class="project-copy">Start a Nexus session for an Audiotool DAW project. Project details are saved for the next step, then authorization continues through Audiotool.</p>
+
+        <div class="project-field">
+          <label for="project-name">PROJECT NAME</label>
+          <input type="text" id="project-name" class="project-input" autocomplete="off" placeholder="Magic Deck Session" />
+          <div id="project-name-error" class="project-error" aria-live="polite"></div>
+        </div>
+
+        <div class="project-field">
+          <label for="project-description">DESCRIPTION <span>OPTIONAL</span></label>
+          <textarea id="project-description" class="project-input project-textarea" rows="4" placeholder="Notes, set intent, or DAW setup details"></textarea>
+        </div>
+
+        <button type="submit" id="btn-create-project" class="btn-primary project-submit">⬡ CONTINUE WITH AUDIOTOOL</button>
+      </form>
+    </section>
 
     <!-- CONNECTION PANEL -->
     <div id="connection-panel">
@@ -182,6 +204,6 @@
 
     </div>
   </div>
-  <script type="module" src="/src/main.ts"></script>
+  <script type="module" src="/main.ts"></script>
 </body>
 </html>

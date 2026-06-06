@@ -24,11 +24,18 @@ interface DeckState {
   fileName: string | null
 }
 
+interface ProjectDraft {
+  name: string
+  description: string
+}
+
 // ─── App State ────────────────────────────────────────────────────────────────
 
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
 let magicGainEntity: NexusEntity<'tinyGain'> | null = null
+let projectDraft: ProjectDraft | null = null
+let projectFlowComplete = false
 
 const decks: [DeckState, DeckState] = [
   { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
@@ -44,6 +51,14 @@ const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as 
 const statusDot = $<HTMLSpanElement>('status-dot')
 const statusText = $<HTMLSpanElement>('status-text')
 const statusUser = $<HTMLDivElement>('status-user')
+const projectCreateScreen = $<HTMLElement>('project-create-screen')
+const projectCreateForm = $<HTMLFormElement>('project-create-form')
+const projectNameInput = $<HTMLInputElement>('project-name')
+const projectDescriptionInput = $<HTMLTextAreaElement>('project-description')
+const projectNameError = $<HTMLDivElement>('project-name-error')
+const btnCreateProject = $<HTMLButtonElement>('btn-create-project')
+const connectionPanel = $<HTMLDivElement>('connection-panel')
+const decksContainer = $<HTMLDivElement>('decks-container')
 const btnLogin = $<HTMLButtonElement>('btn-login')
 const btnConnect = $<HTMLButtonElement>('btn-connect')
 const btnDisconnect = $<HTMLButtonElement>('btn-disconnect')
@@ -77,8 +92,59 @@ function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done', label: 
 // ─── OAuth / Connection ───────────────────────────────────────────────────────
 
 const HARDCODED_CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
+const PROJECT_DRAFT_KEY = 'nexus_project_draft'
+const PROJECT_FLOW_COMPLETE_KEY = 'nexus_project_flow_complete'
 
-async function initAuth() {
+function showProjectCreateView() {
+  projectCreateScreen.classList.remove('is-hidden')
+  connectionPanel.classList.add('is-hidden')
+  decksContainer.classList.add('is-hidden')
+}
+
+function showDeckView() {
+  projectCreateScreen.classList.add('is-hidden')
+  connectionPanel.classList.remove('is-hidden')
+  decksContainer.classList.remove('is-hidden')
+}
+
+function saveProjectDraft(draft: ProjectDraft) {
+  projectDraft = draft
+  localStorage.setItem(PROJECT_DRAFT_KEY, JSON.stringify(draft))
+}
+
+function restoreProjectDraft() {
+  const savedDraft = localStorage.getItem(PROJECT_DRAFT_KEY)
+  if (savedDraft) {
+    try {
+      projectDraft = JSON.parse(savedDraft) as ProjectDraft
+      projectNameInput.value = projectDraft.name
+      projectDescriptionInput.value = projectDraft.description
+    } catch (_) {
+      localStorage.removeItem(PROJECT_DRAFT_KEY)
+    }
+  }
+  projectFlowComplete = localStorage.getItem(PROJECT_FLOW_COMPLETE_KEY) === 'true'
+}
+
+async function handleProjectCreateSubmit(e: SubmitEvent) {
+  e.preventDefault()
+
+  const name = projectNameInput.value.trim()
+  const description = projectDescriptionInput.value.trim()
+  if (!name) {
+    projectNameError.textContent = 'PROJECT NAME IS REQUIRED'
+    projectNameInput.focus()
+    return
+  }
+
+  projectNameError.textContent = ''
+  saveProjectDraft({ name, description })
+  btnCreateProject.disabled = true
+  setStatus('connecting', 'AUTHORIZING WITH AUDIOTOOL…')
+  await initAuth({ redirectIfNeeded: true })
+}
+
+async function initAuth(options: { redirectIfNeeded?: boolean } = {}) {
   const clientId = inputClientId.value.trim() || HARDCODED_CLIENT_ID
   inputClientId.value = clientId
 
@@ -94,17 +160,25 @@ async function initAuth() {
 
     if (result.status === 'authenticated') {
       at = result
+      projectFlowComplete = true
+      localStorage.setItem(PROJECT_FLOW_COMPLETE_KEY, 'true')
       statusUser.textContent = result.userName.toUpperCase()
       setStatus('connected', `AUTHENTICATED AS ${result.userName.toUpperCase()}`)
+      showDeckView()
       btnConnect.disabled = false
       btnDisconnect.disabled = false
     } else {
       // Not yet authenticated — wire the login button to trigger redirect
       btnLogin.disabled = false
+      btnCreateProject.disabled = false
       if (result.error) {
         setStatus('error', `AUTH ERROR: ${result.error.message}`)
       } else {
         setStatus('idle', 'CLICK LOGIN TO AUTHENTICATE')
+        if (options.redirectIfNeeded) {
+          result.login()
+          return
+        }
         // Override: clicking login now does the actual redirect
         btnLogin.onclick = () => {
           result.login()
@@ -113,6 +187,7 @@ async function initAuth() {
     }
   } catch (e: unknown) {
     btnLogin.disabled = false
+    btnCreateProject.disabled = false
     const msg = e instanceof Error ? e.message : String(e)
     setStatus('error', `AUTH FAILED: ${msg}`)
   }
@@ -161,10 +236,13 @@ async function disconnect() {
     at = null
   }
   magicGainEntity = null
+  projectFlowComplete = false
+  localStorage.removeItem(PROJECT_FLOW_COMPLETE_KEY)
   statusUser.textContent = ''
   setStatus('idle', 'DISCONNECTED')
+  showProjectCreateView()
   btnLogin.disabled = false
-  btnLogin.onclick = initAuth
+  btnLogin.onclick = () => { initAuth() }
   btnConnect.disabled = true
   btnDisconnect.disabled = true
 }
@@ -452,9 +530,13 @@ function initApp() {
   window.addEventListener('drop', (e) => e.preventDefault())
 
   // Wire buttons
-  btnLogin.addEventListener('click', initAuth)
+  btnLogin.addEventListener('click', () => { initAuth() })
   btnConnect.addEventListener('click', connectProject)
   btnDisconnect.addEventListener('click', disconnect)
+  projectCreateForm.addEventListener('submit', handleProjectCreateSubmit)
+  projectNameInput.addEventListener('input', () => {
+    if (projectNameInput.value.trim()) projectNameError.textContent = ''
+  })
 
   setupDropZone('drop-1', 0)
   setupDropZone('drop-2', 1)
@@ -480,12 +562,18 @@ function initApp() {
   if (savedProject) inputProjectUrl.value = savedProject
   inputClientId.addEventListener('input', () => localStorage.setItem('nexus_client_id', inputClientId.value))
   inputProjectUrl.addEventListener('input', () => localStorage.setItem('nexus_project_url', inputProjectUrl.value))
+  restoreProjectDraft()
 
   // If returning from OAuth redirect, complete the auth flow automatically
   if (window.location.search.includes('code=') || window.location.hash.includes('access_token')) {
+    showDeckView()
+    initAuth()
+  } else if (projectFlowComplete) {
+    showDeckView()
     initAuth()
   } else {
-    setStatus('idle', 'ENTER CLIENT ID AND CLICK LOGIN')
+    showProjectCreateView()
+    setStatus('idle', 'CREATE A PROJECT TO BEGIN')
   }
 }
 
