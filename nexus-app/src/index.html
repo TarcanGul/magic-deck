@@ -16,45 +16,22 @@
       <div id="status-logo">NEXUS<span class="red">///</span>DJ</div>
       <div id="status-messages">
         <span id="status-dot" class="dot idle"></span>
-        <span id="status-text">OFFLINE — CONNECT TO BEGIN</span>
+        <span id="status-text">LOADING…</span>
       </div>
       <div id="status-user"></div>
     </div>
 
-    <!-- PROJECT CREATION -->
-    <section id="project-create-screen" class="project-screen" aria-labelledby="project-create-title">
-      <form id="project-create-form" class="project-form" novalidate>
-        <div class="project-kicker">AUDIOTOOL API</div>
-        <h1 id="project-create-title">Create a New Project</h1>
-        <p class="project-copy">Start a Nexus session for an Audiotool DAW project. Project details are saved for the next step, then authorization continues through Audiotool.</p>
-
-        <div class="project-field">
-          <label for="project-name">PROJECT NAME</label>
-          <input type="text" id="project-name" class="project-input" autocomplete="off" placeholder="Magic Deck Session" />
-          <div id="project-name-error" class="project-error" aria-live="polite"></div>
-        </div>
-
-        <div class="project-field">
-          <label for="project-description">DESCRIPTION <span>OPTIONAL</span></label>
-          <textarea id="project-description" class="project-input project-textarea" rows="4" placeholder="Notes, set intent, or DAW setup details"></textarea>
-        </div>
-
-        <button type="submit" id="btn-create-project" class="btn-primary project-submit">⬡ CONTINUE WITH AUDIOTOOL</button>
-      </form>
-    </section>
-
     <!-- CONNECTION PANEL -->
     <div id="connection-panel">
-      <div class="conn-row">
-        <label class="conn-label">CLIENT ID</label>
-        <input type="text" id="input-client-id" class="conn-input" placeholder="your-client-id" />
-      </div>
-      <div class="conn-row">
+      <!-- Project URL only shown after login -->
+      <div class="conn-row" id="project-url-row" style="display:none">
         <label class="conn-label">PROJECT URL</label>
         <input type="text" id="input-project-url" class="conn-input" placeholder="https://beta.audiotool.com/studio?project=..." />
       </div>
+      <!-- Hidden inputs still in DOM for JS refs -->
+      <input type="hidden" id="input-client-id" value="fa370480-13d6-4cba-8015-f9297a81e9e8">
       <div class="conn-actions">
-        <button id="btn-login" class="btn-primary">⬡ LOGIN</button>
+        <button id="btn-login" class="btn-primary" disabled>⬡ LOGIN WITH AUDIOTOOL</button>
         <button id="btn-connect" class="btn-primary" disabled>⬡ CONNECT PROJECT</button>
         <button id="btn-disconnect" class="btn-danger" disabled>⬡ DISCONNECT</button>
       </div>
@@ -71,7 +48,7 @@
           <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
         </div>
         <div class="deck-body">
-          <div class="drop-zone" id="drop-1" data-deck="1">
+          <div class="drop-zone" id="drop-1">
             <div class="drop-inner">
               <div class="drop-icon">▼</div>
               <div class="drop-text">DROP MP3 / WAV</div>
@@ -83,7 +60,7 @@
             <button class="t-btn" id="d1-play">▶</button>
             <button class="t-btn" id="d1-pause">⏸</button>
             <button class="t-btn" id="d1-stop">■</button>
-            <button class="t-btn loop-btn" id="d1-loop" title="Loop">⟲</button>
+            <button class="t-btn loop-btn" id="d1-loop">⟲</button>
             <div class="pitch-display">
               <span class="pitch-label">PITCH</span>
               <span class="pitch-value" id="d1-pitch">+0.0</span>
@@ -98,18 +75,9 @@
               <div class="fader-val" id="d1-vol-val">80</div>
             </div>
             <div class="eq-section">
-              <div class="eq-knob-wrap">
-                <canvas class="eq-knob" id="d1-hi" width="56" height="56" data-label="HI" data-value="0.5"></canvas>
-                <span class="eq-label">HI</span>
-              </div>
-              <div class="eq-knob-wrap">
-                <canvas class="eq-knob" id="d1-mid" width="56" height="56" data-label="MID" data-value="0.5"></canvas>
-                <span class="eq-label">MID</span>
-              </div>
-              <div class="eq-knob-wrap">
-                <canvas class="eq-knob" id="d1-low" width="56" height="56" data-label="LOW" data-value="0.5"></canvas>
-                <span class="eq-label">LOW</span>
-              </div>
+              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
             </div>
           </div>
         </div>
@@ -123,7 +91,7 @@
           <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
         </div>
         <div class="deck-body">
-          <div class="drop-zone" id="drop-2" data-deck="2">
+          <div class="drop-zone" id="drop-2">
             <div class="drop-inner">
               <div class="drop-icon">▼</div>
               <div class="drop-text">DROP MP3 / WAV</div>
@@ -135,7 +103,7 @@
             <button class="t-btn" id="d2-play">▶</button>
             <button class="t-btn" id="d2-pause">⏸</button>
             <button class="t-btn" id="d2-stop">■</button>
-            <button class="t-btn loop-btn" id="d2-loop" title="Loop">⟲</button>
+            <button class="t-btn loop-btn" id="d2-loop">⟲</button>
             <div class="pitch-display">
               <span class="pitch-label">PITCH</span>
               <span class="pitch-value" id="d2-pitch">+0.0</span>
@@ -150,18 +118,9 @@
               <div class="fader-val" id="d2-vol-val">80</div>
             </div>
             <div class="eq-section">
-              <div class="eq-knob-wrap">
-                <canvas class="eq-knob" id="d2-hi" width="56" height="56" data-label="HI" data-value="0.5"></canvas>
-                <span class="eq-label">HI</span>
-              </div>
-              <div class="eq-knob-wrap">
-                <canvas class="eq-knob" id="d2-mid" width="56" height="56" data-label="MID" data-value="0.5"></canvas>
-                <span class="eq-label">MID</span>
-              </div>
-              <div class="eq-knob-wrap">
-                <canvas class="eq-knob" id="d2-low" width="56" height="56" data-label="LOW" data-value="0.5"></canvas>
-                <span class="eq-label">LOW</span>
-              </div>
+              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
             </div>
           </div>
         </div>

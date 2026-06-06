@@ -6,6 +6,6 @@ export default defineConfig({
     port: 5173,
   },
   optimizeDeps: {
-    exclude: ['@audiotool/nexus']
-  }
+    include: ['toposort'],
+  },
 })
