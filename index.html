@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NEXUS — DJ PERFORMANCE SYSTEM</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- STATUS BAR -->
+    <div id="status-bar">
+      <div id="status-logo">NEXUS<span class="red">///</span>DJ</div>
+      <div id="status-messages">
+        <span id="status-dot" class="dot idle"></span>
+        <span id="status-text">OFFLINE — CONNECT TO BEGIN</span>
+      </div>
+      <div id="status-user"></div>
+    </div>
+
+    <!-- CONNECTION PANEL -->
+    <div id="connection-panel">
+      <div class="conn-row">
+        <label class="conn-label">CLIENT ID</label>
+        <input type="text" id="input-client-id" class="conn-input" placeholder="your-client-id" />
+      </div>
+      <div class="conn-row">
+        <label class="conn-label">PROJECT URL</label>
+        <input type="text" id="input-project-url" class="conn-input" placeholder="https://beta.audiotool.com/studio?project=..." />
+      </div>
+      <div class="conn-actions">
+        <button id="btn-login" class="btn-primary">⬡ LOGIN</button>
+        <button id="btn-connect" class="btn-primary" disabled>⬡ CONNECT PROJECT</button>
+        <button id="btn-disconnect" class="btn-danger" disabled>⬡ DISCONNECT</button>
+      </div>
+    </div>
+
+    <!-- DECKS CONTAINER -->
+    <div id="decks-container">
+
+      <!-- DECK 1 -->
+      <div class="deck" id="deck-1">
+        <div class="deck-header">
+          <span class="deck-num">01</span>
+          <span class="deck-title">DECK A — PLAYER</span>
+          <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
+        </div>
+        <div class="deck-body">
+          <div class="drop-zone" id="drop-1" data-deck="1">
+            <div class="drop-inner">
+              <div class="drop-icon">▼</div>
+              <div class="drop-text">DROP MP3 / WAV</div>
+              <div class="drop-filename" id="drop1-filename"></div>
+            </div>
+          </div>
+          <canvas class="waveform" id="waveform-1" width="600" height="80"></canvas>
+          <div class="transport">
+            <button class="t-btn" id="d1-play">▶</button>
+            <button class="t-btn" id="d1-pause">⏸</button>
+            <button class="t-btn" id="d1-stop">■</button>
+            <button class="t-btn loop-btn" id="d1-loop" title="Loop">⟲</button>
+            <div class="pitch-display">
+              <span class="pitch-label">PITCH</span>
+              <span class="pitch-value" id="d1-pitch">+0.0</span>
+            </div>
+          </div>
+          <div class="controls-row">
+            <div class="fader-section">
+              <div class="fader-label">VOL</div>
+              <div class="fader-wrap">
+                <input type="range" class="v-fader" id="d1-vol" min="0" max="1" step="0.01" value="0.8" orient="vertical">
+              </div>
+              <div class="fader-val" id="d1-vol-val">80</div>
+            </div>
+            <div class="eq-section">
+              <div class="eq-knob-wrap">
+                <canvas class="eq-knob" id="d1-hi" width="56" height="56" data-label="HI" data-value="0.5"></canvas>
+                <span class="eq-label">HI</span>
+              </div>
+              <div class="eq-knob-wrap">
+                <canvas class="eq-knob" id="d1-mid" width="56" height="56" data-label="MID" data-value="0.5"></canvas>
+                <span class="eq-label">MID</span>
+              </div>
+              <div class="eq-knob-wrap">
+                <canvas class="eq-knob" id="d1-low" width="56" height="56" data-label="LOW" data-value="0.5"></canvas>
+                <span class="eq-label">LOW</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- DECK 2 -->
+      <div class="deck" id="deck-2">
+        <div class="deck-header">
+          <span class="deck-num">02</span>
+          <span class="deck-title">DECK B — PLAYER</span>
+          <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
+        </div>
+        <div class="deck-body">
+          <div class="drop-zone" id="drop-2" data-deck="2">
+            <div class="drop-inner">
+              <div class="drop-icon">▼</div>
+              <div class="drop-text">DROP MP3 / WAV</div>
+              <div class="drop-filename" id="drop2-filename"></div>
+            </div>
+          </div>
+          <canvas class="waveform" id="waveform-2" width="600" height="80"></canvas>
+          <div class="transport">
+            <button class="t-btn" id="d2-play">▶</button>
+            <button class="t-btn" id="d2-pause">⏸</button>
+            <button class="t-btn" id="d2-stop">■</button>
+            <button class="t-btn loop-btn" id="d2-loop" title="Loop">⟲</button>
+            <div class="pitch-display">
+              <span class="pitch-label">PITCH</span>
+              <span class="pitch-value" id="d2-pitch">+0.0</span>
+            </div>
+          </div>
+          <div class="controls-row">
+            <div class="fader-section">
+              <div class="fader-label">VOL</div>
+              <div class="fader-wrap">
+                <input type="range" class="v-fader" id="d2-vol" min="0" max="1" step="0.01" value="0.8" orient="vertical">
+              </div>
+              <div class="fader-val" id="d2-vol-val">80</div>
+            </div>
+            <div class="eq-section">
+              <div class="eq-knob-wrap">
+                <canvas class="eq-knob" id="d2-hi" width="56" height="56" data-label="HI" data-value="0.5"></canvas>
+                <span class="eq-label">HI</span>
+              </div>
+              <div class="eq-knob-wrap">
+                <canvas class="eq-knob" id="d2-mid" width="56" height="56" data-label="MID" data-value="0.5"></canvas>
+                <span class="eq-label">MID</span>
+              </div>
+              <div class="eq-knob-wrap">
+                <canvas class="eq-knob" id="d2-low" width="56" height="56" data-label="LOW" data-value="0.5"></canvas>
+                <span class="eq-label">LOW</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- DECK 3 — MAGIC DECK -->
+      <div class="deck deck-magic" id="deck-3">
+        <div class="deck-header magic-header">
+          <span class="deck-num magic-num">03</span>
+          <span class="deck-title magic-title">MAGIC DECK — AI GEN</span>
+          <div class="magic-status">
+            <span class="status-dot-magic" id="magic-dot"></span>
+            <span class="status-label-magic" id="magic-status-label">IDLE</span>
+          </div>
+        </div>
+        <div class="deck-body">
+          <div class="magic-config-row">
+            <label class="magic-config-label">MAGENTA API</label>
+            <input type="text" id="magenta-url" class="magic-input" value="http://localhost:5000" />
+          </div>
+          <div class="magic-params">
+            <div class="magic-param">
+              <label class="magic-param-label">TEMP <span id="temp-val">0.75</span></label>
+              <input type="range" id="magic-temp" min="0.1" max="2.0" step="0.05" value="0.75" class="magic-slider">
+            </div>
+            <div class="magic-param">
+              <label class="magic-param-label">STEPS <span id="steps-val">128</span></label>
+              <input type="range" id="magic-steps" min="16" max="512" step="16" value="128" class="magic-slider">
+            </div>
+          </div>
+          <button class="btn-generate" id="btn-generate">⬡ GENERATE</button>
+          <canvas class="piano-roll" id="piano-roll" width="600" height="160"></canvas>
+          <div class="magic-mix-row">
+            <label class="magic-config-label">MIX LEVEL</label>
+            <input type="range" id="magic-gain" min="0" max="1" step="0.01" value="0.5" class="h-fader">
+            <span class="magic-gain-val" id="magic-gain-val">50%</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
