@@ -1,6 +1,8 @@
 import { audiotool } from '@audiotool/nexus'
+import { Ticks } from '@audiotool/nexus/utils'
 import type { AuthenticatedClient, SyncedDocument } from '@audiotool/nexus'
-import type { NexusEntity } from '@audiotool/nexus/document'
+import type { SampleMeta } from '@audiotool/nexus/api'
+import type { NexusEntity, SafeTransactionBuilder } from '@audiotool/nexus/document'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -14,6 +16,9 @@ interface DeckState {
   isPlaying: boolean; isPaused: boolean; pauseOffset: number
   startedAt: number; looping: boolean; fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
+  sampleBpm: number | null; regionEntity: NexusEntity<'audioRegion'> | null
+  trackEntity: NexusEntity<'audioTrack'> | null; audioDeviceEntity: NexusEntity<'audioDevice'> | null
+  mixerChannelEntity: NexusEntity<'mixerChannel'> | null
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
@@ -33,14 +38,13 @@ let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
 let magicGainEntity: NexusEntity<'tinyGain'> | null = null
 let lastLoadedDeckIndex: 0 | 1 | null = null
-let lastPlayedDeckIndex: 0 | 1 | null = null
 let currentProjectBpm: number | null = null
 let waveformAnimationFrame: number | null = null
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -127,6 +131,7 @@ async function disconnectAll() {
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
   if (at) { try { at.logout() } catch (_) {}; at = null }
   magicGainEntity = null
+  decks.forEach(clearDeckProjectEntities)
   statusUser.textContent = ''
   projectUrlRow.style.display = 'none'
   btnLogin.style.display = ''
@@ -193,38 +198,157 @@ async function updateMagicGain(value: number) {
   catch (e) { console.warn('[NEXUS] gain update:', e) }
 }
 function updateDeckBpmLabels(bpm: number | null) {
-  const value = bpm === null ? '—' : String(Math.round(bpm))
-  decks.forEach((deck) => { deck.baseBpm = bpm })
-  el('deck1-bpm').textContent = value
-  el('deck2-bpm').textContent = value
-  el('deck3-bpm').textContent = value
+  currentProjectBpm = bpm
+  decks.forEach((deck, index) => {
+    if (deck.sampleBpm === null) deck.baseBpm = bpm
+    updateDeckBpmLabel(index as WaveformDeckIndex)
+  })
+}
+function updateDeckBpmLabel(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const value = deck.sampleBpm ?? deck.baseBpm
+  el(`deck${deckIndex + 1}-bpm`).textContent = value === null ? '—' : String(Math.round(value))
 }
 function loadBPM() {
   if (!nexus) return
   nexus.events.onCreate('config', (cfg) => {
     nexus!.events.onUpdate(cfg.fields.tempoBpm, (bpm) => {
       const nextBpm = Number(bpm)
-      currentProjectBpm = Number.isFinite(nextBpm) ? nextBpm : null
-      updateDeckBpmLabels(currentProjectBpm)
+      updateDeckBpmLabels(Number.isFinite(nextBpm) ? nextBpm : null)
     }, true)
   })
 }
-async function uploadToNexus(deckNum: number, file: File) {
-  if (!nexus || !at) return
+
+function clearDeckProjectEntities(deck: DeckState) {
+  deck.sampleBpm = null
+  deck.regionEntity = null
+  deck.trackEntity = null
+  deck.audioDeviceEntity = null
+  deck.mixerChannelEntity = null
+}
+
+function getDetectedOrProjectBpm(sample: SampleMeta, deckNum: number) {
+  if (Number.isFinite(sample.bpm) && sample.bpm > 0) return sample.bpm
+  if (currentProjectBpm && currentProjectBpm > 0) {
+    setStatus('connected', `DECK ${deckNum}: NO BPM DETECTED — USING PROJECT BPM ${Math.round(currentProjectBpm)}`)
+    return currentProjectBpm
+  }
+  throw new Error('No sample BPM detected and project BPM is unavailable')
+}
+
+function knobValueToEqDb(value: number) {
+  return Math.max(-18, Math.min(18, (value - 0.5) * 36))
+}
+
+async function uploadSample(file: File, displayName: string) {
+  if (!at) throw new Error('Not logged in')
+  const upload = await at.samples.upload({ file, displayName, kind: 'loop' })
+  if (upload instanceof Error) throw upload
+
+  const uploaded = await upload.uploaded
+  if (uploaded instanceof Error) throw uploaded
+
+  const sample = await upload.ready
+  if (sample instanceof Error) throw sample
+  return sample
+}
+
+function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: SafeTransactionBuilder) {
+  const trackId = region.fields.track.value.entityId
+  const track = t.entities.ofTypes('audioTrack').getEntity(trackId)
+  if (!track) throw new Error('Inserted audio track was not found')
+
+  const audioDeviceId = track.fields.player.value.entityId
+  const audioDevice = t.entities.ofTypes('audioDevice').getEntity(audioDeviceId)
+  if (!audioDevice) throw new Error('Inserted audio device was not found')
+
+  const cable = t.entities
+    .ofTypes('desktopAudioCable')
+    .get()
+    .find((candidate) => candidate.fields.fromSocket.value.equals(audioDevice.fields.audioOutput.location))
+  if (!cable) throw new Error('Inserted mixer cable was not found')
+
+  const mixerChannel = t.entities.ofTypes('mixerChannel').getEntity(cable.fields.toSocket.value.entityId)
+  if (!mixerChannel) throw new Error('Inserted mixer channel was not found')
+
+  return { track, audioDevice, mixerChannel }
+}
+
+async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, displayName: string, forceMagicLoop: boolean) {
+  if (!nexus) throw new Error('Project not connected')
+  const deck = decks[deckNum - 1]
+  const bpm = getDetectedOrProjectBpm(sample, deckNum)
+
+  const inserted = await nexus.modify((t) => {
+    const region = t.insertSample(sample, {
+      sample: { bpm },
+      region: forceMagicLoop
+        ? { positionTicks: 0, durationTicks: Ticks.Bars(64) }
+        : { positionTicks: 0 },
+      loop: forceMagicLoop ? true : undefined,
+      displayName,
+    })
+    const entities = resolveInsertedProjectEntities(region, t)
+    return { region, ...entities }
+  })
+
+  deck.sampleBpm = sample.bpm > 0 ? sample.bpm : null
+  deck.baseBpm = bpm
+  deck.regionEntity = inserted.region
+  deck.trackEntity = inserted.track
+  deck.audioDeviceEntity = inserted.audioDevice
+  deck.mixerChannelEntity = inserted.mixerChannel
+  updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
+  if (deckNum === 1 || deckNum === 2) applyCurrentDeckEq((deckNum - 1) as 0 | 1)
+  return inserted
+}
+
+async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false) {
+  if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
   setStatus('connected', `UPLOADING ${file.name}…`)
   try {
-    const upload = await at.samples.upload({ file, displayName: file.name })
-    if (upload instanceof Error) throw upload
-    await upload.uploaded
+    const displayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
+    const sample = await uploadSample(file, displayName)
+    setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
+    await insertSampleIntoProject(deckNum, sample, displayName, forceMagicLoop)
+    setStatus('connected', `DECK ${deckNum}: ${file.name} — PROJECT SYNCED ✓`)
+  } catch (e: unknown) {
+    setStatus('error', `UPLOAD ERROR: ${e instanceof Error ? e.message : String(e)}`)
+    throw e
+  }
+}
+
+async function applyDeckEq(deckIndex: 0 | 1, band: 'hi' | 'mid' | 'low', value: number) {
+  const deck = decks[deckIndex]
+  if (!nexus || !deck.mixerChannelEntity) {
+    setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT EQ`)
+    return
+  }
+
+  const gainDb = knobValueToEqDb(value)
+  try {
     await nexus.modify((t) => {
-      const sample = t.create('sample', { sampleName: upload.name, uploadStartTime: BigInt(Math.floor(Date.now() / 1000)) })
-      const device = t.create('audioDevice', { displayName: `DECK ${deckNum} — ${file.name}`, positionX: (deckNum - 1) * 300, positionY: 100 })
-      const auto = t.create('automationCollection', {})
-      const track = t.create('audioTrack', { player: device.location, orderAmongTracks: deckNum, isEnabled: true })
-      t.create('audioRegion', { track: track.location, sample: sample.location, playbackAutomationCollection: auto.location, region: { positionTicks: 0, durationTicks: 15360, collectionOffsetTicks: 0, loopOffsetTicks: 0, loopDurationTicks: 15360 } })
+      const channel = t.entities.ofTypes('mixerChannel').getEntity(deck.mixerChannelEntity!.id) ?? deck.mixerChannelEntity!
+      if (band === 'low') t.update(channel.fields.eq.fields.lowShelfGainDb, gainDb)
+      if (band === 'mid') {
+        t.update(channel.fields.eq.fields.lowMidGainDb, gainDb)
+        t.update(channel.fields.eq.fields.highMidGainDb, gainDb)
+      }
+      if (band === 'hi') t.update(channel.fields.eq.fields.highShelfGainDb, gainDb)
     })
-    setStatus('connected', `DECK ${deckNum}: ${file.name} — SYNCED ✓`)
-  } catch (e: unknown) { setStatus('error', `UPLOAD ERROR: ${e instanceof Error ? e.message : String(e)}`) }
+  } catch (e) {
+    console.warn('[NEXUS] eq update:', e)
+    setStatus('error', `EQ UPDATE FAILED: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+function applyCurrentDeckEq(deckIndex: 0 | 1) {
+  const bands = ['hi', 'mid', 'low'] as const
+  bands.forEach((band) => {
+    const canvas = el<HTMLCanvasElement>(`d${deckIndex + 1}-${band}`)
+    const state = knobState.get(canvas)
+    if (state) void applyDeckEq(deckIndex, band, state.value)
+  })
 }
 
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
@@ -234,9 +358,6 @@ function ensureCtx(deck: DeckState) {
     deck.gainNode.connect(deck.audioCtx.destination); deck.gainNode.gain.value = 0.8
   }
 }
-function clampPitchPercent(value: number) {
-  return Math.max(-8, Math.min(8, value))
-}
 function formatPitch(value: number) {
   const rounded = Number(value.toFixed(1))
   return `${rounded >= 0 ? '+' : ''}${rounded.toFixed(1)}%`
@@ -245,40 +366,6 @@ function normalizeDeckOffset(deck: DeckState, offset: number) {
   if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return 0
   if (deck.looping) return ((offset % deck.audioBuffer.duration) + deck.audioBuffer.duration) % deck.audioBuffer.duration
   return Math.max(0, Math.min(offset, Math.max(0, deck.audioBuffer.duration - 0.001)))
-}
-function updateDeckPlaybackRate(deck: DeckState, pitchPercent: number) {
-  const nextPitch = clampPitchPercent(pitchPercent)
-  const nextRate = Math.max(0.01, 1 + nextPitch / 100)
-  if (deck.isPlaying && deck.audioCtx) {
-    deck.pauseOffset = getDeckPositionSeconds(deck)
-    deck.startedAt = deck.audioCtx.currentTime
-  }
-  deck.pitchPercent = nextPitch
-  deck.playbackRate = nextRate
-  if (deck.sourceNode) deck.sourceNode.playbackRate.value = nextRate
-}
-function deckPlay(deck: DeckState, onEnded?: () => void) {
-  if (!deck.audioCtx || !deck.audioBuffer || deck.isPlaying) return
-  const src = deck.audioCtx.createBufferSource()
-  src.buffer = deck.audioBuffer; src.loop = deck.looping; src.playbackRate.value = deck.playbackRate; src.connect(deck.gainNode!)
-  const normalizedOffset = normalizeDeckOffset(deck, deck.pauseOffset)
-  src.start(0, normalizedOffset); deck.sourceNode = src
-  deck.startedAt = deck.audioCtx.currentTime; deck.pauseOffset = normalizedOffset; deck.isPlaying = true; deck.isPaused = false
-  src.onended = () => {
-    if (!deck.isPlaying || deck.sourceNode !== src) return
-    deck.sourceNode = null; deck.isPlaying = false; deck.isPaused = false; deck.pauseOffset = 0
-    redrawDeckWaveformByState(deck)
-    onEnded?.()
-  }
-  scheduleWaveformRendering()
-}
-function deckPause(deck: DeckState) {
-  if (!deck.audioCtx || !deck.isPlaying) return
-  deck.pauseOffset = getDeckPositionSeconds(deck)
-  const source = deck.sourceNode
-  deck.sourceNode = null; deck.isPlaying = false; deck.isPaused = true
-  source?.stop()
-  redrawDeckWaveformByState(deck)
 }
 function deckStop(deck: DeckState) {
   const source = deck.sourceNode
@@ -291,11 +378,11 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File) {
   const deck = decks[deckIndex]; ensureCtx(deck)
   try {
     const buf = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
-    deckStop(deck); deck.audioBuffer = buf; deck.fileName = file.name
+    deckStop(deck); clearDeckProjectEntities(deck); deck.audioBuffer = buf; deck.fileName = file.name
     lastLoadedDeckIndex = deckIndex
     drawWaveform(`waveform-${deckIndex + 1}`, buf)
-    uploadToNexus(deckIndex + 1, file)
-  } catch (e: unknown) { setStatus('error', `DECODE ERROR: ${e instanceof Error ? e.message : String(e)}`) }
+    await uploadToNexus(deckIndex + 1, file)
+  } catch (e: unknown) { setStatus('error', `LOAD ERROR: ${e instanceof Error ? e.message : String(e)}`) }
 }
 
 // ── WAVEFORM ──────────────────────────────────────────────────────────────────
@@ -351,7 +438,7 @@ function redrawDeckWaveformByState(deck: DeckState) {
 }
 
 function anyWaveformLoaded() {
-  return decks.some((deck) => deck.audioBuffer)
+  return decks.some((deck) => deck.audioBuffer && deck.isPlaying)
 }
 
 function scheduleWaveformRendering() {
@@ -370,35 +457,6 @@ function drawWaveform(id: string, buf: AudioBuffer) {
   scheduleWaveformRendering()
 }
 
-function getWaveformClickSeconds(canvas: HTMLCanvasElement, deck: DeckState, event: MouseEvent) {
-  if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return null
-  const rect = canvas.getBoundingClientRect()
-  const clickedX = Math.max(0, Math.min(event.clientX - rect.left, rect.width))
-  const ratio = rect.width > 0 ? clickedX / rect.width : 0
-  return ratio * deck.audioBuffer.duration
-}
-
-function seekDeck(deck: DeckState, offsetSeconds: number, onEnded?: () => void) {
-  if (!deck.audioBuffer) return
-  const wasPlaying = deck.isPlaying
-  const wasPaused = deck.isPaused
-  const source = deck.sourceNode
-  const normalizedOffset = normalizeDeckOffset(deck, offsetSeconds)
-
-  deck.sourceNode = null
-  deck.isPlaying = false
-  deck.isPaused = wasPaused
-  deck.pauseOffset = normalizedOffset
-  source?.stop()
-
-  if (wasPlaying) {
-    deck.isPaused = false
-    deckPlay(deck, onEnded)
-  } else {
-    redrawDeckWaveformByState(deck)
-  }
-}
-
 // ── KNOBS ─────────────────────────────────────────────────────────────────────
 function drawKnob(canvas: HTMLCanvasElement, value: number) {
   const ctx = canvas.getContext('2d')!
@@ -412,12 +470,24 @@ function drawKnob(canvas: HTMLCanvasElement, value: number) {
   ctx.beginPath(); ctx.arc(ix, iy, 3, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill()
   ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fillStyle = '#333'; ctx.fill()
 }
+function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: 0 | 1; band: 'hi' | 'mid' | 'low' } | null {
+  const match = canvas.id.match(/^d([12])-(hi|mid|low)$/)
+  if (!match) return null
+  return { deckIndex: Number(match[1]) - 1 as 0 | 1, band: match[2] as 'hi' | 'mid' | 'low' }
+}
 function initKnob(canvas: HTMLCanvasElement) {
   const init = parseFloat(canvas.dataset.value ?? '0.5')
   knobState.set(canvas, { value: init, dragging: false, startY: 0, startVal: init })
   drawKnob(canvas, init)
   canvas.addEventListener('mousedown', (e) => { const s = knobState.get(canvas)!; s.dragging = true; s.startY = e.clientY; s.startVal = s.value; e.preventDefault() })
-  window.addEventListener('mousemove', (e) => { const s = knobState.get(canvas); if (!s?.dragging) return; s.value = Math.max(0, Math.min(1, s.startVal + (s.startY - e.clientY) / 120)); drawKnob(canvas, s.value) })
+  window.addEventListener('mousemove', (e) => {
+    const s = knobState.get(canvas)
+    if (!s?.dragging) return
+    s.value = Math.max(0, Math.min(1, s.startVal + (s.startY - e.clientY) / 120))
+    drawKnob(canvas, s.value)
+    const control = getDeckEqControl(canvas)
+    if (control) void applyDeckEq(control.deckIndex, control.band, s.value)
+  })
   window.addEventListener('mouseup', () => { const s = knobState.get(canvas); if (s) s.dragging = false })
 }
 
@@ -441,9 +511,6 @@ function getDeckPositionSeconds(deck: DeckState) {
 }
 
 function selectReferenceDeck(): { deck: DeckState; deckIndex: 0 | 1 } | null {
-  if (lastPlayedDeckIndex !== null && decks[lastPlayedDeckIndex].isPlaying && decks[lastPlayedDeckIndex].audioBuffer) {
-    return { deck: decks[lastPlayedDeckIndex], deckIndex: lastPlayedDeckIndex }
-  }
   const playingIndex = decks.findIndex((deck, index) => index < 2 && deck.isPlaying && deck.audioBuffer) as 0 | 1 | -1
   if (playingIndex !== -1) return { deck: decks[playingIndex], deckIndex: playingIndex }
   if (lastLoadedDeckIndex !== null && decks[lastLoadedDeckIndex].audioBuffer) {
@@ -590,14 +657,14 @@ async function generateMagicAudio() {
     ensureCtx(magicDeck)
     const generatedBuffer = await magicDeck.audioCtx!.decodeAudioData(await generatedBlob.arrayBuffer())
     deckStop(magicDeck)
+    clearDeckProjectEntities(magicDeck)
     magicDeck.looping = true
     magicDeck.audioBuffer = generatedBuffer
     magicDeck.fileName = generatedFile.name
     if (magicDeck.gainNode) magicDeck.gainNode.gain.value = parseFloat(magicGain.value)
     drawWaveform('magic-waveform', generatedBuffer)
-    deckPlay(magicDeck, () => syncTransportUi('d3', magicDeck))
     syncTransportUi('d3', magicDeck)
-    uploadToNexus(3, generatedFile)
+    await uploadToNexus(3, generatedFile, true)
 
     setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF`); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
   } catch (e: unknown) {
@@ -635,34 +702,27 @@ function syncTransportUi(prefix: DeckPrefix, deck: DeckState) {
 }
 function setupWaveformSeek(prefix: DeckPrefix, deckIndex: WaveformDeckIndex) {
   const canvas = getWaveformCanvas(deckIndex)
-  const deck = decks[deckIndex]
+  canvas.title = 'Use Audiotool Studio timeline controls for playback and seeking'
   canvas.addEventListener('click', (event) => {
-    const offsetSeconds = getWaveformClickSeconds(canvas, deck, event)
-    if (offsetSeconds === null) return
-    const wasPlaying = deck.isPlaying
-    seekDeck(deck, offsetSeconds, () => syncTransportUi(prefix, deck))
-    if (wasPlaying && (deckIndex === 0 || deckIndex === 1)) lastPlayedDeckIndex = deckIndex
-    syncTransportUi(prefix, deck)
+    event.preventDefault()
+    setStatus('connected', `${prefix.toUpperCase()}: USE AUDIOTOOL STUDIO TIMELINE FOR SEEKING`)
   })
 }
 function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const deck = decks[deckIndex]
   const playBtn = el<HTMLButtonElement>(`${prefix}-play`), pauseBtn = el<HTMLButtonElement>(`${prefix}-pause`)
+  const stopBtn = el<HTMLButtonElement>(`${prefix}-stop`)
+  const loopBtn = el<HTMLButtonElement>(`${prefix}-loop`)
   const volSlider = document.getElementById(`${prefix}-vol`) as HTMLInputElement | null
   const volVal = document.getElementById(`${prefix}-vol-val`) as HTMLSpanElement | null
 
-  playBtn.addEventListener('click', () => {
-    deckPlay(deck, () => syncTransportUi(prefix, deck))
-    if (deckIndex === 0 || deckIndex === 1) lastPlayedDeckIndex = deckIndex
-    syncTransportUi(prefix, deck)
+  const transportButtons = [playBtn, pauseBtn, stopBtn, loopBtn]
+  transportButtons.forEach((button) => {
+    button.disabled = true
+    button.title = 'Use Audiotool Studio transport'
+    button.setAttribute('aria-label', 'Project transport is controlled in Audiotool Studio')
   })
-  pauseBtn.addEventListener('click', () => { deckPause(deck); syncTransportUi(prefix, deck) })
-  el<HTMLButtonElement>(`${prefix}-stop`).addEventListener('click', () => { deckStop(deck); syncTransportUi(prefix, deck) })
-  el<HTMLButtonElement>(`${prefix}-loop`).addEventListener('click', () => {
-    deck.looping = !deck.looping
-    if (deck.sourceNode) deck.sourceNode.loop = deck.looping
-    syncTransportUi(prefix, deck)
-  })
+
   volSlider?.addEventListener('input', () => {
     const v = parseFloat(volSlider.value)
     if (volVal) volVal.textContent = String(Math.round(v * 100))
@@ -673,15 +733,10 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   if (prefix === 'd3') {
     const pitchWheel = el<HTMLInputElement>('d3-pitch-wheel')
     const pitchReset = el<HTMLButtonElement>('d3-pitch-reset')
-    const setMagicPitch = (value: number) => {
-      updateDeckPlaybackRate(deck, value)
-      pitchWheel.value = deck.pitchPercent.toFixed(1)
-      syncTransportUi(prefix, deck)
-    }
-
-    pitchWheel.addEventListener('input', () => setMagicPitch(parseFloat(pitchWheel.value)))
-    pitchWheel.addEventListener('dblclick', () => setMagicPitch(0))
-    pitchReset.addEventListener('click', () => setMagicPitch(0))
+    pitchWheel.disabled = true
+    pitchWheel.title = 'Magic audio follows the inserted Audiotool timeline loop'
+    pitchReset.disabled = true
+    pitchReset.title = 'Magic audio follows the inserted Audiotool timeline loop'
   }
 
   setupWaveformSeek(prefix, deckIndex)
