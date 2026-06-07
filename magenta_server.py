@@ -10,29 +10,55 @@ import io
 import math
 import tempfile
 import os
+from typing import Any
 import numpy as np
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import uvicorn
-
-# Magenta imports
-from magenta_rt import audio, musiccoca
-from magenta_rt.mlx import system
 
 # ---------------------------------------------------------------------------
 # App & model initialisation
 # ---------------------------------------------------------------------------
 
+MAGENTA_HOME = os.environ.setdefault(
+    "MAGENTA_HOME",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".magenta"),
+)
+MAGENTA_RT_HOME = os.path.join(MAGENTA_HOME, "magenta-rt-v2")
+MAGENTA_MODEL = "mrt2_small"
+
 app = FastAPI(title="Magenta RT2 API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
-print("Loading MusicCoCa style model...")
-style_model = musiccoca.MusicCoCa()
+magenta_audio: Any | None = None
+style_model: Any | None = None
+mrt: Any | None = None
 
-print("Loading MagentaRT2SystemMlxfn (mrt2_small)...")
-mrt = system.MagentaRT2SystemMlxfn(size="mrt2_small")
 
-print("Models loaded. Server ready.")
+def get_magenta_runtime() -> tuple[Any, Any, Any]:
+    global magenta_audio, style_model, mrt
+
+    if magenta_audio is None or style_model is None or mrt is None:
+        from magenta_rt import audio, musiccoca
+        from magenta_rt.mlx import system
+
+        print("Loading MusicCoCa style model...")
+        magenta_audio = audio
+        style_model = musiccoca.MusicCoCa()
+
+        print(f"Loading MagentaRT2SystemMlxfn ({MAGENTA_MODEL})...")
+        mrt = system.MagentaRT2SystemMlxfn(size=MAGENTA_MODEL)
+
+        print("Models loaded. Server ready.")
+
+    return magenta_audio, style_model, mrt
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -40,7 +66,11 @@ print("Models loaded. Server ready.")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "mrt2_small"}
+    return {
+        "status": "ok",
+        "model": MAGENTA_MODEL,
+        "magenta_home": MAGENTA_RT_HOME,
+    }
 
 
 @app.post("/generate")
@@ -59,6 +89,11 @@ async def generate(
     # --- Validate duration ---
     if duration_seconds <= 0 or duration_seconds > 120:
         raise HTTPException(status_code=400, detail="duration_seconds must be between 1 and 120.")
+
+    try:
+        audio, style_model, mrt = get_magenta_runtime()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Magenta runtime unavailable: {e}") from e
 
     # --- Save uploaded file to temp ---
     suffix = os.path.splitext(audio_file.filename)[-1] or ".wav"
@@ -103,7 +138,7 @@ async def generate(
         output_waveform = audio.concatenate(chunks)
 
         buf = io.BytesIO()
-        output_waveform.write(buf)
+        output_waveform.write(buf, format="WAV")
         buf.seek(0)
 
         filename = f"magenta_{prompt[:30].replace(' ', '_')}.wav"

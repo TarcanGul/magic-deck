@@ -8,20 +8,30 @@ const REDIRECT_URL = 'http://127.0.0.1:5173/'
 const SCOPE = 'project:write sample:write'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-interface MidiNote { pitch: number; startTime: number; endTime: number; velocity: number }
 interface DeckState {
   audioCtx: AudioContext | null; sourceNode: AudioBufferSourceNode | null
   gainNode: GainNode | null; audioBuffer: AudioBuffer | null
   isPlaying: boolean; isPaused: boolean; pauseOffset: number
   startedAt: number; looping: boolean; fileName: string | null
 }
+interface ReferenceAudio {
+  blob: Blob
+  fileName: string
+  deckNum: number
+  seconds: number
+}
+
+const REFERENCE_AUDIO_SECONDS = 8
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
 let magicGainEntity: NexusEntity<'tinyGain'> | null = null
+let lastLoadedDeckIndex: 0 | 1 | null = null
+let lastPlayedDeckIndex: 0 | 1 | null = null
 
-const decks: [DeckState, DeckState] = [
+const decks: [DeckState, DeckState, DeckState] = [
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
   { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
   { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
 ]
@@ -41,13 +51,16 @@ const magentaUrl = el<HTMLInputElement>('magenta-url')
 const btnGenerate = el<HTMLButtonElement>('btn-generate')
 const magicDot = el<HTMLSpanElement>('magic-dot')
 const magicStatusLabel = el<HTMLSpanElement>('magic-status-label')
-const magicTemp = el<HTMLInputElement>('magic-temp')
-const magicSteps = el<HTMLInputElement>('magic-steps')
-const tempVal = el<HTMLSpanElement>('temp-val')
-const stepsVal = el<HTMLSpanElement>('steps-val')
+const magicPrompt = el<HTMLInputElement>('magic-prompt')
+const magicAudioWeight = el<HTMLInputElement>('magic-audio-weight')
+const magicTextWeight = el<HTMLInputElement>('magic-text-weight')
+const magicDuration = el<HTMLInputElement>('magic-duration')
+const audioWeightVal = el<HTMLSpanElement>('audio-weight-val')
+const textWeightVal = el<HTMLSpanElement>('text-weight-val')
+const durationVal = el<HTMLSpanElement>('duration-val')
 const magicGain = el<HTMLInputElement>('magic-gain')
 const magicGainVal = el<HTMLSpanElement>('magic-gain-val')
-const pianoRoll = el<HTMLCanvasElement>('piano-roll')
+const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 function setStatus(state: 'idle' | 'connecting' | 'connected' | 'error', msg: string) {
@@ -231,6 +244,7 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File) {
   try {
     const buf = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
     deckStop(deck); deck.audioBuffer = buf; deck.fileName = file.name
+    lastLoadedDeckIndex = deckIndex
     drawWaveform(`waveform-${deckIndex + 1}`, buf)
     uploadToNexus(deckIndex + 1, file)
   } catch (e: unknown) { setStatus('error', `DECODE ERROR: ${e instanceof Error ? e.message : String(e)}`) }
@@ -273,36 +287,181 @@ function initKnob(canvas: HTMLCanvasElement) {
   window.addEventListener('mouseup', () => { const s = knobState.get(canvas); if (s) s.dragging = false })
 }
 
-// ── PIANO ROLL ────────────────────────────────────────────────────────────────
-function drawPianoRoll(notes: MidiNote[]) {
-  const ctx = pianoRoll.getContext('2d')!
-  const W = pianoRoll.width, H = pianoRoll.height, MIN = 36, MAX = 84, RANGE = MAX - MIN, ROW = H / RANGE
+// ── MAGIC AUDIO ───────────────────────────────────────────────────────────────
+function drawMagicIdle(label = '[ GENERATE AUDIO FROM LAST 8 SECONDS ]') {
+  const ctx = magicWaveform.getContext('2d')!
+  const W = magicWaveform.width, H = magicWaveform.height
   ctx.fillStyle = '#050000'; ctx.fillRect(0, 0, W, H)
-  for (let p = MIN; p <= MAX; p += 12) {
-    const y = H - ((p - MIN) / RANGE) * H
-    ctx.strokeStyle = '#1a0000'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke()
-    ctx.fillStyle = '#440000'; ctx.font = '9px IBM Plex Mono'; ctx.fillText(`C${Math.floor(p / 12) - 1}`, 2, y - 2)
+  ctx.strokeStyle = '#1a0000'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2); ctx.stroke()
+  ctx.fillStyle = '#440000'; ctx.font = '12px Share Tech Mono'; ctx.textAlign = 'center'; ctx.fillText(label, W / 2, H / 2 + 4); ctx.textAlign = 'left'
+}
+
+function getDeckPositionSeconds(deck: DeckState) {
+  if (!deck.audioBuffer) return 0
+  if (deck.isPlaying && deck.audioCtx) {
+    const elapsed = deck.audioCtx.currentTime - deck.startedAt
+    if (deck.looping && deck.audioBuffer.duration > 0) return ((elapsed % deck.audioBuffer.duration) + deck.audioBuffer.duration) % deck.audioBuffer.duration
+    return Math.max(0, Math.min(elapsed, deck.audioBuffer.duration))
   }
-  if (!notes.length) { ctx.fillStyle = '#440000'; ctx.font = '12px Share Tech Mono'; ctx.textAlign = 'center'; ctx.fillText('[ PRESS GENERATE TO SEE AI MIDI ]', W / 2, H / 2); ctx.textAlign = 'left'; return }
-  const maxT = Math.max(...notes.map(n => n.endTime), 1)
-  for (const n of notes) {
-    const p = Math.max(MIN, Math.min(MAX - 1, n.pitch)), x = (n.startTime / maxT) * W, nw = Math.max(3, ((n.endTime - n.startTime) / maxT) * W - 1)
-    const y = H - ((p - MIN + 1) / RANGE) * H, vel = n.velocity / 127, gb = Math.round((1 - vel) * 200)
-    ctx.fillStyle = `rgba(255,${gb},${gb},${0.7 + vel * 0.3})`; ctx.fillRect(x, y + 1, nw, ROW - 2)
+  if (deck.isPaused) return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
+  return deck.audioBuffer.duration
+}
+
+function selectReferenceDeck(): { deck: DeckState; deckIndex: 0 | 1 } | null {
+  if (lastPlayedDeckIndex !== null && decks[lastPlayedDeckIndex].isPlaying && decks[lastPlayedDeckIndex].audioBuffer) {
+    return { deck: decks[lastPlayedDeckIndex], deckIndex: lastPlayedDeckIndex }
+  }
+  const playingIndex = decks.findIndex((deck, index) => index < 2 && deck.isPlaying && deck.audioBuffer) as 0 | 1 | -1
+  if (playingIndex !== -1) return { deck: decks[playingIndex], deckIndex: playingIndex }
+  if (lastLoadedDeckIndex !== null && decks[lastLoadedDeckIndex].audioBuffer) {
+    return { deck: decks[lastLoadedDeckIndex], deckIndex: lastLoadedDeckIndex }
+  }
+  const loadedIndex = decks.findIndex((deck, index) => index < 2 && deck.audioBuffer) as 0 | 1 | -1
+  if (loadedIndex !== -1) return { deck: decks[loadedIndex], deckIndex: loadedIndex }
+  return null
+}
+
+function createReferenceBuffer(deck: DeckState) {
+  if (!deck.audioBuffer) throw new Error('No audio loaded')
+  ensureCtx(deck)
+
+  const source = deck.audioBuffer
+  const sampleRate = source.sampleRate
+  const sourceLength = source.length
+  const channels = Math.min(source.numberOfChannels, 2)
+  const useLoopWindow = deck.looping && (deck.isPlaying || deck.isPaused)
+  const endSeconds = deck.isPlaying || deck.isPaused ? getDeckPositionSeconds(deck) : source.duration
+  const endSample = useLoopWindow
+    ? Math.round(endSeconds * sampleRate)
+    : Math.min(sourceLength, Math.max(1, Math.round(endSeconds * sampleRate)))
+  const length = useLoopWindow
+    ? Math.max(1, Math.round(REFERENCE_AUDIO_SECONDS * sampleRate))
+    : Math.max(1, Math.min(Math.round(REFERENCE_AUDIO_SECONDS * sampleRate), endSample))
+  const output = deck.audioCtx!.createBuffer(channels, length, sampleRate)
+  const startSample = Math.max(0, endSample - length)
+
+  for (let channel = 0; channel < channels; channel++) {
+    const input = source.getChannelData(channel)
+    const out = output.getChannelData(channel)
+    for (let i = 0; i < length; i++) {
+      const sourceIndex = useLoopWindow ? ((endSample - length + i) % sourceLength + sourceLength) % sourceLength : startSample + i
+      out[i] = input[sourceIndex] ?? 0
+    }
+  }
+
+  return output
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i))
+}
+
+function audioBufferToWav(buffer: AudioBuffer) {
+  const channels = buffer.numberOfChannels
+  const sampleRate = buffer.sampleRate
+  const bytesPerSample = 2
+  const blockAlign = channels * bytesPerSample
+  const dataSize = buffer.length * blockAlign
+  const arrayBuffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(arrayBuffer)
+
+  writeAscii(view, 0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeAscii(view, 8, 'WAVE')
+  writeAscii(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, channels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * blockAlign, true)
+  view.setUint16(32, blockAlign, true)
+  view.setUint16(34, bytesPerSample * 8, true)
+  writeAscii(view, 36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  const channelData = Array.from({ length: channels }, (_, channel) => buffer.getChannelData(channel))
+  let offset = 44
+  for (let i = 0; i < buffer.length; i++) {
+    for (let channel = 0; channel < channels; channel++) {
+      const sample = Math.max(-1, Math.min(1, channelData[channel][i]))
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+      offset += bytesPerSample
+    }
+  }
+
+  return new Blob([arrayBuffer], { type: 'audio/wav' })
+}
+
+function buildReferenceAudio(): ReferenceAudio {
+  const selection = selectReferenceDeck()
+  if (!selection) throw new Error('Load or play a deck before generating')
+
+  const buffer = createReferenceBuffer(selection.deck)
+  return {
+    blob: audioBufferToWav(buffer),
+    fileName: `deck-${selection.deckIndex + 1}-last-${REFERENCE_AUDIO_SECONDS}s.wav`,
+    deckNum: selection.deckIndex + 1,
+    seconds: buffer.duration,
   }
 }
 
+function magentaEndpoint() {
+  return (magentaUrl.value.trim() || 'http://localhost:8000').replace(/\/+$/, '')
+}
+
+function describeMagentaError(error: unknown) {
+  if (error instanceof TypeError) {
+    return `Could not reach Magenta API at ${magentaEndpoint()}. Check that magenta_server.py is running on port 8000.`
+  }
+  return error instanceof Error ? error.message : 'Error'
+}
+
 // ── MAGENTA ───────────────────────────────────────────────────────────────────
-async function generateMidi() {
-  setMagicStatus('generating', 'GENERATING'); btnGenerate.disabled = true
+async function generateMagicAudio() {
+  const promptText = magicPrompt.value.trim()
+  const audioWeight = parseFloat(magicAudioWeight.value)
+  const textWeight = parseFloat(magicTextWeight.value)
+  if (!promptText) { setMagicStatus('error', 'PROMPT REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
+  if (audioWeight + textWeight <= 0) { setMagicStatus('error', 'WEIGHTS REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
+
+  setMagicStatus('generating', 'CAPTURING'); btnGenerate.disabled = true
   try {
-    const url = magentaUrl.value.trim() || 'http://localhost:5000'
-    const resp = await fetch(`${url}/generate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ temperature: parseFloat(magicTemp.value), steps: parseInt(magicSteps.value) }) })
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-    const data = await resp.json()
-    drawPianoRoll(Array.isArray(data) ? data : (data.notes ?? []))
-    setMagicStatus('done', 'DONE'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 2000)
-  } catch (e: unknown) { setMagicStatus('error', 'ERROR'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000) }
+    const reference = buildReferenceAudio()
+    const form = new FormData()
+    form.append('audio_file', reference.blob, reference.fileName)
+    form.append('prompt', promptText)
+    form.append('audio_weight', String(audioWeight))
+    form.append('text_weight', String(textWeight))
+    form.append('duration_seconds', magicDuration.value)
+
+    setMagicStatus('generating', `MAGENTA ← DECK ${reference.deckNum}`)
+    const resp = await fetch(`${magentaEndpoint()}/generate`, { method: 'POST', body: form })
+    if (!resp.ok) {
+      const detail = await resp.text()
+      throw new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`)
+    }
+
+    setMagicStatus('generating', 'LOADING WAV')
+    const generatedBlob = await resp.blob()
+    const generatedFile = new File([generatedBlob], `magic-${Date.now()}.wav`, { type: generatedBlob.type || 'audio/wav' })
+    const magicDeck = decks[2]
+    ensureCtx(magicDeck)
+    const generatedBuffer = await magicDeck.audioCtx!.decodeAudioData(await generatedBlob.arrayBuffer())
+    deckStop(magicDeck)
+    magicDeck.audioBuffer = generatedBuffer
+    magicDeck.fileName = generatedFile.name
+    if (magicDeck.gainNode) magicDeck.gainNode.gain.value = parseFloat(magicGain.value)
+    drawWaveform('magic-waveform', generatedBuffer)
+    deckPlay(magicDeck)
+    uploadToNexus(3, generatedFile)
+
+    setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF`); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
+  } catch (e: unknown) {
+    console.error('[MAGENTA] generate:', e)
+    const message = describeMagentaError(e)
+    setMagicStatus('error', message.toUpperCase().slice(0, 24))
+    setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
+  }
   finally { btnGenerate.disabled = false }
 }
 
@@ -328,7 +487,7 @@ function wireTransport(prefix: 'd1' | 'd2', deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
   const playBtn = el<HTMLButtonElement>(`${prefix}-play`), pauseBtn = el<HTMLButtonElement>(`${prefix}-pause`)
   const volSlider = el<HTMLInputElement>(`${prefix}-vol`), volVal = el<HTMLSpanElement>(`${prefix}-vol-val`)
-  playBtn.addEventListener('click', () => { deckPlay(deck); playBtn.classList.add('active'); pauseBtn.classList.remove('active') })
+  playBtn.addEventListener('click', () => { deckPlay(deck); lastPlayedDeckIndex = deckIndex; playBtn.classList.add('active'); pauseBtn.classList.remove('active') })
   pauseBtn.addEventListener('click', () => { deckPause(deck); pauseBtn.classList.add('active'); playBtn.classList.remove('active') })
   el<HTMLButtonElement>(`${prefix}-stop`).addEventListener('click', () => { deckStop(deck); playBtn.classList.remove('active'); pauseBtn.classList.remove('active') })
   el<HTMLButtonElement>(`${prefix}-loop`).addEventListener('click', function () { deck.looping = !deck.looping; this.classList.toggle('active', deck.looping); if (deck.sourceNode) deck.sourceNode.loop = deck.looping })
@@ -355,11 +514,18 @@ function initApp() {
   wireTransport('d2', 1)
   document.querySelectorAll<HTMLCanvasElement>('.eq-knob').forEach(initKnob)
 
-  magicTemp.addEventListener('input', () => { tempVal.textContent = parseFloat(magicTemp.value).toFixed(2) })
-  magicSteps.addEventListener('input', () => { stepsVal.textContent = magicSteps.value })
-  magicGain.addEventListener('input', async () => { const v = parseFloat(magicGain.value); magicGainVal.textContent = `${Math.round(v * 100)}%`; await updateMagicGain(v) })
-  btnGenerate.addEventListener('click', generateMidi)
-  drawPianoRoll([])
+  magicAudioWeight.addEventListener('input', () => { audioWeightVal.textContent = parseFloat(magicAudioWeight.value).toFixed(1) })
+  magicTextWeight.addEventListener('input', () => { textWeightVal.textContent = parseFloat(magicTextWeight.value).toFixed(1) })
+  magicDuration.addEventListener('input', () => { durationVal.textContent = `${magicDuration.value}s` })
+  magicGain.addEventListener('input', async () => {
+    const v = parseFloat(magicGain.value)
+    const magicDeck = decks[2]
+    magicGainVal.textContent = `${Math.round(v * 100)}%`
+    if (magicDeck.gainNode) magicDeck.gainNode.gain.value = v
+    await updateMagicGain(v)
+  })
+  btnGenerate.addEventListener('click', generateMagicAudio)
+  drawMagicIdle()
 
   init()
 }

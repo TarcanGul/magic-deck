@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="./src/style.css">
 </head>
 <body>
   <div id="app">
@@ -140,20 +140,28 @@
         <div class="deck-body">
           <div class="magic-config-row">
             <label class="magic-config-label">MAGENTA API</label>
-            <input type="text" id="magenta-url" class="magic-input" value="http://localhost:5000" />
+            <input type="text" id="magenta-url" class="magic-input" value="http://localhost:8000" />
+          </div>
+          <div class="magic-config-row">
+            <label class="magic-config-label">PROMPT</label>
+            <input type="text" id="magic-prompt" class="magic-input magic-prompt" value="dark trap 808s" />
           </div>
           <div class="magic-params">
             <div class="magic-param">
-              <label class="magic-param-label">TEMP <span id="temp-val">0.75</span></label>
-              <input type="range" id="magic-temp" min="0.1" max="2.0" step="0.05" value="0.75" class="magic-slider">
+              <label class="magic-param-label">AUDIO WT <span id="audio-weight-val">2.0</span></label>
+              <input type="range" id="magic-audio-weight" min="0" max="5" step="0.1" value="2" class="magic-slider">
             </div>
             <div class="magic-param">
-              <label class="magic-param-label">STEPS <span id="steps-val">128</span></label>
-              <input type="range" id="magic-steps" min="16" max="512" step="16" value="128" class="magic-slider">
+              <label class="magic-param-label">TEXT WT <span id="text-weight-val">1.0</span></label>
+              <input type="range" id="magic-text-weight" min="0" max="5" step="0.1" value="1" class="magic-slider">
+            </div>
+            <div class="magic-param">
+              <label class="magic-param-label">DURATION <span id="duration-val">10s</span></label>
+              <input type="range" id="magic-duration" min="2" max="30" step="2" value="10" class="magic-slider">
             </div>
           </div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE</button>
-          <canvas class="piano-roll" id="piano-roll" width="600" height="160"></canvas>
+          <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>
           <div class="magic-mix-row">
             <label class="magic-config-label">MIX LEVEL</label>
             <input type="range" id="magic-gain" min="0" max="1" step="0.01" value="0.5" class="h-fader">
@@ -164,6 +172,6 @@
 
     </div>
   </div>
-  <script type="module" src="/main.ts"></script>
+  <script type="module" src="./src/main.ts"></script>
 </body>
 </html>
