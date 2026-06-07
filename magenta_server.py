@@ -33,6 +33,7 @@ MAGENTA_RT_HOME = os.path.join(MAGENTA_HOME, "magenta-rt-v2")
 MAGENTA_MODEL = "mrt2_small"
 MAGENTA_SAMPLE_RATE = 48_000
 MRT_FRAMES_PER_SECOND = 25.0
+BEATS_PER_BAR = 4
 MIN_GENERATION_BPM = 40.0
 MAX_GENERATION_BPM = 240.0
 PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -109,28 +110,52 @@ def validate_generation_bpm(bpm: float | None, required: bool = True) -> float |
     return bpm
 
 
-def resolve_duration_seconds(
-    duration_seconds: float | None,
-    duration_bars: int | None,
-    beats_per_bar: int,
-    bpm: float | None,
-) -> float:
-    if duration_bars is not None:
-        bpm = validate_generation_bpm(bpm, required=True)
-        if duration_bars <= 0:
-            raise HTTPException(status_code=400, detail="duration_bars must be greater than 0.")
-        if beats_per_bar <= 0:
-            raise HTTPException(status_code=400, detail="beats_per_bar must be greater than 0.")
-        duration_seconds = (duration_bars * beats_per_bar * 60.0) / bpm
+def resolve_duration_seconds(duration_bars: int | None, bpm: float | None) -> float:
+    bpm = validate_generation_bpm(bpm, required=True)
+    if duration_bars is None:
+        raise HTTPException(status_code=400, detail="duration_bars with bpm is required.")
+    if duration_bars <= 0:
+        raise HTTPException(status_code=400, detail="duration_bars must be greater than 0.")
 
-    if duration_seconds is None:
-        raise HTTPException(status_code=400, detail="duration_seconds or duration_bars with bpm is required.")
+    duration_seconds = (duration_bars * BEATS_PER_BAR * 60.0) / bpm
     if not math.isfinite(duration_seconds):
         raise HTTPException(status_code=400, detail="duration_seconds must be a finite number.")
     if duration_seconds < 1 or duration_seconds > 120:
         raise HTTPException(status_code=400, detail="duration_seconds must be between 1 and 120.")
 
     return duration_seconds
+
+
+def validate_generation_weights(audio_weight: float, text_weight: float) -> tuple[float, float]:
+    if not math.isfinite(audio_weight):
+        raise HTTPException(status_code=400, detail="audio_weight must be a finite number.")
+    if audio_weight < 0 or audio_weight > 1:
+        raise HTTPException(status_code=400, detail="audio_weight must be between 0 and 1.")
+    if not math.isfinite(text_weight):
+        raise HTTPException(status_code=400, detail="text_weight must be a finite number.")
+    if text_weight < 1 or text_weight > 5:
+        raise HTTPException(status_code=400, detail="text_weight must be between 1 and 5.")
+
+    return audio_weight, text_weight
+
+
+def format_bpm_for_style_prompt(bpm: float) -> str:
+    rounded_bpm = round(bpm)
+    if math.isclose(bpm, rounded_bpm, abs_tol=0.05):
+        return str(rounded_bpm)
+    return f"{bpm:.1f}"
+
+
+def build_mrt_style_prompt(prompt: str, bpm: float, detected_key: DetectedKey) -> str:
+    clean_prompt = prompt.strip()
+    return f"{format_bpm_for_style_prompt(bpm)} bpm {clean_prompt} in {detected_key.name}"
+
+
+def as_style_vector(style: Any) -> np.ndarray:
+    vector = np.asarray(style, dtype=np.float32)
+    if vector.ndim == 2 and vector.shape[0] == 1:
+        vector = vector[0]
+    return vector
 
 
 def frames_per_beat_for_bpm(bpm: float) -> int:
@@ -257,12 +282,11 @@ def analyze_reference(
     samples: np.ndarray,
     sample_rate: int,
     bpm: float,
-    beats_per_bar: int,
     duration_bars: int | None,
     duration_seconds: float,
 ) -> dict[str, Any]:
     target_samples = int(round(duration_seconds * sample_rate))
-    total_beats = max(1, int(duration_bars * beats_per_bar) if duration_bars else math.ceil(duration_seconds * bpm / 60.0))
+    total_beats = max(1, int(duration_bars * BEATS_PER_BAR) if duration_bars else math.ceil(duration_seconds * bpm / 60.0))
     tiled = trim_or_tile(samples, target_samples)
     mono = np.mean(tiled, axis=1)
     beat_energy, onset_density = beat_grid_features(mono, sample_rate, bpm, total_beats)
@@ -439,11 +463,9 @@ def health():
 async def generate(
     audio_file: UploadFile = File(..., description="Reference audio file (WAV, 48kHz preferred)"),
     prompt: str = Form(..., description="Text style prompt e.g. 'dark trap 808s'"),
-    audio_weight: float = Form(2.0, description="Weight for audio prompt (default 2.0)"),
+    audio_weight: float = Form(0.5, description="Weight for audio prompt (default 0.5)"),
     text_weight: float = Form(1.0, description="Weight for text prompt (default 1.0)"),
-    duration_seconds: float | None = Form(None, description="Output duration in seconds"),
     duration_bars: int | None = Form(None, description="Output duration in bars"),
-    beats_per_bar: int = Form(4, description="Beats per bar"),
     bpm: float | None = Form(None, description="Project tempo in beats per minute"),
     stem_role: str = Form("auto", description="Complementary stem role: auto, melody, bass, drums, or texture"),
     avoid_clash: bool = Form(True, description="Apply spectral anti-clash processing"),
@@ -459,9 +481,8 @@ async def generate(
 
     # --- Resolve and validate duration ---
     generation_bpm = validate_generation_bpm(bpm, required=True)
-    duration_seconds = resolve_duration_seconds(duration_seconds, duration_bars, beats_per_bar, bpm)
-    if audio_weight + text_weight <= 0:
-        raise HTTPException(status_code=400, detail="audio_weight + text_weight must be greater than 0.")
+    duration_seconds = resolve_duration_seconds(duration_bars, bpm)
+    validate_generation_weights(audio_weight, text_weight)
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be greater than 0.")
 
@@ -483,7 +504,7 @@ async def generate(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Could not read audio file: {e}")
         reference_samples = load_reference_audio(tmp_path, MAGENTA_SAMPLE_RATE)
-        analysis = analyze_reference(reference_samples, MAGENTA_SAMPLE_RATE, generation_bpm, beats_per_bar, duration_bars, duration_seconds)
+        analysis = analyze_reference(reference_samples, MAGENTA_SAMPLE_RATE, generation_bpm, duration_bars, duration_seconds)
         conditioning = build_conditioning(analysis, stem_role)
         detected_key: DetectedKey = analysis["detected_key"]
         scale_pitch_classes = pitch_classes_for_key(detected_key, analysis["pitch_classes"])
@@ -498,12 +519,12 @@ async def generate(
         )
 
         # --- Blend styles ---
-        weighted_styles = [
-            (audio_weight, my_audio),
-            (text_weight, prompt),
-        ]
-        weights = np.array([w for w, _ in weighted_styles])
-        styles = style_model.embed([s for _, s in weighted_styles])
+        mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key)
+        print(f"MRT style prompt: {mrt_style_prompt}")
+        audio_style = as_style_vector(style_model.embed([my_audio]))
+        text_style = as_style_vector(mrt.embed_style(mrt_style_prompt, use_mapper=True))
+        weights = np.array([audio_weight, text_weight], dtype=np.float32)
+        styles = np.stack([audio_style, text_style])
         weights_norm = weights / weights.sum()
         blended_style = (weights_norm[:, np.newaxis] * styles).mean(axis=0).astype(np.float32)
 

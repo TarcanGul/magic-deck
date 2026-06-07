@@ -33,7 +33,6 @@ interface ReferenceAudio {
 
 const REFERENCE_AUDIO_SECONDS = 8
 const MAGIC_DURATION_BARS = 16
-const BEATS_PER_BAR = 4
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -711,9 +710,9 @@ function magentaEndpoint() {
   return (magentaUrl.value.trim() || 'http://localhost:8000').replace(/\/+$/, '')
 }
 
-function getMagicDurationSeconds() {
+function getMagicGenerationBpm() {
   if (!currentProjectBpm || currentProjectBpm <= 0) throw new Error('Project BPM required for 16-bar duration')
-  return (MAGIC_DURATION_BARS * BEATS_PER_BAR * 60) / currentProjectBpm
+  return currentProjectBpm
 }
 
 function describeMagentaError(error: unknown) {
@@ -734,16 +733,14 @@ async function generateMagicAudio() {
   setMagicStatus('generating', 'CAPTURING'); btnGenerate.disabled = true
   try {
     const reference = buildReferenceAudio()
-    const durationSeconds = getMagicDurationSeconds()
+    const generationBpm = getMagicGenerationBpm()
     const form = new FormData()
     form.append('audio_file', reference.blob, reference.fileName)
     form.append('prompt', promptText)
     form.append('audio_weight', String(audioWeight))
     form.append('text_weight', String(textWeight))
     form.append('duration_bars', String(MAGIC_DURATION_BARS))
-    form.append('beats_per_bar', String(BEATS_PER_BAR))
-    form.append('bpm', String(currentProjectBpm))
-    form.append('duration_seconds', String(durationSeconds))
+    form.append('bpm', String(generationBpm))
     form.append('stem_role', 'auto')
     form.append('avoid_clash', 'true')
 
