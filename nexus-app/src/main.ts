@@ -13,7 +13,10 @@ interface DeckState {
   gainNode: GainNode | null; audioBuffer: AudioBuffer | null
   isPlaying: boolean; isPaused: boolean; pauseOffset: number
   startedAt: number; looping: boolean; fileName: string | null
+  baseBpm: number | null; pitchPercent: number; playbackRate: number
 }
+type DeckPrefix = 'd1' | 'd2' | 'd3'
+type WaveformDeckIndex = 0 | 1 | 2
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -22,6 +25,8 @@ interface ReferenceAudio {
 }
 
 const REFERENCE_AUDIO_SECONDS = 8
+const MAGIC_DURATION_BARS = 16
+const BEATS_PER_BAR = 4
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
@@ -29,11 +34,13 @@ let nexus: SyncedDocument | null = null
 let magicGainEntity: NexusEntity<'tinyGain'> | null = null
 let lastLoadedDeckIndex: 0 | 1 | null = null
 let lastPlayedDeckIndex: 0 | 1 | null = null
+let currentProjectBpm: number | null = null
+let waveformAnimationFrame: number | null = null
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -54,10 +61,8 @@ const magicStatusLabel = el<HTMLSpanElement>('magic-status-label')
 const magicPrompt = el<HTMLInputElement>('magic-prompt')
 const magicAudioWeight = el<HTMLInputElement>('magic-audio-weight')
 const magicTextWeight = el<HTMLInputElement>('magic-text-weight')
-const magicDuration = el<HTMLInputElement>('magic-duration')
 const audioWeightVal = el<HTMLSpanElement>('audio-weight-val')
 const textWeightVal = el<HTMLSpanElement>('text-weight-val')
-const durationVal = el<HTMLSpanElement>('duration-val')
 const magicGain = el<HTMLInputElement>('magic-gain')
 const magicGainVal = el<HTMLSpanElement>('magic-gain-val')
 const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
@@ -164,10 +169,10 @@ async function connectProject() {
   try {
     nexus = await at.open(projectUrl)
     nexus.connected.subscribe((c) => setStatus(c ? 'connected' : 'error', c ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…'))
+    loadBPM()
     await nexus.start()
     setStatus('connected', 'SYNCED ↔ PROJECT ACTIVE')
     localStorage.setItem('nexus_project_url', projectUrl)
-    loadBPM()
     await initMagicGain()
   } catch (e: unknown) {
     setStatus('error', `PROJECT ERROR: ${e instanceof Error ? e.message : String(e)}`)
@@ -187,13 +192,21 @@ async function updateMagicGain(value: number) {
   try { const f = magicGainEntity.fields.gain; await nexus.modify((t) => { t.update(f, value) }) }
   catch (e) { console.warn('[NEXUS] gain update:', e) }
 }
+function updateDeckBpmLabels(bpm: number | null) {
+  const value = bpm === null ? '—' : String(Math.round(bpm))
+  decks.forEach((deck) => { deck.baseBpm = bpm })
+  el('deck1-bpm').textContent = value
+  el('deck2-bpm').textContent = value
+  el('deck3-bpm').textContent = value
+}
 function loadBPM() {
   if (!nexus) return
   nexus.events.onCreate('config', (cfg) => {
     nexus!.events.onUpdate(cfg.fields.tempoBpm, (bpm) => {
-      const v = String(Math.round(Number(bpm)))
-      el('deck1-bpm').textContent = v; el('deck2-bpm').textContent = v
-    })
+      const nextBpm = Number(bpm)
+      currentProjectBpm = Number.isFinite(nextBpm) ? nextBpm : null
+      updateDeckBpmLabels(currentProjectBpm)
+    }, true)
   })
 }
 async function uploadToNexus(deckNum: number, file: File) {
@@ -221,23 +234,58 @@ function ensureCtx(deck: DeckState) {
     deck.gainNode.connect(deck.audioCtx.destination); deck.gainNode.gain.value = 0.8
   }
 }
-function deckPlay(deck: DeckState) {
+function clampPitchPercent(value: number) {
+  return Math.max(-8, Math.min(8, value))
+}
+function formatPitch(value: number) {
+  const rounded = Number(value.toFixed(1))
+  return `${rounded >= 0 ? '+' : ''}${rounded.toFixed(1)}%`
+}
+function normalizeDeckOffset(deck: DeckState, offset: number) {
+  if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return 0
+  if (deck.looping) return ((offset % deck.audioBuffer.duration) + deck.audioBuffer.duration) % deck.audioBuffer.duration
+  return Math.max(0, Math.min(offset, Math.max(0, deck.audioBuffer.duration - 0.001)))
+}
+function updateDeckPlaybackRate(deck: DeckState, pitchPercent: number) {
+  const nextPitch = clampPitchPercent(pitchPercent)
+  const nextRate = Math.max(0.01, 1 + nextPitch / 100)
+  if (deck.isPlaying && deck.audioCtx) {
+    deck.pauseOffset = getDeckPositionSeconds(deck)
+    deck.startedAt = deck.audioCtx.currentTime
+  }
+  deck.pitchPercent = nextPitch
+  deck.playbackRate = nextRate
+  if (deck.sourceNode) deck.sourceNode.playbackRate.value = nextRate
+}
+function deckPlay(deck: DeckState, onEnded?: () => void) {
   if (!deck.audioCtx || !deck.audioBuffer || deck.isPlaying) return
   const src = deck.audioCtx.createBufferSource()
-  src.buffer = deck.audioBuffer; src.loop = deck.looping; src.connect(deck.gainNode!)
-  const off = deck.isPaused ? deck.pauseOffset : 0
-  src.start(0, off); deck.sourceNode = src
-  deck.startedAt = deck.audioCtx.currentTime - off; deck.isPlaying = true; deck.isPaused = false
-  src.onended = () => { if (deck.isPlaying) { deck.isPlaying = false; deck.pauseOffset = 0 } }
+  src.buffer = deck.audioBuffer; src.loop = deck.looping; src.playbackRate.value = deck.playbackRate; src.connect(deck.gainNode!)
+  const normalizedOffset = normalizeDeckOffset(deck, deck.pauseOffset)
+  src.start(0, normalizedOffset); deck.sourceNode = src
+  deck.startedAt = deck.audioCtx.currentTime; deck.pauseOffset = normalizedOffset; deck.isPlaying = true; deck.isPaused = false
+  src.onended = () => {
+    if (!deck.isPlaying || deck.sourceNode !== src) return
+    deck.sourceNode = null; deck.isPlaying = false; deck.isPaused = false; deck.pauseOffset = 0
+    redrawDeckWaveformByState(deck)
+    onEnded?.()
+  }
+  scheduleWaveformRendering()
 }
 function deckPause(deck: DeckState) {
   if (!deck.audioCtx || !deck.isPlaying) return
-  deck.pauseOffset = deck.audioCtx.currentTime - deck.startedAt
-  deck.sourceNode?.stop(); deck.sourceNode = null; deck.isPlaying = false; deck.isPaused = true
+  deck.pauseOffset = getDeckPositionSeconds(deck)
+  const source = deck.sourceNode
+  deck.sourceNode = null; deck.isPlaying = false; deck.isPaused = true
+  source?.stop()
+  redrawDeckWaveformByState(deck)
 }
 function deckStop(deck: DeckState) {
-  deck.sourceNode?.stop(); deck.sourceNode = null
+  const source = deck.sourceNode
+  deck.sourceNode = null
   deck.isPlaying = false; deck.isPaused = false; deck.pauseOffset = 0
+  source?.stop()
+  redrawDeckWaveformByState(deck)
 }
 async function loadAudioFile(deckIndex: 0 | 1, file: File) {
   const deck = decks[deckIndex]; ensureCtx(deck)
@@ -251,8 +299,17 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File) {
 }
 
 // ── WAVEFORM ──────────────────────────────────────────────────────────────────
-function drawWaveform(id: string, buf: AudioBuffer) {
-  const canvas = el<HTMLCanvasElement>(id), ctx = canvas.getContext('2d')!
+function getWaveformCanvas(deckIndex: WaveformDeckIndex) {
+  return el<HTMLCanvasElement>(deckIndex === 2 ? 'magic-waveform' : `waveform-${deckIndex + 1}`)
+}
+
+function getDeckIndex(deck: DeckState): WaveformDeckIndex | null {
+  const index = decks.indexOf(deck)
+  return index === -1 ? null : index as WaveformDeckIndex
+}
+
+function drawWaveformBase(canvas: HTMLCanvasElement, buf: AudioBuffer) {
+  const ctx = canvas.getContext('2d')!
   const W = canvas.width, H = canvas.height, data = buf.getChannelData(0)
   const step = Math.ceil(data.length / W), mid = H / 2
   ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H)
@@ -262,6 +319,83 @@ function drawWaveform(id: string, buf: AudioBuffer) {
     for (let j = 0; j < step; j++) { const d = data[i * step + j]; if (d !== undefined) { if (d < lo) lo = d; if (d > hi) hi = d } }
     ctx.strokeStyle = `rgb(${Math.round(60 + (i / W) * 144)},0,0)`
     ctx.beginPath(); ctx.moveTo(i, mid + lo * mid * 0.9); ctx.lineTo(i, mid + hi * mid * 0.9); ctx.stroke()
+  }
+}
+
+function drawWaveformPlayhead(canvas: HTMLCanvasElement, deck: DeckState) {
+  if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return
+  const ctx = canvas.getContext('2d')!
+  const W = canvas.width, H = canvas.height
+  const ratio = getDeckPositionSeconds(deck) / deck.audioBuffer.duration
+  const x = Math.max(0, Math.min(W - 1, ratio * W))
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.moveTo(Math.round(x) + 0.5, 0)
+  ctx.lineTo(Math.round(x) + 0.5, H)
+  ctx.stroke()
+}
+
+function redrawDeckWaveform(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  if (!deck.audioBuffer) return
+  const canvas = getWaveformCanvas(deckIndex)
+  drawWaveformBase(canvas, deck.audioBuffer)
+  drawWaveformPlayhead(canvas, deck)
+}
+
+function redrawDeckWaveformByState(deck: DeckState) {
+  const deckIndex = getDeckIndex(deck)
+  if (deckIndex === null) return
+  redrawDeckWaveform(deckIndex)
+}
+
+function anyWaveformLoaded() {
+  return decks.some((deck) => deck.audioBuffer)
+}
+
+function scheduleWaveformRendering() {
+  if (waveformAnimationFrame !== null || !anyWaveformLoaded()) return
+
+  const tick = () => {
+    ([0, 1, 2] as WaveformDeckIndex[]).forEach(redrawDeckWaveform)
+    waveformAnimationFrame = anyWaveformLoaded() ? requestAnimationFrame(tick) : null
+  }
+
+  waveformAnimationFrame = requestAnimationFrame(tick)
+}
+
+function drawWaveform(id: string, buf: AudioBuffer) {
+  drawWaveformBase(el<HTMLCanvasElement>(id), buf)
+  scheduleWaveformRendering()
+}
+
+function getWaveformClickSeconds(canvas: HTMLCanvasElement, deck: DeckState, event: MouseEvent) {
+  if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return null
+  const rect = canvas.getBoundingClientRect()
+  const clickedX = Math.max(0, Math.min(event.clientX - rect.left, rect.width))
+  const ratio = rect.width > 0 ? clickedX / rect.width : 0
+  return ratio * deck.audioBuffer.duration
+}
+
+function seekDeck(deck: DeckState, offsetSeconds: number, onEnded?: () => void) {
+  if (!deck.audioBuffer) return
+  const wasPlaying = deck.isPlaying
+  const wasPaused = deck.isPaused
+  const source = deck.sourceNode
+  const normalizedOffset = normalizeDeckOffset(deck, offsetSeconds)
+
+  deck.sourceNode = null
+  deck.isPlaying = false
+  deck.isPaused = wasPaused
+  deck.pauseOffset = normalizedOffset
+  source?.stop()
+
+  if (wasPlaying) {
+    deck.isPaused = false
+    deckPlay(deck, onEnded)
+  } else {
+    redrawDeckWaveformByState(deck)
   }
 }
 
@@ -299,12 +433,11 @@ function drawMagicIdle(label = '[ GENERATE AUDIO FROM LAST 8 SECONDS ]') {
 function getDeckPositionSeconds(deck: DeckState) {
   if (!deck.audioBuffer) return 0
   if (deck.isPlaying && deck.audioCtx) {
-    const elapsed = deck.audioCtx.currentTime - deck.startedAt
-    if (deck.looping && deck.audioBuffer.duration > 0) return ((elapsed % deck.audioBuffer.duration) + deck.audioBuffer.duration) % deck.audioBuffer.duration
+    const elapsed = deck.pauseOffset + ((deck.audioCtx.currentTime - deck.startedAt) * deck.playbackRate)
+    if (deck.looping && deck.audioBuffer.duration > 0) return normalizeDeckOffset(deck, elapsed)
     return Math.max(0, Math.min(elapsed, deck.audioBuffer.duration))
   }
-  if (deck.isPaused) return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
-  return deck.audioBuffer.duration
+  return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
 }
 
 function selectReferenceDeck(): { deck: DeckState; deckIndex: 0 | 1 } | null {
@@ -409,6 +542,11 @@ function magentaEndpoint() {
   return (magentaUrl.value.trim() || 'http://localhost:8000').replace(/\/+$/, '')
 }
 
+function getMagicDurationSeconds() {
+  if (!currentProjectBpm || currentProjectBpm <= 0) throw new Error('Project BPM required for 16-bar duration')
+  return (MAGIC_DURATION_BARS * BEATS_PER_BAR * 60) / currentProjectBpm
+}
+
 function describeMagentaError(error: unknown) {
   if (error instanceof TypeError) {
     return `Could not reach Magenta API at ${magentaEndpoint()}. Check that magenta_server.py is running on port 8000.`
@@ -427,12 +565,16 @@ async function generateMagicAudio() {
   setMagicStatus('generating', 'CAPTURING'); btnGenerate.disabled = true
   try {
     const reference = buildReferenceAudio()
+    const durationSeconds = getMagicDurationSeconds()
     const form = new FormData()
     form.append('audio_file', reference.blob, reference.fileName)
     form.append('prompt', promptText)
     form.append('audio_weight', String(audioWeight))
     form.append('text_weight', String(textWeight))
-    form.append('duration_seconds', magicDuration.value)
+    form.append('duration_bars', String(MAGIC_DURATION_BARS))
+    form.append('beats_per_bar', String(BEATS_PER_BAR))
+    form.append('bpm', String(currentProjectBpm))
+    form.append('duration_seconds', String(durationSeconds))
 
     setMagicStatus('generating', `MAGENTA ← DECK ${reference.deckNum}`)
     const resp = await fetch(`${magentaEndpoint()}/generate`, { method: 'POST', body: form })
@@ -452,7 +594,8 @@ async function generateMagicAudio() {
     magicDeck.fileName = generatedFile.name
     if (magicDeck.gainNode) magicDeck.gainNode.gain.value = parseFloat(magicGain.value)
     drawWaveform('magic-waveform', generatedBuffer)
-    deckPlay(magicDeck)
+    deckPlay(magicDeck, () => syncTransportUi('d3', magicDeck))
+    syncTransportUi('d3', magicDeck)
     uploadToNexus(3, generatedFile)
 
     setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF`); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
@@ -483,15 +626,65 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
 }
 
 // ── TRANSPORT ─────────────────────────────────────────────────────────────────
-function wireTransport(prefix: 'd1' | 'd2', deckIndex: 0 | 1) {
+function syncTransportUi(prefix: DeckPrefix, deck: DeckState) {
+  el<HTMLButtonElement>(`${prefix}-play`).classList.toggle('active', deck.isPlaying)
+  el<HTMLButtonElement>(`${prefix}-pause`).classList.toggle('active', deck.isPaused)
+  el<HTMLButtonElement>(`${prefix}-loop`).classList.toggle('active', deck.looping)
+  el<HTMLSpanElement>(`${prefix}-pitch`).textContent = formatPitch(deck.pitchPercent)
+}
+function setupWaveformSeek(prefix: DeckPrefix, deckIndex: WaveformDeckIndex) {
+  const canvas = getWaveformCanvas(deckIndex)
+  const deck = decks[deckIndex]
+  canvas.addEventListener('click', (event) => {
+    const offsetSeconds = getWaveformClickSeconds(canvas, deck, event)
+    if (offsetSeconds === null) return
+    const wasPlaying = deck.isPlaying
+    seekDeck(deck, offsetSeconds, () => syncTransportUi(prefix, deck))
+    if (wasPlaying && (deckIndex === 0 || deckIndex === 1)) lastPlayedDeckIndex = deckIndex
+    syncTransportUi(prefix, deck)
+  })
+}
+function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const deck = decks[deckIndex]
   const playBtn = el<HTMLButtonElement>(`${prefix}-play`), pauseBtn = el<HTMLButtonElement>(`${prefix}-pause`)
-  const volSlider = el<HTMLInputElement>(`${prefix}-vol`), volVal = el<HTMLSpanElement>(`${prefix}-vol-val`)
-  playBtn.addEventListener('click', () => { deckPlay(deck); lastPlayedDeckIndex = deckIndex; playBtn.classList.add('active'); pauseBtn.classList.remove('active') })
-  pauseBtn.addEventListener('click', () => { deckPause(deck); pauseBtn.classList.add('active'); playBtn.classList.remove('active') })
-  el<HTMLButtonElement>(`${prefix}-stop`).addEventListener('click', () => { deckStop(deck); playBtn.classList.remove('active'); pauseBtn.classList.remove('active') })
-  el<HTMLButtonElement>(`${prefix}-loop`).addEventListener('click', function () { deck.looping = !deck.looping; this.classList.toggle('active', deck.looping); if (deck.sourceNode) deck.sourceNode.loop = deck.looping })
-  volSlider.addEventListener('input', () => { const v = parseFloat(volSlider.value); volVal.textContent = String(Math.round(v * 100)); ensureCtx(deck); if (deck.gainNode) deck.gainNode.gain.value = v })
+  const volSlider = document.getElementById(`${prefix}-vol`) as HTMLInputElement | null
+  const volVal = document.getElementById(`${prefix}-vol-val`) as HTMLSpanElement | null
+
+  playBtn.addEventListener('click', () => {
+    deckPlay(deck, () => syncTransportUi(prefix, deck))
+    if (deckIndex === 0 || deckIndex === 1) lastPlayedDeckIndex = deckIndex
+    syncTransportUi(prefix, deck)
+  })
+  pauseBtn.addEventListener('click', () => { deckPause(deck); syncTransportUi(prefix, deck) })
+  el<HTMLButtonElement>(`${prefix}-stop`).addEventListener('click', () => { deckStop(deck); syncTransportUi(prefix, deck) })
+  el<HTMLButtonElement>(`${prefix}-loop`).addEventListener('click', () => {
+    deck.looping = !deck.looping
+    if (deck.sourceNode) deck.sourceNode.loop = deck.looping
+    syncTransportUi(prefix, deck)
+  })
+  volSlider?.addEventListener('input', () => {
+    const v = parseFloat(volSlider.value)
+    if (volVal) volVal.textContent = String(Math.round(v * 100))
+    ensureCtx(deck)
+    if (deck.gainNode) deck.gainNode.gain.value = v
+  })
+
+  if (prefix === 'd3') {
+    const pitchWheel = el<HTMLInputElement>('d3-pitch-wheel')
+    const pitchReset = el<HTMLButtonElement>('d3-pitch-reset')
+    const setMagicPitch = (value: number) => {
+      updateDeckPlaybackRate(deck, value)
+      pitchWheel.value = deck.pitchPercent.toFixed(1)
+      syncTransportUi(prefix, deck)
+    }
+
+    pitchWheel.addEventListener('input', () => setMagicPitch(parseFloat(pitchWheel.value)))
+    pitchWheel.addEventListener('dblclick', () => setMagicPitch(0))
+    pitchReset.addEventListener('click', () => setMagicPitch(0))
+  }
+
+  setupWaveformSeek(prefix, deckIndex)
+  syncTransportUi(prefix, deck)
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
@@ -512,11 +705,11 @@ function initApp() {
   setupDropZone('drop-2', 1)
   wireTransport('d1', 0)
   wireTransport('d2', 1)
+  wireTransport('d3', 2)
   document.querySelectorAll<HTMLCanvasElement>('.eq-knob').forEach(initKnob)
 
   magicAudioWeight.addEventListener('input', () => { audioWeightVal.textContent = parseFloat(magicAudioWeight.value).toFixed(1) })
   magicTextWeight.addEventListener('input', () => { textWeightVal.textContent = parseFloat(magicTextWeight.value).toFixed(1) })
-  magicDuration.addEventListener('input', () => { durationVal.textContent = `${magicDuration.value}s` })
   magicGain.addEventListener('input', async () => {
     const v = parseFloat(magicGain.value)
     const magicDeck = decks[2]

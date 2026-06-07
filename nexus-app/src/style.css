@@ -733,6 +733,16 @@ html, body {
   font-family: var(--font-live);
 }
 
+.magic-duration-label {
+  min-height: 16px;
+  font-family: var(--font-data);
+  font-size: 10px;
+  color: var(--red);
+  letter-spacing: 1px;
+  display: flex;
+  align-items: center;
+}
+
 .magic-slider {
   width: 100%;
   accent-color: var(--red);
@@ -790,6 +800,47 @@ html, body {
   display: block;
   background: #050000;
   border: 1px solid var(--red-dim);
+  cursor: crosshair;
+}
+
+.magic-transport {
+  gap: 8px;
+}
+
+.magic-pitch-control {
+  flex: 1;
+  min-width: 180px;
+  max-width: 360px;
+  margin-left: 8px;
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) 28px;
+  align-items: center;
+  gap: 8px;
+}
+
+.pitch-wheel {
+  width: 100%;
+  accent-color: var(--red);
+  cursor: pointer;
+  background: transparent;
+}
+
+.pitch-reset {
+  width: 28px;
+  height: 28px;
+  background: var(--black);
+  border: 1px solid var(--grey-light);
+  color: var(--grey-text);
+  font-family: var(--font-live);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.pitch-reset:hover {
+  color: var(--white);
+  border-color: var(--red);
+  box-shadow: 0 0 8px var(--red-glow2);
 }
 
 /* ============================

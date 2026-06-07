@@ -132,6 +132,7 @@
         <div class="deck-header magic-header">
           <span class="deck-num magic-num">03</span>
           <span class="deck-title magic-title">MAGIC DECK — AI GEN</span>
+          <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck3-bpm">—</span></div>
           <div class="magic-status">
             <span class="status-dot-magic" id="magic-dot"></span>
             <span class="status-label-magic" id="magic-status-label">IDLE</span>
@@ -156,12 +157,26 @@
               <input type="range" id="magic-text-weight" min="0" max="5" step="0.1" value="1" class="magic-slider">
             </div>
             <div class="magic-param">
-              <label class="magic-param-label">DURATION <span id="duration-val">10s</span></label>
-              <input type="range" id="magic-duration" min="2" max="30" step="2" value="10" class="magic-slider">
+              <div class="magic-duration-label">DURATION: 16 BARS</div>
             </div>
           </div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE</button>
           <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>
+          <div class="transport magic-transport">
+            <button class="t-btn" id="d3-play">▶</button>
+            <button class="t-btn" id="d3-pause">⏸</button>
+            <button class="t-btn" id="d3-stop">■</button>
+            <button class="t-btn loop-btn" id="d3-loop">⟲</button>
+            <div class="magic-pitch-control">
+              <span class="pitch-label">TEMPO</span>
+              <input type="range" id="d3-pitch-wheel" min="-8" max="8" step="0.1" value="0" class="pitch-wheel">
+              <button class="pitch-reset" id="d3-pitch-reset">0</button>
+            </div>
+            <div class="pitch-display">
+              <span class="pitch-label">PITCH</span>
+              <span class="pitch-value" id="d3-pitch">+0.0%</span>
+            </div>
+          </div>
           <div class="magic-mix-row">
             <label class="magic-config-label">MIX LEVEL</label>
             <input type="range" id="magic-gain" min="0" max="1" step="0.01" value="0.5" class="h-fader">

@@ -60,6 +60,29 @@ def get_magenta_runtime() -> tuple[Any, Any, Any]:
 
     return magenta_audio, style_model, mrt
 
+
+def resolve_duration_seconds(
+    duration_seconds: float | None,
+    duration_bars: int | None,
+    beats_per_bar: int,
+    bpm: float | None,
+) -> float:
+    if duration_bars is not None:
+        if duration_bars <= 0:
+            raise HTTPException(status_code=400, detail="duration_bars must be greater than 0.")
+        if beats_per_bar <= 0:
+            raise HTTPException(status_code=400, detail="beats_per_bar must be greater than 0.")
+        if bpm is None or bpm <= 0:
+            raise HTTPException(status_code=400, detail="bpm must be greater than 0 when duration_bars is provided.")
+        duration_seconds = (duration_bars * beats_per_bar * 60.0) / bpm
+
+    if duration_seconds is None:
+        raise HTTPException(status_code=400, detail="duration_seconds or duration_bars with bpm is required.")
+    if duration_seconds <= 0 or duration_seconds > 120:
+        raise HTTPException(status_code=400, detail="duration_seconds must be between 1 and 120.")
+
+    return duration_seconds
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -79,16 +102,18 @@ async def generate(
     prompt: str = Form(..., description="Text style prompt e.g. 'dark trap 808s'"),
     audio_weight: float = Form(2.0, description="Weight for audio prompt (default 2.0)"),
     text_weight: float = Form(1.0, description="Weight for text prompt (default 1.0)"),
-    duration_seconds: float = Form(10.0, description="Output duration in seconds (default 10.0)"),
+    duration_seconds: float | None = Form(None, description="Output duration in seconds"),
+    duration_bars: int | None = Form(None, description="Output duration in bars"),
+    beats_per_bar: int = Form(4, description="Beats per bar"),
+    bpm: float | None = Form(None, description="Project tempo in beats per minute"),
 ):
     """
     Generate music blending an uploaded audio file with a text prompt.
     Returns a WAV file.
     """
 
-    # --- Validate duration ---
-    if duration_seconds <= 0 or duration_seconds > 120:
-        raise HTTPException(status_code=400, detail="duration_seconds must be between 1 and 120.")
+    # --- Resolve and validate duration ---
+    duration_seconds = resolve_duration_seconds(duration_seconds, duration_bars, beats_per_bar, bpm)
 
     try:
         audio, style_model, mrt = get_magenta_runtime()
