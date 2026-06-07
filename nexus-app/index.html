@@ -75,6 +75,13 @@
               </div>
               <div class="fader-val" id="d1-vol-val">80</div>
             </div>
+            <div class="fader-section">
+              <div class="fader-label">GAIN</div>
+              <div class="fader-wrap">
+                <input type="range" class="v-fader" id="d1-gain" min="1" max="2" step="0.01" value="1" orient="vertical">
+              </div>
+              <div class="fader-val" id="d1-gain-val">1.0x</div>
+            </div>
             <div class="eq-section">
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
@@ -117,6 +124,13 @@
                 <input type="range" class="v-fader" id="d2-vol" min="0" max="1" step="0.01" value="0.8" orient="vertical">
               </div>
               <div class="fader-val" id="d2-vol-val">80</div>
+            </div>
+            <div class="fader-section">
+              <div class="fader-label">GAIN</div>
+              <div class="fader-wrap">
+                <input type="range" class="v-fader" id="d2-gain" min="1" max="2" step="0.01" value="1" orient="vertical">
+              </div>
+              <div class="fader-val" id="d2-gain-val">1.0x</div>
             </div>
             <div class="eq-section">
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
@@ -167,23 +181,26 @@
             <button class="t-btn" id="d3-pause">⏸</button>
             <button class="t-btn" id="d3-stop">■</button>
             <button class="t-btn loop-btn" id="d3-loop">⟲</button>
-            <div class="magic-pitch-control">
-              <span class="pitch-label">TEMPO</span>
-              <input type="range" id="d3-pitch-wheel" min="-8" max="8" step="0.1" value="0" class="pitch-wheel">
-              <button class="pitch-reset" id="d3-pitch-reset">0</button>
-            </div>
             <div class="pitch-display">
               <span class="pitch-label">PITCH</span>
               <span class="pitch-value" id="d3-pitch">+0.0%</span>
             </div>
           </div>
-          <div class="magic-mix-row">
-            <label class="magic-config-label">MIX LEVEL</label>
-            <input type="range" id="magic-gain" min="0" max="1" step="0.01" value="0.5" class="h-fader">
-            <span class="magic-gain-val" id="magic-gain-val">50%</span>
-          </div>
-          <div class="magic-eq-row">
-            <label class="magic-config-label">EQ</label>
+          <div class="controls-row magic-controls-row">
+            <div class="fader-section">
+              <div class="fader-label">VOL</div>
+              <div class="fader-wrap">
+                <input type="range" class="v-fader" id="d3-vol" min="0" max="1" step="0.01" value="0.8" orient="vertical">
+              </div>
+              <div class="fader-val" id="d3-vol-val">80</div>
+            </div>
+            <div class="fader-section">
+              <div class="fader-label">GAIN</div>
+              <div class="fader-wrap">
+                <input type="range" class="v-fader" id="d3-gain" min="1" max="2" step="0.01" value="1" orient="vertical">
+              </div>
+              <div class="fader-val" id="d3-gain-val">1.0x</div>
+            </div>
             <div class="eq-section">
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>

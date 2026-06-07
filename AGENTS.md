@@ -3,6 +3,7 @@
 ## Project Structure & Module Organization
 
 This repository contains a single Vite/TypeScript Audiotool API app in `nexus-app/src`. It authenticates with Audiotool, connects to an Audiotool DAW project, and syncs controls through `@audiotool/nexus`.
+The connected Audiotool project is the source of truth for project state. UI controls that represent project settings should read from and write to Nexus/Audiotool entities rather than relying only on local app state.
 Key files are:
 
 - `nexus-app/src/main.ts`: app state, Nexus authentication, DAW project connection, deck controls, audio engine, and UI events.

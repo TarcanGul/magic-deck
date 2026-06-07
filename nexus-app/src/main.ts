@@ -16,6 +16,7 @@ interface DeckState {
   isPlaying: boolean; isPaused: boolean; pauseOffset: number
   startedAt: number; looping: boolean; fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
+  volume: number; gainTrim: number
   sampleBpm: number | null; regionEntity: NexusEntity<'audioRegion'> | null
   trackEntity: NexusEntity<'audioTrack'> | null; audioDeviceEntity: NexusEntity<'audioDevice'> | null
   mixerChannelEntity: NexusEntity<'mixerChannel'> | null
@@ -33,19 +34,19 @@ interface ReferenceAudio {
 const REFERENCE_AUDIO_SECONDS = 8
 const MAGIC_DURATION_BARS = 16
 const BEATS_PER_BAR = 4
+const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
-let magicGainEntity: NexusEntity<'tinyGain'> | null = null
 let lastLoadedDeckIndex: 0 | 1 | null = null
 let currentProjectBpm: number | null = null
 let waveformAnimationFrame: number | null = null
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -68,8 +69,6 @@ const magicAudioWeight = el<HTMLInputElement>('magic-audio-weight')
 const magicTextWeight = el<HTMLInputElement>('magic-text-weight')
 const audioWeightVal = el<HTMLSpanElement>('audio-weight-val')
 const textWeightVal = el<HTMLSpanElement>('text-weight-val')
-const magicGain = el<HTMLInputElement>('magic-gain')
-const magicGainVal = el<HTMLSpanElement>('magic-gain-val')
 const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -131,7 +130,6 @@ async function init() {
 async function disconnectAll() {
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
   if (at) { try { at.logout() } catch (_) {}; at = null }
-  magicGainEntity = null
   decks.forEach(clearDeckProjectEntities)
   statusUser.textContent = ''
   projectUrlRow.style.display = 'none'
@@ -179,7 +177,6 @@ async function connectProject() {
     await nexus.start()
     setStatus('connected', 'SYNCED ↔ PROJECT ACTIVE')
     localStorage.setItem('nexus_project_url', projectUrl)
-    await initMagicGain()
   } catch (e: unknown) {
     setStatus('error', `PROJECT ERROR: ${e instanceof Error ? e.message : String(e)}`)
     nexus = null
@@ -188,16 +185,6 @@ async function connectProject() {
 }
 
 // ── NEXUS ─────────────────────────────────────────────────────────────────────
-async function initMagicGain() {
-  if (!nexus) return
-  try { magicGainEntity = await nexus.modify((t) => t.create('tinyGain', { displayName: 'MAGIC DECK MIX', gain: 0.5 })) }
-  catch (e) { console.warn('[NEXUS] tinyGain:', e) }
-}
-async function updateMagicGain(value: number) {
-  if (!nexus || !magicGainEntity) return
-  try { const f = magicGainEntity.fields.gain; await nexus.modify((t) => { t.update(f, value) }) }
-  catch (e) { console.warn('[NEXUS] gain update:', e) }
-}
 function updateDeckBpmLabels(bpm: number | null) {
   currentProjectBpm = bpm
   decks.forEach((deck, index) => {
@@ -301,6 +288,7 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   deck.mixerChannelEntity = inserted.mixerChannel
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
   applyCurrentDeckEq((deckNum - 1) as WaveformDeckIndex)
+  void applyCurrentDeckLevels((deckNum - 1) as WaveformDeckIndex)
   return inserted
 }
 
@@ -352,11 +340,40 @@ function applyCurrentDeckEq(deckIndex: WaveformDeckIndex) {
   })
 }
 
+async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  if (!nexus || !deck.mixerChannelEntity) {
+    setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT LEVELS`)
+    return
+  }
+
+  try {
+    await nexus.modify((t) => {
+      const channel = t.entities.ofTypes('mixerChannel').getEntity(deck.mixerChannelEntity!.id) ?? deck.mixerChannelEntity!
+      t.update(channel.fields.faderParameters.fields.postGain, deck.volume)
+      t.update(channel.fields.preGain, PROJECT_PRE_GAIN_BASE * deck.gainTrim)
+    })
+  } catch (e) {
+    console.warn('[NEXUS] level update:', e)
+    setStatus('error', `LEVEL UPDATE FAILED: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+function applyCurrentDeckLevels(deckIndex: WaveformDeckIndex) {
+  applyDeckPreviewGain(decks[deckIndex])
+  return applyDeckProjectLevels(deckIndex)
+}
+
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
+function applyDeckPreviewGain(deck: DeckState) {
+  if (deck.gainNode) deck.gainNode.gain.value = deck.volume * deck.gainTrim
+}
+
 function ensureCtx(deck: DeckState) {
   if (!deck.audioCtx) {
     deck.audioCtx = new AudioContext(); deck.gainNode = deck.audioCtx.createGain()
-    deck.gainNode.connect(deck.audioCtx.destination); deck.gainNode.gain.value = 0.8
+    deck.gainNode.connect(deck.audioCtx.destination)
+    applyDeckPreviewGain(deck)
   }
 }
 function formatPitch(value: number) {
@@ -664,7 +681,7 @@ async function generateMagicAudio() {
     magicDeck.looping = true
     magicDeck.audioBuffer = generatedBuffer
     magicDeck.fileName = generatedFile.name
-    if (magicDeck.gainNode) magicDeck.gainNode.gain.value = parseFloat(magicGain.value)
+    applyDeckPreviewGain(magicDeck)
     drawWaveform('magic-waveform', generatedBuffer)
     syncTransportUi('d3', magicDeck)
     await uploadToNexus(3, generatedFile, true)
@@ -718,6 +735,8 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const loopBtn = el<HTMLButtonElement>(`${prefix}-loop`)
   const volSlider = document.getElementById(`${prefix}-vol`) as HTMLInputElement | null
   const volVal = document.getElementById(`${prefix}-vol-val`) as HTMLSpanElement | null
+  const gainSlider = document.getElementById(`${prefix}-gain`) as HTMLInputElement | null
+  const gainVal = document.getElementById(`${prefix}-gain-val`) as HTMLSpanElement | null
 
   const transportButtons = [playBtn, pauseBtn, stopBtn, loopBtn]
   transportButtons.forEach((button) => {
@@ -727,20 +746,20 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   })
 
   volSlider?.addEventListener('input', () => {
-    const v = parseFloat(volSlider.value)
-    if (volVal) volVal.textContent = String(Math.round(v * 100))
+    deck.volume = parseFloat(volSlider.value)
+    if (volVal) volVal.textContent = String(Math.round(deck.volume * 100))
     ensureCtx(deck)
-    if (deck.gainNode) deck.gainNode.gain.value = v
+    applyDeckPreviewGain(deck)
+    void applyDeckProjectLevels(deckIndex)
   })
 
-  if (prefix === 'd3') {
-    const pitchWheel = el<HTMLInputElement>('d3-pitch-wheel')
-    const pitchReset = el<HTMLButtonElement>('d3-pitch-reset')
-    pitchWheel.disabled = true
-    pitchWheel.title = 'Magic audio follows the inserted Audiotool timeline loop'
-    pitchReset.disabled = true
-    pitchReset.title = 'Magic audio follows the inserted Audiotool timeline loop'
-  }
+  gainSlider?.addEventListener('input', () => {
+    deck.gainTrim = parseFloat(gainSlider.value)
+    if (gainVal) gainVal.textContent = `${deck.gainTrim.toFixed(1)}x`
+    ensureCtx(deck)
+    applyDeckPreviewGain(deck)
+    void applyDeckProjectLevels(deckIndex)
+  })
 
   setupWaveformSeek(prefix, deckIndex)
   syncTransportUi(prefix, deck)
@@ -769,13 +788,6 @@ function initApp() {
 
   magicAudioWeight.addEventListener('input', () => { audioWeightVal.textContent = parseFloat(magicAudioWeight.value).toFixed(1) })
   magicTextWeight.addEventListener('input', () => { textWeightVal.textContent = parseFloat(magicTextWeight.value).toFixed(1) })
-  magicGain.addEventListener('input', async () => {
-    const v = parseFloat(magicGain.value)
-    const magicDeck = decks[2]
-    magicGainVal.textContent = `${Math.round(v * 100)}%`
-    if (magicDeck.gainNode) magicDeck.gainNode.gain.value = v
-    await updateMagicGain(v)
-  })
   btnGenerate.addEventListener('click', generateMagicAudio)
   drawMagicIdle()
 
