@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NEXUS — DJ PERFORMANCE SYSTEM</title>
+  <title>MAGIC-DECK - DJ PERFORMANCE SYSTEM</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -13,7 +13,7 @@
   <div id="app">
     <!-- STATUS BAR -->
     <div id="status-bar">
-      <div id="status-logo">NEXUS<span class="red">///</span>DJ</div>
+      <div id="status-logo">MAGIC<span class="red"> </span>DECK</div>
       <div id="status-messages">
         <span id="status-dot" class="dot idle"></span>
         <span id="status-text">LOADING…</span>
@@ -213,5 +213,25 @@
     </div>
   </div>
   <script type="module" src="./src/main.ts"></script>
+
+<!-- Native-style modal for creating a project -->
+<div id="create-modal" class="modal-overlay is-hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-kicker">NEW PROJECT</span>
+      <h2 class="modal-title">Create New Audiotool Project</h2>
+    </div>
+    <div class="modal-body">
+      <label class="modal-label" for="modal-project-name">PROJECT NAME</label>
+      <input type="text" id="modal-project-name" class="modal-input" placeholder="My DJ Set" value="My DJ Set" autocomplete="off" />
+      <label class="modal-label" for="modal-project-description">DESCRIPTION <span>OPTIONAL</span></label>
+      <textarea id="modal-project-description" class="modal-input modal-textarea" placeholder="Set notes, vibe, anything…"></textarea>
+    </div>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn-danger">⬡ CANCEL</button>
+      <button id="modal-confirm" class="btn-primary">⬡ CREATE</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
