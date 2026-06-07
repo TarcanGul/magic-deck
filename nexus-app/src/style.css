@@ -487,3 +487,9 @@ input[type="range"]:not(.v-fader)::-moz-range-thumb {
   justify-content: flex-end;
   gap: 10px;
 }
+
+.eq-knob:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 3px;
+  border-radius: 50%;
+}

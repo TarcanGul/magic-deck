@@ -534,16 +534,62 @@ function initKnob(canvas: HTMLCanvasElement) {
   const init = parseFloat(canvas.dataset.value ?? '0.5')
   knobState.set(canvas, { value: init, dragging: false, startY: 0, startVal: init })
   drawKnob(canvas, init)
-  canvas.addEventListener('mousedown', (e) => { const s = knobState.get(canvas)!; s.dragging = true; s.startY = e.clientY; s.startVal = s.value; e.preventDefault() })
+
+  // ── Accessibility: make canvas focusable + ARIA role ────────────────────────
+  canvas.setAttribute('tabindex', '0')
+  canvas.setAttribute('role', 'slider')
+  canvas.setAttribute('aria-valuemin', '0')
+  canvas.setAttribute('aria-valuemax', '100')
+  canvas.setAttribute('aria-valuenow', String(Math.round(init * 100)))
+  const label = canvas.id.match(/^d(\d)-(hi|mid|low)$/)
+  if (label) canvas.setAttribute('aria-label', `Deck ${label[1]} ${label[2].toUpperCase()} EQ`)
+
+  const updateValue = (newValue: number) => {
+    const s = knobState.get(canvas)!
+    s.value = Math.max(0, Math.min(1, newValue))
+    drawKnob(canvas, s.value)
+    canvas.setAttribute('aria-valuenow', String(Math.round(s.value * 100)))
+    const control = getDeckEqControl?.(canvas)
+    if (control) void applyDeckEq?.(control.deckIndex, control.band, s.value)
+  }
+
+  // Mouse drag
+  canvas.addEventListener('mousedown', (e) => {
+    const s = knobState.get(canvas)!
+    s.dragging = true; s.startY = e.clientY; s.startVal = s.value
+    canvas.focus()
+    e.preventDefault()
+  })
   window.addEventListener('mousemove', (e) => {
     const s = knobState.get(canvas)
     if (!s?.dragging) return
-    s.value = Math.max(0, Math.min(1, s.startVal + (s.startY - e.clientY) / 120))
-    drawKnob(canvas, s.value)
-    const control = getDeckEqControl(canvas)
-    if (control) void applyDeckEq(control.deckIndex, control.band, s.value)
+    updateValue(s.startVal + (s.startY - e.clientY) / 120)
   })
   window.addEventListener('mouseup', () => { const s = knobState.get(canvas); if (s) s.dragging = false })
+
+  // ── Keyboard ─────────────────────────────────────────────────────────────────
+  canvas.addEventListener('keydown', (e) => {
+    const s = knobState.get(canvas)!
+    const step = e.shiftKey ? 0.1 : 0.05  // coarse with Shift, fine without
+    const bigStep = 0.25
+    let newVal = s.value
+    switch (e.key) {
+      case 'ArrowUp': case 'ArrowRight': newVal = s.value + step; break
+      case 'ArrowDown': case 'ArrowLeft': newVal = s.value - step; break
+      case 'PageUp': newVal = s.value + bigStep; break
+      case 'PageDown': newVal = s.value - bigStep; break
+      case 'Home': newVal = 0; break
+      case 'End': newVal = 1; break
+      case ' ': case 'Enter': newVal = 0.5; break  // Space/Enter centers the knob
+      default: return
+    }
+    e.preventDefault()
+    updateValue(newVal)
+  })
+
+  // Visual focus ring
+  canvas.addEventListener('focus', () => { canvas.style.outline = '2px solid var(--red)'; canvas.style.outlineOffset = '2px' })
+  canvas.addEventListener('blur',  () => { canvas.style.outline = 'none' })
 }
 
 // ── MAGIC AUDIO ───────────────────────────────────────────────────────────────
