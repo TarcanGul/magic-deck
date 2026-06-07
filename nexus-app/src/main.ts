@@ -40,7 +40,7 @@ let waveformAnimationFrame: number | null = null
 const decks: [DeckState, DeckState, DeckState] = [
   { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
   { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1 },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -590,6 +590,7 @@ async function generateMagicAudio() {
     ensureCtx(magicDeck)
     const generatedBuffer = await magicDeck.audioCtx!.decodeAudioData(await generatedBlob.arrayBuffer())
     deckStop(magicDeck)
+    magicDeck.looping = true
     magicDeck.audioBuffer = generatedBuffer
     magicDeck.fileName = generatedFile.name
     if (magicDeck.gainNode) magicDeck.gainNode.gain.value = parseFloat(magicGain.value)
