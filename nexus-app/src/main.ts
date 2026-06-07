@@ -806,7 +806,7 @@ function setupWaveformSeek(prefix: DeckPrefix, deckIndex: WaveformDeckIndex) {
   canvas.title = 'Use Audiotool Studio timeline controls for playback and seeking'
   canvas.addEventListener('click', (event) => {
     event.preventDefault()
-    setStatus('connected', `${prefix.toUpperCase()}: USE AUDIOTOOL STUDIO TIMELINE FOR SEEKING`)
+    setStatus('connected', ``)
   })
 }
 function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
