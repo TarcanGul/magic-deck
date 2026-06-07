@@ -10,6 +10,7 @@ import io
 import math
 import tempfile
 import os
+from dataclasses import dataclass
 from typing import Any
 import numpy as np
 import librosa
@@ -32,6 +33,11 @@ MAGENTA_RT_HOME = os.path.join(MAGENTA_HOME, "magenta-rt-v2")
 MAGENTA_MODEL = "mrt2_small"
 MAGENTA_SAMPLE_RATE = 48_000
 MRT_FRAMES_PER_SECOND = 25.0
+MIN_GENERATION_BPM = 40.0
+MAX_GENERATION_BPM = 240.0
+PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+MAJOR_SCALE = np.array([0, 2, 4, 5, 7, 9, 11], dtype=np.int16)
+MINOR_SCALE = np.array([0, 2, 3, 5, 7, 8, 10], dtype=np.int16)
 EQ_BANDS = {
     "low": (20.0, 250.0),
     "mid": (250.0, 4_000.0),
@@ -49,6 +55,19 @@ app.add_middleware(
 magenta_audio: Any | None = None
 style_model: Any | None = None
 mrt: Any | None = None
+
+
+@dataclass(frozen=True)
+class DetectedKey:
+    root_pitch_class: int
+    mode: str
+    major_score: float
+    minor_score: float
+    confidence: float
+
+    @property
+    def name(self) -> str:
+        return f"{PITCH_CLASS_NAMES[self.root_pitch_class]} {self.mode}"
 
 
 def get_magenta_runtime() -> tuple[Any, Any, Any]:
@@ -70,6 +89,26 @@ def get_magenta_runtime() -> tuple[Any, Any, Any]:
     return magenta_audio, style_model, mrt
 
 
+def validate_generation_bpm(bpm: float | None, required: bool = True) -> float | None:
+    if bpm is None:
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail="bpm is required for beat-synced Magenta generation.",
+            )
+        return None
+
+    if not math.isfinite(bpm):
+        raise HTTPException(status_code=400, detail="bpm must be a finite number.")
+    if bpm < MIN_GENERATION_BPM or bpm > MAX_GENERATION_BPM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"bpm must be between {MIN_GENERATION_BPM:g} and {MAX_GENERATION_BPM:g} for Magenta beat-synced generation.",
+        )
+
+    return bpm
+
+
 def resolve_duration_seconds(
     duration_seconds: float | None,
     duration_bars: int | None,
@@ -77,20 +116,27 @@ def resolve_duration_seconds(
     bpm: float | None,
 ) -> float:
     if duration_bars is not None:
+        bpm = validate_generation_bpm(bpm, required=True)
         if duration_bars <= 0:
             raise HTTPException(status_code=400, detail="duration_bars must be greater than 0.")
         if beats_per_bar <= 0:
             raise HTTPException(status_code=400, detail="beats_per_bar must be greater than 0.")
-        if bpm is None or bpm <= 0:
-            raise HTTPException(status_code=400, detail="bpm must be greater than 0 when duration_bars is provided.")
         duration_seconds = (duration_bars * beats_per_bar * 60.0) / bpm
 
     if duration_seconds is None:
         raise HTTPException(status_code=400, detail="duration_seconds or duration_bars with bpm is required.")
-    if duration_seconds <= 0 or duration_seconds > 120:
+    if not math.isfinite(duration_seconds):
+        raise HTTPException(status_code=400, detail="duration_seconds must be a finite number.")
+    if duration_seconds < 1 or duration_seconds > 120:
         raise HTTPException(status_code=400, detail="duration_seconds must be between 1 and 120.")
 
     return duration_seconds
+
+
+def frames_per_beat_for_bpm(bpm: float) -> int:
+    validated_bpm = validate_generation_bpm(bpm, required=True)
+    seconds_per_beat = 60.0 / validated_bpm
+    return max(1, int(round(MRT_FRAMES_PER_SECOND * seconds_per_beat)))
 
 
 def load_reference_audio(path: str, sample_rate: int = MAGENTA_SAMPLE_RATE) -> np.ndarray:
@@ -159,6 +205,40 @@ def pitch_class_energy(mono: np.ndarray, sample_rate: int) -> np.ndarray:
     return normalize_vector(np.mean(chroma, axis=1))
 
 
+def detect_key(chroma: np.ndarray) -> DetectedKey:
+    chroma = normalize_vector(chroma)
+    if chroma.size != 12 or float(np.max(chroma)) <= 1e-8:
+        return DetectedKey(
+            root_pitch_class=0,
+            mode="major",
+            major_score=0.0,
+            minor_score=0.0,
+            confidence=0.0,
+        )
+
+    root = int(np.argmax(chroma))
+    major_score = float(np.sum(chroma[(root + MAJOR_SCALE) % 12]))
+    minor_score = float(np.sum(chroma[(root + MINOR_SCALE) % 12]))
+    mode = "minor" if minor_score > major_score else "major"
+    confidence = abs(major_score - minor_score) / max(major_score, minor_score, 1e-8)
+
+    return DetectedKey(
+        root_pitch_class=root,
+        mode=mode,
+        major_score=major_score,
+        minor_score=minor_score,
+        confidence=float(confidence),
+    )
+
+
+def pitch_classes_for_key(detected_key: DetectedKey, chroma: np.ndarray | None = None) -> list[int]:
+    scale = MINOR_SCALE if detected_key.mode == "minor" else MAJOR_SCALE
+    pitch_classes = [int((detected_key.root_pitch_class + interval) % 12) for interval in scale]
+    if chroma is None or chroma.size != 12:
+        return pitch_classes
+    return sorted(pitch_classes, key=lambda pc: float(chroma[pc]))
+
+
 def spectral_occupancy(mono: np.ndarray, sample_rate: int) -> dict[str, float]:
     spectrum = np.abs(librosa.stft(mono, n_fft=2048, hop_length=512))
     freqs = librosa.fft_frequencies(sr=sample_rate, n_fft=2048)
@@ -186,6 +266,8 @@ def analyze_reference(
     tiled = trim_or_tile(samples, target_samples)
     mono = np.mean(tiled, axis=1)
     beat_energy, onset_density = beat_grid_features(mono, sample_rate, bpm, total_beats)
+    chroma = pitch_class_energy(mono, sample_rate)
+    detected_key = detect_key(chroma)
 
     return {
         "reference": tiled,
@@ -193,7 +275,8 @@ def analyze_reference(
         "total_beats": total_beats,
         "beat_energy": beat_energy,
         "onset_density": onset_density,
-        "pitch_classes": pitch_class_energy(mono, sample_rate),
+        "pitch_classes": chroma,
+        "detected_key": detected_key,
         "spectral": spectral_occupancy(mono, sample_rate),
     }
 
@@ -210,17 +293,6 @@ def resolve_stem_role(stem_role: str, spectral: dict[str, float], onset_density:
     if quietest_band == "high":
         return "texture"
     return "melody"
-
-
-def compatible_pitch_classes(chroma: np.ndarray) -> list[int]:
-    major = np.array([0, 2, 4, 5, 7, 9, 11])
-    minor = np.array([0, 2, 3, 5, 7, 8, 10])
-    root = int(np.argmax(chroma)) if chroma.size else 0
-    major_score = float(np.sum(chroma[(root + major) % 12]))
-    minor_score = float(np.sum(chroma[(root + minor) % 12]))
-    scale = minor if minor_score > major_score else major
-    pcs = [int((root + interval) % 12) for interval in scale]
-    return sorted(pcs, key=lambda pc: float(chroma[pc]))
 
 
 def note_range_for_role(role: str) -> range:
@@ -243,7 +315,7 @@ def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[l
     beat_energy = analysis["beat_energy"]
     onset_density = analysis["onset_density"]
     total_beats = int(analysis["total_beats"])
-    pcs = compatible_pitch_classes(analysis["pitch_classes"])
+    pcs = pitch_classes_for_key(analysis["detected_key"], analysis["pitch_classes"])
     midi_range = note_range_for_role(role)
     low_activity = normalize_vector(1.0 - np.maximum(beat_energy, onset_density))
     threshold = float(np.quantile(low_activity, 0.55)) if total_beats > 1 else 0.0
@@ -386,14 +458,12 @@ async def generate(
     """
 
     # --- Resolve and validate duration ---
+    generation_bpm = validate_generation_bpm(bpm, required=True)
     duration_seconds = resolve_duration_seconds(duration_seconds, duration_bars, beats_per_bar, bpm)
     if audio_weight + text_weight <= 0:
         raise HTTPException(status_code=400, detail="audio_weight + text_weight must be greater than 0.")
-    if bpm is not None and bpm <= 0:
-        raise HTTPException(status_code=400, detail="bpm must be greater than 0.")
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be greater than 0.")
-    generation_bpm = bpm or 120.0
 
     try:
         audio, style_model, mrt = get_magenta_runtime()
@@ -415,6 +485,17 @@ async def generate(
         reference_samples = load_reference_audio(tmp_path, MAGENTA_SAMPLE_RATE)
         analysis = analyze_reference(reference_samples, MAGENTA_SAMPLE_RATE, generation_bpm, beats_per_bar, duration_bars, duration_seconds)
         conditioning = build_conditioning(analysis, stem_role)
+        detected_key: DetectedKey = analysis["detected_key"]
+        scale_pitch_classes = pitch_classes_for_key(detected_key, analysis["pitch_classes"])
+        print(
+            "Reference key detected: "
+            f"{detected_key.name} "
+            f"(root_pc={detected_key.root_pitch_class}, "
+            f"major_score={detected_key.major_score:.3f}, "
+            f"minor_score={detected_key.minor_score:.3f}, "
+            f"confidence={detected_key.confidence:.3f}, "
+            f"scale_pcs={scale_pitch_classes})"
+        )
 
         # --- Blend styles ---
         weighted_styles = [
@@ -429,8 +510,7 @@ async def generate(
         # --- Generate beat-grid chunks ---
         chunks = []
         state = None
-        seconds_per_beat = 60.0 / generation_bpm
-        frames_per_beat = max(1, int(round(MRT_FRAMES_PER_SECOND * seconds_per_beat)))
+        frames_per_beat = frames_per_beat_for_bpm(generation_bpm)
         for notes, drums in conditioning:
             chunk, state = mrt.generate(
                 style=blended_style,
