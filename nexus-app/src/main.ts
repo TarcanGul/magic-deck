@@ -141,14 +141,52 @@ async function disconnectAll() {
 }
 
 // ── PROJECT ───────────────────────────────────────────────────────────────────
+function showCreateProjectModal(): Promise<{ name: string; description: string } | null> {
+  return new Promise((resolve) => {
+    const modal = el<HTMLDivElement>('create-modal')
+    const nameInput = el<HTMLInputElement>('modal-project-name')
+    const descInput = el<HTMLTextAreaElement>('modal-project-description')
+    const btnConfirm = el<HTMLButtonElement>('modal-confirm')
+    const btnCancel = el<HTMLButtonElement>('modal-cancel')
+
+    modal.classList.remove('is-hidden')
+    nameInput.focus()
+    nameInput.select()
+
+    const close = (result: { name: string; description: string } | null) => {
+      modal.classList.add('is-hidden')
+      btnConfirm.onclick = null
+      btnCancel.onclick = null
+      document.removeEventListener('keydown', onKey)
+      resolve(result)
+    }
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close(null)
+      if (e.key === 'Enter' && e.target === nameInput) {
+        e.preventDefault()
+        btnConfirm.click()
+      }
+    }
+
+    btnConfirm.onclick = () => {
+      const name = nameInput.value.trim()
+      if (!name) { nameInput.focus(); return }
+      close({ name, description: descInput.value.trim() })
+    }
+    btnCancel.onclick = () => close(null)
+    document.addEventListener('keydown', onKey)
+  })
+}
+
 async function createNewProject() {
   if (!at) { setStatus('error', 'NOT LOGGED IN'); return }
-  const name = prompt('Project name?', 'My DJ Set')
-  if (!name) return
-  setStatus('connecting', `CREATING PROJECT "${name}"…`)
+  const result = await showCreateProjectModal()
+  if (!result) return
+  setStatus('connecting', `CREATING PROJECT "${result.name}"…`)
   try {
     const response = await at.projects.createProject({
-      project: { displayName: name, description: 'Created from NEXUS DJ' },
+      project: { displayName: result.name, description: result.description || 'Created from NEXUS DJ' },
     })
     if (response instanceof Error) throw response
     const project = response.project
@@ -158,7 +196,7 @@ async function createNewProject() {
     const url = `https://beta.audiotool.com/studio?project=${uuid}`
     inputProjectUrl.value = url
     localStorage.setItem('nexus_project_url', url)
-    setStatus('connected', `PROJECT "${name}" CREATED — CLICK CONNECT PROJECT`)
+    setStatus('connected', `PROJECT "${result.name}" CREATED — CLICK CONNECT PROJECT`)
   } catch (e: unknown) {
     setStatus('error', `CREATE FAILED: ${e instanceof Error ? e.message : String(e)}`)
   }
