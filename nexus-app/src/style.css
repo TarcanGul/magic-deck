@@ -204,8 +204,8 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 #deck-1 .transport,
 #deck-2 .transport { display: none; }
 
-/* Hide the VOL/GAIN faders and EQ knobs on Magic Deck — no need for them there */
-#deck-3 .controls-row { display: none; }
+/* Hide EQ knobs on Magic Deck */
+#deck-3 .eq-section { display: none; }
 
 /* ============================  CONTROLS ROW (VOL + EQ)  ============================ */
 .controls-row { display: flex; align-items: flex-end; gap: 20px; }
@@ -268,6 +268,14 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .btn-generate:hover::before { transform: scaleX(1); }
 .btn-generate:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.magic-playback-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 4fr) minmax(112px, 1fr);
+  align-items: stretch;
+  gap: 16px;
+}
+
 .magic-waveform {
   width: 100%; height: 160px; display: block;
   background: #050000; border: 1px solid var(--red-dim);
@@ -275,7 +283,17 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   box-shadow: inset 0 0 0 1px rgba(0,0,0,0.8), inset 0 2px 6px rgba(0,0,0,0.9), 0 0 0 1px rgba(255,0,0,0.15);
 }
 .magic-transport { gap: 8px; }
-.magic-controls-row { gap: 20px; }
+.magic-controls-row {
+  align-items: stretch;
+  gap: 12px;
+  justify-content: flex-start;
+  min-width: 0;
+}
+.magic-controls-row .fader-section {
+  flex: 1;
+  min-width: 48px;
+  justify-content: center;
+}
 
 /* ============================  SLIDERS  ============================ */
 input[type="range"] {
