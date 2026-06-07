@@ -796,10 +796,11 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
 
 // ── TRANSPORT ─────────────────────────────────────────────────────────────────
 function syncTransportUi(prefix: DeckPrefix, deck: DeckState) {
-  el<HTMLButtonElement>(`${prefix}-play`).classList.toggle('active', deck.isPlaying)
-  el<HTMLButtonElement>(`${prefix}-pause`).classList.toggle('active', deck.isPaused)
-  el<HTMLButtonElement>(`${prefix}-loop`).classList.toggle('active', deck.looping)
-  el<HTMLSpanElement>(`${prefix}-pitch`).textContent = formatPitch(deck.pitchPercent)
+  document.getElementById(`${prefix}-play`)?.classList.toggle('active', deck.isPlaying)
+  document.getElementById(`${prefix}-pause`)?.classList.toggle('active', deck.isPaused)
+  document.getElementById(`${prefix}-loop`)?.classList.toggle('active', deck.looping)
+  const pitchValue = document.getElementById(`${prefix}-pitch`)
+  if (pitchValue) pitchValue.textContent = formatPitch(deck.pitchPercent)
 }
 function setupWaveformSeek(prefix: DeckPrefix, deckIndex: WaveformDeckIndex) {
   const canvas = getWaveformCanvas(deckIndex)
@@ -811,15 +812,18 @@ function setupWaveformSeek(prefix: DeckPrefix, deckIndex: WaveformDeckIndex) {
 }
 function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const deck = decks[deckIndex]
-  const playBtn = el<HTMLButtonElement>(`${prefix}-play`), pauseBtn = el<HTMLButtonElement>(`${prefix}-pause`)
-  const stopBtn = el<HTMLButtonElement>(`${prefix}-stop`)
-  const loopBtn = el<HTMLButtonElement>(`${prefix}-loop`)
+  const playBtn = document.getElementById(`${prefix}-play`) as HTMLButtonElement | null
+  const pauseBtn = document.getElementById(`${prefix}-pause`) as HTMLButtonElement | null
+  const stopBtn = document.getElementById(`${prefix}-stop`) as HTMLButtonElement | null
+  const loopBtn = document.getElementById(`${prefix}-loop`) as HTMLButtonElement | null
   const volSlider = document.getElementById(`${prefix}-vol`) as HTMLInputElement | null
   const volVal = document.getElementById(`${prefix}-vol-val`) as HTMLSpanElement | null
   const gainSlider = document.getElementById(`${prefix}-gain`) as HTMLInputElement | null
   const gainVal = document.getElementById(`${prefix}-gain-val`) as HTMLSpanElement | null
 
-  const transportButtons = [playBtn, pauseBtn, stopBtn, loopBtn]
+  const transportButtons = [playBtn, pauseBtn, stopBtn, loopBtn].filter(
+    (button): button is HTMLButtonElement => button !== null,
+  )
   transportButtons.forEach((button) => {
     button.disabled = true
     button.title = 'Use Audiotool Studio transport'
