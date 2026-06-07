@@ -22,6 +22,7 @@ interface DeckState {
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
+type EqBand = 'hi' | 'mid' | 'low'
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -299,7 +300,7 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   deck.audioDeviceEntity = inserted.audioDevice
   deck.mixerChannelEntity = inserted.mixerChannel
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
-  if (deckNum === 1 || deckNum === 2) applyCurrentDeckEq((deckNum - 1) as 0 | 1)
+  applyCurrentDeckEq((deckNum - 1) as WaveformDeckIndex)
   return inserted
 }
 
@@ -318,7 +319,7 @@ async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false
   }
 }
 
-async function applyDeckEq(deckIndex: 0 | 1, band: 'hi' | 'mid' | 'low', value: number) {
+async function applyDeckEq(deckIndex: WaveformDeckIndex, band: EqBand, value: number) {
   const deck = decks[deckIndex]
   if (!nexus || !deck.mixerChannelEntity) {
     setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT EQ`)
@@ -342,7 +343,7 @@ async function applyDeckEq(deckIndex: 0 | 1, band: 'hi' | 'mid' | 'low', value: 
   }
 }
 
-function applyCurrentDeckEq(deckIndex: 0 | 1) {
+function applyCurrentDeckEq(deckIndex: WaveformDeckIndex) {
   const bands = ['hi', 'mid', 'low'] as const
   bands.forEach((band) => {
     const canvas = el<HTMLCanvasElement>(`d${deckIndex + 1}-${band}`)
@@ -470,10 +471,10 @@ function drawKnob(canvas: HTMLCanvasElement, value: number) {
   ctx.beginPath(); ctx.arc(ix, iy, 3, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill()
   ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fillStyle = '#333'; ctx.fill()
 }
-function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: 0 | 1; band: 'hi' | 'mid' | 'low' } | null {
-  const match = canvas.id.match(/^d([12])-(hi|mid|low)$/)
+function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: WaveformDeckIndex; band: EqBand } | null {
+  const match = canvas.id.match(/^d([123])-(hi|mid|low)$/)
   if (!match) return null
-  return { deckIndex: Number(match[1]) - 1 as 0 | 1, band: match[2] as 'hi' | 'mid' | 'low' }
+  return { deckIndex: Number(match[1]) - 1 as WaveformDeckIndex, band: match[2] as EqBand }
 }
 function initKnob(canvas: HTMLCanvasElement) {
   const init = parseFloat(canvas.dataset.value ?? '0.5')
@@ -642,6 +643,8 @@ async function generateMagicAudio() {
     form.append('beats_per_bar', String(BEATS_PER_BAR))
     form.append('bpm', String(currentProjectBpm))
     form.append('duration_seconds', String(durationSeconds))
+    form.append('stem_role', 'auto')
+    form.append('avoid_clash', 'true')
 
     setMagicStatus('generating', `MAGENTA ← DECK ${reference.deckNum}`)
     const resp = await fetch(`${magentaEndpoint()}/generate`, { method: 'POST', body: form })

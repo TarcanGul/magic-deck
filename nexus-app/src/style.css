@@ -852,6 +852,12 @@ html, body {
   gap: 12px;
 }
 
+.magic-eq-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+}
+
 .h-fader {
   flex: 1;
   accent-color: var(--red);
