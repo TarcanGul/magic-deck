@@ -8,6 +8,7 @@ from magenta_server import (
     build_conditioning,
     build_mrt_style_prompt,
     detect_key,
+    embed_musiccoca_styles,
     frames_per_beat_for_bpm,
     pitch_classes_for_key,
     resolve_duration_seconds,
@@ -17,6 +18,39 @@ from magenta_server import (
 
 
 class MagentaServerHelperTests(unittest.TestCase):
+    def test_embed_musiccoca_styles_uses_joint_model_without_mapper(self):
+        audio_prompt = object()
+
+        class FakeMusicCoCa:
+            def __init__(self):
+                self.calls = []
+
+            def embed(self, prompts, **kwargs):
+                self.calls.append((prompts, kwargs))
+                return np.array([[3.0, 4.0], [5.0, 12.0]], dtype=np.float32)
+
+        style_model = FakeMusicCoCa()
+        audio_style, text_style = embed_musiccoca_styles(
+            style_model,
+            audio_prompt,
+            "128 bpm tech house in A minor",
+        )
+
+        self.assertEqual(
+            style_model.calls,
+            [([audio_prompt, "128 bpm tech house in A minor"], {"use_mapper": False})],
+        )
+        np.testing.assert_array_equal(audio_style, np.array([3.0, 4.0], dtype=np.float32))
+        np.testing.assert_array_equal(text_style, np.array([5.0, 12.0], dtype=np.float32))
+
+    def test_embed_musiccoca_styles_rejects_non_batched_result(self):
+        class FakeMusicCoCa:
+            def embed(self, prompts, **kwargs):
+                return np.array([3.0, 4.0], dtype=np.float32)
+
+        with self.assertRaisesRegex(ValueError, "shape \\(2, embedding_dim\\)"):
+            embed_musiccoca_styles(FakeMusicCoCa(), object(), "tech house")
+
     def test_build_mrt_style_prompt_includes_bpm_prompt_and_key(self):
         detected_key = DetectedKey(
             root_pitch_class=9,
