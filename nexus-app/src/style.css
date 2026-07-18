@@ -520,6 +520,8 @@ input[type="range"]:not(.v-fader)::-moz-range-thumb {
   gap: 10px;
 }
 
+.modal-actions-wrap { flex-wrap: wrap; }
+
 .eq-knob:focus-visible {
   outline: 2px solid var(--red);
   outline-offset: 3px;
