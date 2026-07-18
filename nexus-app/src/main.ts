@@ -32,7 +32,7 @@ interface ReferenceAudio {
 }
 
 const REFERENCE_AUDIO_SECONDS = 8
-const MAGIC_DURATION_BARS = 16
+const MAGIC_DURATION_BARS = 4
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -308,7 +308,7 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
     const region = t.insertSample(sample, {
       sample: { bpm },
       region: forceMagicLoop
-        ? { positionTicks: 0, durationTicks: Ticks.Bars(64) }
+        ? { positionTicks: 0, durationTicks: Ticks.Bars(MAGIC_DURATION_BARS) }
         : { positionTicks: 0 },
       loop: forceMagicLoop ? true : undefined,
       displayName,
@@ -630,23 +630,17 @@ function createReferenceBuffer(deck: DeckState) {
   const sampleRate = source.sampleRate
   const sourceLength = source.length
   const channels = Math.min(source.numberOfChannels, 2)
-  const useLoopWindow = deck.looping && (deck.isPlaying || deck.isPaused)
-  const endSeconds = deck.isPlaying || deck.isPaused ? getDeckPositionSeconds(deck) : source.duration
-  const endSample = useLoopWindow
-    ? Math.round(endSeconds * sampleRate)
-    : Math.min(sourceLength, Math.max(1, Math.round(endSeconds * sampleRate)))
-  const length = useLoopWindow
-    ? Math.max(1, Math.round(REFERENCE_AUDIO_SECONDS * sampleRate))
-    : Math.max(1, Math.min(Math.round(REFERENCE_AUDIO_SECONDS * sampleRate), endSample))
+  if (sourceLength <= 0) throw new Error('Loaded audio is empty')
+
+  const length = Math.max(1, Math.min(Math.round(REFERENCE_AUDIO_SECONDS * sampleRate), sourceLength))
+  const startSample = Math.floor((sourceLength - length) / 2)
   const output = deck.audioCtx!.createBuffer(channels, length, sampleRate)
-  const startSample = Math.max(0, endSample - length)
 
   for (let channel = 0; channel < channels; channel++) {
     const input = source.getChannelData(channel)
     const out = output.getChannelData(channel)
     for (let i = 0; i < length; i++) {
-      const sourceIndex = useLoopWindow ? ((endSample - length + i) % sourceLength + sourceLength) % sourceLength : startSample + i
-      out[i] = input[sourceIndex] ?? 0
+      out[i] = input[startSample + i] ?? 0
     }
   }
 
@@ -700,7 +694,7 @@ function buildReferenceAudio(): ReferenceAudio {
   const buffer = createReferenceBuffer(selection.deck)
   return {
     blob: audioBufferToWav(buffer),
-    fileName: `deck-${selection.deckIndex + 1}-last-${REFERENCE_AUDIO_SECONDS}s.wav`,
+    fileName: `deck-${selection.deckIndex + 1}-middle-${REFERENCE_AUDIO_SECONDS}s.wav`,
     deckNum: selection.deckIndex + 1,
     seconds: buffer.duration,
   }
@@ -711,7 +705,7 @@ function magentaEndpoint() {
 }
 
 function getMagicGenerationBpm() {
-  if (!currentProjectBpm || currentProjectBpm <= 0) throw new Error('Project BPM required for 16-bar duration')
+  if (!currentProjectBpm || currentProjectBpm <= 0) throw new Error('Project BPM required for beat-synced generation')
   return currentProjectBpm
 }
 
