@@ -204,9 +204,6 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 #deck-1 .transport,
 #deck-2 .transport { display: none; }
 
-/* Hide EQ knobs on Magic Deck */
-#deck-3 .eq-section { display: none; }
-
 /* ============================  CONTROLS ROW (VOL + EQ)  ============================ */
 .controls-row { display: flex; align-items: flex-end; gap: 20px; }
 .fader-section {
@@ -283,15 +280,33 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   box-shadow: inset 0 0 0 1px rgba(0,0,0,0.8), inset 0 2px 6px rgba(0,0,0,0.9), 0 0 0 1px rgba(255,0,0,0.15);
 }
 .magic-controls-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: 1fr auto;
   align-items: stretch;
-  gap: 12px;
-  justify-content: flex-start;
+  gap: 8px;
   min-width: 0;
 }
 .magic-controls-row .fader-section {
-  flex: 1;
-  min-width: 48px;
+  width: auto;
+  min-width: 0;
   justify-content: center;
+}
+.magic-controls-row .eq-section {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  align-items: end;
+}
+.magic-controls-row .eq-knob-wrap {
+  min-width: 0;
+  padding: 5px 2px 3px 2px;
+}
+.magic-controls-row .eq-knob {
+  width: min(44px, 100%);
+  height: auto;
+  aspect-ratio: 1;
 }
 
 /* ============================  SLIDERS  ============================ */

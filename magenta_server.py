@@ -44,6 +44,21 @@ EQ_BANDS = {
     "mid": (250.0, 4_000.0),
     "high": (4_000.0, 16_000.0),
 }
+STEM_ROLES = {"melody", "bass", "drums", "texture"}
+ROLE_NOTE_RANGES = {
+    "bass": range(36, 53),
+    "texture": range(60, 85),
+    "melody": range(55, 77),
+}
+MAJOR_KEY_PROFILE = np.array(
+    [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+    dtype=np.float32,
+)
+MINOR_KEY_PROFILE = np.array(
+    [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
+    dtype=np.float32,
+)
+TONIC_KEY_WEIGHT = 0.08
 
 app = FastAPI(title="Magenta RT2 API", version="1.0.0")
 app.add_middleware(
@@ -146,9 +161,13 @@ def format_bpm_for_style_prompt(bpm: float) -> str:
     return f"{bpm:.1f}"
 
 
-def build_mrt_style_prompt(prompt: str, bpm: float, detected_key: DetectedKey) -> str:
+def build_mrt_style_prompt(prompt: str, bpm: float, detected_key: DetectedKey, stem_role: str | None = None) -> str:
     clean_prompt = prompt.strip()
-    return f"{format_bpm_for_style_prompt(bpm)} bpm {clean_prompt} in {detected_key.name}"
+    stem_prefix = ""
+    if stem_role:
+        role_name = "drum" if stem_role == "drums" else stem_role
+        stem_prefix = f"{role_name} stem, "
+    return f"{format_bpm_for_style_prompt(bpm)} bpm {stem_prefix}{clean_prompt} in {detected_key.name}"
 
 
 def as_style_vector(style: Any) -> np.ndarray:
@@ -158,10 +177,27 @@ def as_style_vector(style: Any) -> np.ndarray:
     return vector
 
 
+def blend_style_vectors(audio_style: Any, text_style: Any, audio_weight: float, text_weight: float) -> np.ndarray:
+    weights = np.array([audio_weight, text_weight], dtype=np.float32)
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0:
+        raise HTTPException(status_code=400, detail="audio_weight and text_weight must sum to greater than 0.")
+
+    styles = np.stack([as_style_vector(audio_style), as_style_vector(text_style)])
+    weights_norm = weights / weight_sum
+    return np.sum(weights_norm[:, np.newaxis] * styles, axis=0).astype(np.float32)
+
+
 def frames_per_beat_for_bpm(bpm: float) -> int:
     validated_bpm = validate_generation_bpm(bpm, required=True)
     seconds_per_beat = 60.0 / validated_bpm
     return max(1, int(round(MRT_FRAMES_PER_SECOND * seconds_per_beat)))
+
+
+def clamp01(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
+    return float(np.clip(value, 0.0, 1.0))
 
 
 def load_reference_audio(path: str, sample_rate: int = MAGENTA_SAMPLE_RATE) -> np.ndarray:
@@ -230,6 +266,15 @@ def pitch_class_energy(mono: np.ndarray, sample_rate: int) -> np.ndarray:
     return normalize_vector(np.mean(chroma, axis=1))
 
 
+def score_key_profile(chroma: np.ndarray, profile: np.ndarray, root_pitch_class: int) -> float:
+    template = np.roll(profile, root_pitch_class)
+    denominator = float(np.linalg.norm(chroma) * np.linalg.norm(template))
+    if denominator <= 1e-8:
+        return 0.0
+    profile_score = float(np.dot(chroma, template) / denominator)
+    return profile_score + (TONIC_KEY_WEIGHT * clamp01(float(chroma[root_pitch_class])))
+
+
 def detect_key(chroma: np.ndarray) -> DetectedKey:
     chroma = normalize_vector(chroma)
     if chroma.size != 12 or float(np.max(chroma)) <= 1e-8:
@@ -241,11 +286,17 @@ def detect_key(chroma: np.ndarray) -> DetectedKey:
             confidence=0.0,
         )
 
-    root = int(np.argmax(chroma))
-    major_score = float(np.sum(chroma[(root + MAJOR_SCALE) % 12]))
-    minor_score = float(np.sum(chroma[(root + MINOR_SCALE) % 12]))
-    mode = "minor" if minor_score > major_score else "major"
-    confidence = abs(major_score - minor_score) / max(major_score, minor_score, 1e-8)
+    candidates: list[tuple[float, int, str]] = []
+    for root in range(12):
+        candidates.append((score_key_profile(chroma, MAJOR_KEY_PROFILE, root), root, "major"))
+        candidates.append((score_key_profile(chroma, MINOR_KEY_PROFILE, root), root, "minor"))
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    best_score, root, mode = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    major_score = score_key_profile(chroma, MAJOR_KEY_PROFILE, root)
+    minor_score = score_key_profile(chroma, MINOR_KEY_PROFILE, root)
+    confidence = (best_score - second_score) / max(abs(best_score), 1e-8)
 
     return DetectedKey(
         root_pitch_class=root,
@@ -256,12 +307,18 @@ def detect_key(chroma: np.ndarray) -> DetectedKey:
     )
 
 
-def pitch_classes_for_key(detected_key: DetectedKey, chroma: np.ndarray | None = None) -> list[int]:
+def scale_pitch_classes_for_key(detected_key: DetectedKey) -> list[int]:
     scale = MINOR_SCALE if detected_key.mode == "minor" else MAJOR_SCALE
-    pitch_classes = [int((detected_key.root_pitch_class + interval) % 12) for interval in scale]
+    return [int((detected_key.root_pitch_class + interval) % 12) for interval in scale]
+
+
+def pitch_classes_for_key(detected_key: DetectedKey, chroma: np.ndarray | None = None) -> list[int]:
+    pitch_classes = scale_pitch_classes_for_key(detected_key)
     if chroma is None or chroma.size != 12:
         return pitch_classes
-    return sorted(pitch_classes, key=lambda pc: float(chroma[pc]))
+    tonic = pitch_classes[0]
+    remaining = sorted(pitch_classes[1:], key=lambda pc: float(chroma[pc]))
+    return [tonic, *remaining]
 
 
 def spectral_occupancy(mono: np.ndarray, sample_rate: int) -> dict[str, float]:
@@ -305,26 +362,42 @@ def analyze_reference(
     }
 
 
-def resolve_stem_role(stem_role: str, spectral: dict[str, float], onset_density: np.ndarray) -> str:
+def resolve_stem_role(
+    stem_role: str,
+    spectral: dict[str, float],
+    onset_density: np.ndarray,
+    beat_energy: np.ndarray | None = None,
+) -> str:
     role = stem_role.lower().strip()
-    if role in {"melody", "bass", "drums", "texture"}:
+    if role in STEM_ROLES:
         return role
-    if float(np.mean(onset_density)) < 0.25:
-        return "drums"
-    quietest_band = min(spectral, key=spectral.get) if spectral else "mid"
-    if quietest_band == "low":
-        return "bass"
-    if quietest_band == "high":
-        return "texture"
-    return "melody"
+
+    onset = np.clip(np.asarray(onset_density, dtype=np.float32), 0.0, 1.0)
+    energy = np.clip(
+        np.asarray(beat_energy if beat_energy is not None else onset_density, dtype=np.float32),
+        0.0,
+        1.0,
+    )
+    mean_onset = float(np.mean(onset)) if onset.size else 0.0
+    mean_energy = float(np.mean(energy)) if energy.size else 0.0
+    rhythmic_gap = 1.0 - mean_onset
+    dynamic_gap = 1.0 - mean_energy
+    spectral_gap = {band: 1.0 - clamp01(float(spectral.get(band, 0.0))) for band in EQ_BANDS}
+
+    role_scores = {
+        "drums": (1.05 * rhythmic_gap) + (0.20 * dynamic_gap),
+        "bass": spectral_gap["low"] + (0.08 * dynamic_gap) - (0.12 * mean_onset),
+        "melody": spectral_gap["mid"] + (0.08 * rhythmic_gap),
+        "texture": spectral_gap["high"] + (0.05 * rhythmic_gap),
+    }
+    if mean_onset > 0.62:
+        role_scores["drums"] -= 0.35
+
+    return max(("drums", "bass", "melody", "texture"), key=lambda candidate: role_scores[candidate])
 
 
 def note_range_for_role(role: str) -> range:
-    if role == "bass":
-        return range(36, 53)
-    if role == "texture":
-        return range(60, 85)
-    return range(55, 77)
+    return ROLE_NOTE_RANGES.get(role, ROLE_NOTE_RANGES["melody"])
 
 
 def choose_midi_note(pitch_class: int, midi_range: range) -> int:
@@ -334,34 +407,99 @@ def choose_midi_note(pitch_class: int, midi_range: range) -> int:
     return candidates[len(candidates) // 2]
 
 
+def beat_space_scores(beat_energy: np.ndarray, onset_density: np.ndarray, role: str) -> np.ndarray:
+    energy = np.clip(np.asarray(beat_energy, dtype=np.float32), 0.0, 1.0)
+    onset = np.clip(np.asarray(onset_density, dtype=np.float32), 0.0, 1.0)
+    activity = np.maximum(energy, onset)
+    space = 1.0 - activity
+    beats = np.arange(len(space))
+    downbeats = (beats % BEATS_PER_BAR == 0).astype(np.float32)
+    backbeats = (beats % BEATS_PER_BAR == 2).astype(np.float32)
+    pickups = (beats % BEATS_PER_BAR == 3).astype(np.float32)
+    even_beats = (beats % 2 == 0).astype(np.float32)
+
+    if role == "drums":
+        phrase_bonus = (0.16 * downbeats) + (0.10 * backbeats) + (0.08 * pickups)
+    elif role == "bass":
+        phrase_bonus = (0.20 * downbeats) + (0.08 * pickups)
+    elif role == "texture":
+        phrase_bonus = (0.16 * downbeats) + (0.08 * even_beats)
+    else:
+        phrase_bonus = (0.14 * downbeats) + (0.12 * pickups)
+
+    return np.clip((0.76 * space) + phrase_bonus, 0.0, 1.25).astype(np.float32)
+
+
+def conditioning_threshold(fill_scores: np.ndarray, role: str) -> float:
+    if len(fill_scores) <= 1:
+        return 0.0
+    quantiles = {
+        "drums": 0.42,
+        "bass": 0.55,
+        "melody": 0.50,
+        "texture": 0.62,
+    }
+    return float(np.quantile(fill_scores, quantiles.get(role, 0.50)))
+
+
+def pitch_class_for_stem_beat(role: str, beat: int, scale_pcs: list[int], complementary_pcs: list[int]) -> int:
+    bar = beat // BEATS_PER_BAR
+    beat_in_bar = beat % BEATS_PER_BAR
+    if role == "bass":
+        progression_degrees = (0, 4, 5, 3)
+        if beat_in_bar == 0:
+            return scale_pcs[progression_degrees[bar % len(progression_degrees)]]
+        return complementary_pcs[(bar + beat_in_bar) % len(complementary_pcs)]
+    if role == "texture":
+        progression_degrees = (0, 3, 4, 5)
+        return scale_pcs[progression_degrees[bar % len(progression_degrees)]]
+    return complementary_pcs[(beat + bar) % len(complementary_pcs)]
+
+
+def add_texture_chord(notes: list[int], root_pc: int, scale_pcs: list[int], midi_range: range, intensity: int) -> None:
+    root_degree = scale_pcs.index(root_pc) if root_pc in scale_pcs else 0
+    previous_note = -1
+    for degree_offset in (0, 2, 4):
+        pc = scale_pcs[(root_degree + degree_offset) % len(scale_pcs)]
+        note = choose_midi_note(pc, midi_range)
+        while note <= previous_note and note + 12 < midi_range.stop:
+            note += 12
+        if note in midi_range and 0 <= note < 128:
+            notes[note] = intensity
+            previous_note = note
+
+
 def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[list[int], list[int]]]:
-    role = resolve_stem_role(stem_role, analysis["spectral"], analysis["onset_density"])
+    role = resolve_stem_role(stem_role, analysis["spectral"], analysis["onset_density"], analysis["beat_energy"])
     beat_energy = analysis["beat_energy"]
     onset_density = analysis["onset_density"]
     total_beats = int(analysis["total_beats"])
-    pcs = pitch_classes_for_key(analysis["detected_key"], analysis["pitch_classes"])
+    scale_pcs = scale_pitch_classes_for_key(analysis["detected_key"])
+    complementary_pcs = pitch_classes_for_key(analysis["detected_key"], analysis["pitch_classes"])
     midi_range = note_range_for_role(role)
-    low_activity = normalize_vector(1.0 - np.maximum(beat_energy, onset_density))
-    threshold = float(np.quantile(low_activity, 0.55)) if total_beats > 1 else 0.0
+    fill_scores = beat_space_scores(beat_energy, onset_density, role)
+    threshold = conditioning_threshold(fill_scores, role)
     conditioning: list[tuple[list[int], list[int]]] = []
     held_note: int | None = None
 
     for beat in range(total_beats):
         notes = [-1] * 128
         drums = [0]
-        should_fill = low_activity[beat] >= threshold
+        beat_in_bar = beat % BEATS_PER_BAR
+        is_downbeat = beat_in_bar == 0
+        should_fill = fill_scores[beat] >= threshold
 
         if role == "drums":
-            drums = [1 if should_fill or beat % 4 == 0 else 0]
+            sparse_beat = onset_density[beat] < 0.68
+            trigger_drum = is_downbeat or ((should_fill or beat_in_bar == 2) and sparse_beat)
+            drums = [1 if trigger_drum else 0]
         else:
-            if should_fill or (role == "texture" and beat % 4 == 0):
-                pc = pcs[(beat // (2 if role == "bass" else 1)) % len(pcs)]
+            should_anchor = is_downbeat and (role in {"bass", "texture"} or fill_scores[beat] > 0.20)
+            if should_fill or should_anchor:
+                pc = pitch_class_for_stem_beat(role, beat, scale_pcs, complementary_pcs)
                 note = choose_midi_note(pc, midi_range)
                 if role == "texture":
-                    for offset in (0, 7, 12):
-                        chord_note = note + offset
-                        if 0 <= chord_note < 128:
-                            notes[chord_note] = 3 if beat % 4 == 0 else 1
+                    add_texture_chord(notes, pc, scale_pcs, midi_range, 3 if is_downbeat else 1)
                     held_note = note
                 else:
                     notes[note] = 1 if held_note == note else 2
@@ -369,7 +507,7 @@ def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[l
             else:
                 held_note = None
 
-            if beat % 4 == 0 and low_activity[beat] > 0.35:
+            if is_downbeat and onset_density[beat] < 0.35 and fill_scores[beat] > 0.55:
                 drums = [1]
 
         conditioning.append((notes, drums))
@@ -469,7 +607,7 @@ async def generate(
     bpm: float | None = Form(None, description="Project tempo in beats per minute"),
     stem_role: str = Form("auto", description="Complementary stem role: auto, melody, bass, drums, or texture"),
     avoid_clash: bool = Form(True, description="Apply spectral anti-clash processing"),
-    temperature: float = Form(1.1, description="MRT sampling temperature"),
+    temperature: float = Form(0.2, description="MRT sampling temperature"),
     top_k: int = Form(40, description="MRT top-k sampling threshold"),
     cfg_notes: float = Form(1.0, description="MRT notes classifier-free guidance"),
     cfg_drums: float = Form(1.0, description="MRT drums classifier-free guidance"),
@@ -505,7 +643,13 @@ async def generate(
             raise HTTPException(status_code=400, detail=f"Could not read audio file: {e}")
         reference_samples = load_reference_audio(tmp_path, MAGENTA_SAMPLE_RATE)
         analysis = analyze_reference(reference_samples, MAGENTA_SAMPLE_RATE, generation_bpm, duration_bars, duration_seconds)
-        conditioning = build_conditioning(analysis, stem_role)
+        resolved_stem_role = resolve_stem_role(
+            stem_role,
+            analysis["spectral"],
+            analysis["onset_density"],
+            analysis["beat_energy"],
+        )
+        conditioning = build_conditioning(analysis, resolved_stem_role)
         detected_key: DetectedKey = analysis["detected_key"]
         scale_pitch_classes = pitch_classes_for_key(detected_key, analysis["pitch_classes"])
         print(
@@ -517,16 +661,14 @@ async def generate(
             f"confidence={detected_key.confidence:.3f}, "
             f"scale_pcs={scale_pitch_classes})"
         )
+        print(f"Resolved stem role: {resolved_stem_role}")
 
         # --- Blend styles ---
-        mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key)
+        mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key, resolved_stem_role)
         print(f"MRT style prompt: {mrt_style_prompt}")
-        audio_style = as_style_vector(style_model.embed([my_audio]))
-        text_style = as_style_vector(mrt.embed_style(mrt_style_prompt, use_mapper=True))
-        weights = np.array([audio_weight, text_weight], dtype=np.float32)
-        styles = np.stack([audio_style, text_style])
-        weights_norm = weights / weights.sum()
-        blended_style = (weights_norm[:, np.newaxis] * styles).mean(axis=0).astype(np.float32)
+        audio_style = style_model.embed([my_audio])
+        text_style = mrt.embed_style(mrt_style_prompt, use_mapper=True)
+        blended_style = blend_style_vectors(audio_style, text_style, audio_weight, text_weight)
 
         # --- Generate beat-grid chunks ---
         chunks = []
