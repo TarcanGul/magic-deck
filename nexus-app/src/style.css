@@ -205,7 +205,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 #deck-2 .transport { display: none; }
 
 /* ============================  CONTROLS ROW (VOL + EQ)  ============================ */
-.controls-row { display: flex; align-items: flex-end; gap: 20px; }
+.controls-row { display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap; min-width: 0; }
 .fader-section {
   display: flex; flex-direction: column; align-items: center; gap: 4px; width: 40px;
   padding: 6px 4px;
@@ -227,6 +227,35 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 .eq-knob { width: 56px; height: 56px; cursor: pointer; display: block; }
 .eq-label { font-family: var(--font-data); font-size: 9px; color: var(--grey-text); letter-spacing: 1px; }
+
+.bpm-dialogue {
+  flex: 1 1 280px;
+  min-width: 0;
+  align-self: stretch;
+  padding: 10px 12px;
+  background: linear-gradient(180deg, rgba(42,0,0,0.7), rgba(8,0,0,0.7));
+  border: 1px solid var(--red-dim);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 7px;
+}
+.bpm-dialogue-title { font-family: var(--font-header); color: var(--red); font-size: 15px; letter-spacing: 2px; }
+.bpm-dialogue-form { display: flex; flex-direction: column; gap: 7px; }
+.bpm-dialogue-hint, .bpm-dialogue-error { min-height: 1.2em; font-family: var(--font-data); font-size: 10px; letter-spacing: 0.5px; color: var(--grey-text); }
+.bpm-dialogue-error { color: var(--red); }
+.bpm-dialogue-actions { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; }
+.bpm-dialogue-input { min-width: 90px; flex: 1 1 100px; background: var(--black); border: 1px solid var(--grey-light); color: var(--white); font-family: var(--font-data); padding: 7px 8px; outline: none; border-radius: 3px; }
+.bpm-dialogue-input:focus { border-color: var(--red); box-shadow: 0 0 8px var(--red-glow2); }
+.bpm-dialogue-button { flex: 0 0 auto; padding: 7px 10px; }
+
+@media (max-width: 560px) {
+  .controls-row { gap: 10px; }
+  .bpm-dialogue { flex-basis: 100%; width: 100%; }
+  .eq-section { min-width: 0; gap: 6px; }
+  .eq-knob { width: min(56px, 16vw); height: auto; aspect-ratio: 1; }
+}
 
 /* ============================  MAGIC DECK  ============================ */
 .deck-magic {
@@ -487,6 +516,7 @@ input[type="range"]:not(.v-fader)::-moz-range-thumb {
   color: var(--red-dim);
   margin-left: 4px;
 }
+.modal-hint { min-height: 1.2em; margin: 8px 0 0; color: var(--grey-text); font-family: var(--font-data); font-size: 11px; }
 
 .modal-input {
   width: 100%;

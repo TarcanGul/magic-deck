@@ -2,6 +2,7 @@
 Magenta RT2 FastAPI Server
 --------------------------
 Endpoints:
+  POST /detect-bpm — detect tempo from an uploaded audio file with aubio
   POST /generate  — generate audio from audio file + text prompt
   GET  /health    — health check
 """
@@ -15,6 +16,13 @@ from typing import Any
 import numpy as np
 import librosa
 import soundfile as sf
+
+aubio_load_error: Exception | None = None
+try:
+    import aubio
+except (ImportError, OSError) as e:
+    aubio = None
+    aubio_load_error = e
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +81,10 @@ style_model: Any | None = None
 mrt: Any | None = None
 
 
+class AubioUnavailableError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DetectedKey:
     root_pitch_class: int
@@ -103,6 +115,49 @@ def get_magenta_runtime() -> tuple[Any, Any, Any]:
         print("Models loaded. Server ready.")
 
     return magenta_audio, style_model, mrt
+
+
+def get_aubio_runtime() -> Any:
+    """Load aubio independently from the much heavier Magenta runtime."""
+    if aubio is None:
+        raise AubioUnavailableError(str(aubio_load_error))
+    return aubio
+
+
+def detect_bpm_from_file(path: str, aubio_module: Any | None = None) -> dict[str, float | bool | None]:
+    aubio_module = aubio_module or get_aubio_runtime()
+    window_size = 1024
+    hop_size = 512
+    source = aubio_module.source(path, 0, hop_size)
+    tempo = aubio_module.tempo("default", window_size, hop_size, source.samplerate)
+    estimates: list[float] = []
+    confidences: list[float] = []
+
+    while True:
+        samples, frames_read = source()
+        if tempo(samples):
+            estimate = float(tempo.get_bpm())
+            if math.isfinite(estimate) and estimate > 0:
+                estimates.append(estimate)
+                confidence = float(tempo.get_confidence())
+                confidences.append(clamp01(confidence))
+        if frames_read < hop_size:
+            break
+
+    if len(estimates) < 2:
+        return {"bpm": None, "confidence": 0.0, "reliable": False}
+
+    bpm = float(np.median(estimates))
+    relative_deviation = float(np.median(np.abs(np.asarray(estimates) - bpm))) / bpm
+    if relative_deviation > 0.1:
+        return {"bpm": None, "confidence": 0.0, "reliable": False}
+
+    confidence = float(np.median(confidences)) if confidences else 0.0
+    return {
+        "bpm": round(bpm, 2),
+        "confidence": round(confidence, 3),
+        "reliable": confidence >= 0.5,
+    }
 
 
 def validate_generation_bpm(bpm: float | None, required: bool = True) -> float | None:
@@ -629,6 +684,36 @@ def health():
         "model": MAGENTA_MODEL,
         "magenta_home": MAGENTA_RT_HOME,
     }
+
+
+@app.post("/detect-bpm")
+async def detect_bpm(audio_file: UploadFile = File(..., description="Original audio file")):
+    try:
+        aubio_module = get_aubio_runtime()
+    except AubioUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"Aubio BPM detection unavailable: {e}") from e
+
+    suffix = os.path.splitext(audio_file.filename or "")[-1] or ".audio"
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            contents = await audio_file.read()
+            if not contents:
+                raise HTTPException(status_code=400, detail="Could not read audio file: file is empty.")
+            tmp.write(contents)
+        try:
+            return detect_bpm_from_file(tmp_path, aubio_module)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read audio file: {e}") from e
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 @app.post("/generate")
