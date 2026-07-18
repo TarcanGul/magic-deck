@@ -177,6 +177,20 @@ def as_style_vector(style: Any) -> np.ndarray:
     return vector
 
 
+def embed_musiccoca_styles(style_model: Any, audio_prompt: Any, text_prompt: str) -> tuple[np.ndarray, np.ndarray]:
+    """Embed audio and text together in MusicCoCa's joint embedding space."""
+    styles = np.asarray(
+        style_model.embed([audio_prompt, text_prompt], use_mapper=False),
+        dtype=np.float32,
+    )
+    if styles.ndim != 2 or styles.shape[0] != 2:
+        raise ValueError(
+            "MusicCoCa must return one audio and one text embedding "
+            f"with shape (2, embedding_dim); got {styles.shape}."
+        )
+    return styles[0], styles[1]
+
+
 def blend_style_vectors(audio_style: Any, text_style: Any, audio_weight: float, text_weight: float) -> np.ndarray:
     weights = np.array([audio_weight, text_weight], dtype=np.float32)
     weight_sum = float(weights.sum())
@@ -186,6 +200,26 @@ def blend_style_vectors(audio_style: Any, text_style: Any, audio_weight: float, 
     styles = np.stack([as_style_vector(audio_style), as_style_vector(text_style)])
     weights_norm = weights / weight_sum
     return np.sum(weights_norm[:, np.newaxis] * styles, axis=0).astype(np.float32)
+
+
+def log_style_embedding_norms(
+    audio_style: Any,
+    text_style: Any,
+    audio_weight: float,
+    text_weight: float,
+) -> None:
+    weights = np.array([audio_weight, text_weight], dtype=np.float32)
+    weights /= float(weights.sum())
+    audio_vector = as_style_vector(audio_style)
+    text_vector = as_style_vector(text_style)
+    audio_norm = float(np.linalg.norm(audio_vector))
+    text_norm = float(np.linalg.norm(text_vector))
+    print(
+        "MusicCoCa embedding norms: "
+        f"audio={audio_norm:.3f}, text={text_norm:.3f}, "
+        f"weighted_audio={audio_norm * float(weights[0]):.3f}, "
+        f"weighted_text={text_norm * float(weights[1]):.3f}"
+    )
 
 
 def frames_per_beat_for_bpm(bpm: float) -> int:
@@ -666,8 +700,8 @@ async def generate(
         # --- Blend styles ---
         mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key, resolved_stem_role)
         print(f"MRT style prompt: {mrt_style_prompt}")
-        audio_style = style_model.embed([my_audio])
-        text_style = mrt.embed_style(mrt_style_prompt, use_mapper=True)
+        audio_style, text_style = embed_musiccoca_styles(style_model, my_audio, mrt_style_prompt)
+        log_style_embedding_norms(audio_style, text_style, audio_weight, text_weight)
         blended_style = blend_style_vectors(audio_style, text_style, audio_weight, text_weight)
 
         # --- Generate beat-grid chunks ---
