@@ -8,6 +8,7 @@ Endpoints:
 """
 
 import io
+import logging
 import math
 import tempfile
 import os
@@ -67,6 +68,9 @@ MINOR_KEY_PROFILE = np.array(
     dtype=np.float32,
 )
 TONIC_KEY_WEIGHT = 0.08
+MAX_LOGGED_BPM_CANDIDATES = 5
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Magenta RT2 API", version="1.0.0")
 app.add_middleware(
@@ -124,7 +128,34 @@ def get_aubio_runtime() -> Any:
     return aubio
 
 
-def detect_bpm_from_file(path: str, aubio_module: Any | None = None) -> dict[str, float | bool | None]:
+def log_bpm_candidates(estimates: list[float], confidences: list[float]) -> None:
+    candidates: dict[float, float] = {}
+    for estimate, confidence in zip(estimates, confidences):
+        rounded_bpm = round(estimate, 2)
+        candidates[rounded_bpm] = max(candidates.get(rounded_bpm, 0.0), confidence)
+
+    ranked = sorted(candidates.items(), key=lambda candidate: candidate[1], reverse=True)
+    top_candidates = ranked[:MAX_LOGGED_BPM_CANDIDATES]
+    if not top_candidates:
+        logger.info("BPM detection produced no candidates")
+        return
+
+    logger.info("BPM detection top %d candidate(s):", len(top_candidates))
+    for rank, (bpm, confidence) in enumerate(top_candidates, start=1):
+        logger.info(
+            "  #%d bpm=%.2f confidence=%.3f (%d%%)",
+            rank,
+            bpm,
+            confidence,
+            round(confidence * 100),
+        )
+
+
+def detect_bpm_from_file(
+    path: str,
+    aubio_module: Any | None = None,
+    log_candidates: bool = False,
+) -> dict[str, float | bool | None]:
     aubio_module = aubio_module or get_aubio_runtime()
     window_size = 1024
     hop_size = 512
@@ -143,6 +174,9 @@ def detect_bpm_from_file(path: str, aubio_module: Any | None = None) -> dict[str
                 confidences.append(clamp01(confidence))
         if frames_read < hop_size:
             break
+
+    if log_candidates:
+        log_bpm_candidates(estimates, confidences)
 
     if len(estimates) < 2:
         return {"bpm": None, "confidence": 0.0, "reliable": False}
@@ -703,7 +737,7 @@ async def detect_bpm(audio_file: UploadFile = File(..., description="Original au
                 raise HTTPException(status_code=400, detail="Could not read audio file: file is empty.")
             tmp.write(contents)
         try:
-            return detect_bpm_from_file(tmp_path, aubio_module)
+            return detect_bpm_from_file(tmp_path, aubio_module, log_candidates=True)
         except HTTPException:
             raise
         except Exception as e:
