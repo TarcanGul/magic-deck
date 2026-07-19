@@ -29,6 +29,14 @@
         <input type="text" id="input-project-url" class="conn-input" placeholder="https://beta.audiotool.com/studio?project=..." />
         <button id="btn-create-project" class="btn-primary" style="white-space:nowrap">⬡ NEW PROJECT</button>
       </div>
+      <div class="conn-row audio-capture-row" id="audio-capture-row" style="display:none">
+        <label class="conn-label">LIVE AUDIO</label>
+        <button id="btn-audio-capture" class="btn-primary">⬡ SELECT AUDIOTOOL TAB</button>
+        <div class="audio-capture-status" aria-live="polite">
+          <span id="audio-capture-dot" class="dot idle"></span>
+          <span id="audio-capture-label">SELECT THE AUDIOTOOL TAB AND ENABLE TAB AUDIO — ONCE PER SESSION</span>
+        </div>
+      </div>
       <!-- Hidden inputs still in DOM for JS refs -->
       <input type="hidden" id="input-client-id" value="fa370480-13d6-4cba-8015-f9297a81e9e8">
       <div class="conn-actions">
@@ -198,7 +206,7 @@
               <div class="magic-duration-label">DURATION: 4 BARS</div>
             </div>
           </div>
-          <button class="btn-generate" id="btn-generate">⬡ GENERATE</button>
+          <button class="btn-generate" id="btn-generate">⬡ GENERATE FROM LIVE AUDIO</button>
           <div class="magic-playback-row">
             <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>
             <div class="controls-row magic-controls-row">
