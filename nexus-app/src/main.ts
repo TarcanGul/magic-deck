@@ -45,6 +45,7 @@ const MAGIC_DURATION_BARS = 4
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
 const MIN_SUPPORTED_BPM = 40
 const MAX_SUPPORTED_BPM = 240
+const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
@@ -246,7 +247,7 @@ function resetTempoMasterSession() {
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
     pendingBpmResolutions[deckIndex] = null
-    hideBpmDialogue(deckIndex)
+    resetBpmDialogue(deckIndex)
   })
 }
 
@@ -288,15 +289,22 @@ function isSupportedBpm(value: number | null | undefined): value is number {
     && value <= MAX_SUPPORTED_BPM
 }
 
-function hideBpmDialogue(deckIndex: number) {
-  el<HTMLDivElement>(`deck${deckIndex + 1}-bpm-dialogue`).classList.add('is-hidden')
+function resetBpmDialogue(deckIndex: number) {
+  const prefix = `deck${deckIndex + 1}-bpm`
+  el<HTMLDivElement>(`${prefix}-dialogue`).classList.remove('is-hidden')
+  el<HTMLDivElement>(`${prefix}-form`).classList.add('is-hidden')
+  const title = el<HTMLDivElement>(`${prefix}-title`)
+  title.textContent = DECK_PROMPT_IDLE_TEXT
+  title.classList.add('bpm-dialogue-title-idle')
 }
 
 function showBpmAnalyzing(deckNum: number) {
   const prefix = `deck${deckNum}-bpm`
   el<HTMLDivElement>(`${prefix}-dialogue`).classList.remove('is-hidden')
   el<HTMLDivElement>(`${prefix}-form`).classList.add('is-hidden')
-  el<HTMLDivElement>(`${prefix}-title`).textContent = 'ANALYZING BPM…'
+  const title = el<HTMLDivElement>(`${prefix}-title`)
+  title.textContent = 'ANALYZING BPM…'
+  title.classList.remove('bpm-dialogue-title-idle')
 }
 
 function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<BpmResolution | null> {
@@ -315,12 +323,14 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
       ? `AUBIO: ${estimate.bpm} BPM · ${Math.round(estimate.confidence * 100)}% CONFIDENCE`
       : 'ENTER SOURCE BPM (40–240)'
     error.textContent = ''
-    el<HTMLDivElement>(`${prefix}-title`).textContent = 'CONFIRM SOURCE BPM'
+    const title = el<HTMLDivElement>(`${prefix}-title`)
+    title.textContent = 'CONFIRM SOURCE BPM'
+    title.classList.remove('bpm-dialogue-title-idle')
     dialogue.classList.remove('is-hidden')
     form.classList.remove('is-hidden')
 
     const close = (result: BpmResolution | null) => {
-      dialogue.classList.add('is-hidden')
+      resetBpmDialogue(deckIndex)
       confirm.onclick = null
       fallback.onclick = null
       input.onkeydown = null
@@ -363,7 +373,7 @@ async function requestAubioBpm(file: File): Promise<AubioBpmResult> {
 
 async function resolveSampleBpm(sample: SampleMeta, file: File, deckNum: number, expectedSession: number): Promise<BpmResolution | null> {
   if (isSupportedBpm(sample.bpm)) {
-    hideBpmDialogue(deckNum - 1)
+    resetBpmDialogue(deckNum - 1)
     setStatus('connected', `DECK ${deckNum}: AUDIOTOOL BPM METADATA ${Math.round(sample.bpm)} ACCEPTED`)
     return { bpm: sample.bpm, source: 'audiotool' }
   }
@@ -372,11 +382,11 @@ async function resolveSampleBpm(sample: SampleMeta, file: File, deckNum: number,
   try {
     const estimate = await requestAubioBpm(file)
     if (expectedSession !== tempoSessionId || !nexus) {
-      hideBpmDialogue(deckNum - 1)
+      resetBpmDialogue(deckNum - 1)
       return null
     }
     if (estimate.reliable && estimate.confidence >= 0.5 && isSupportedBpm(estimate.bpm)) {
-      hideBpmDialogue(deckNum - 1)
+      resetBpmDialogue(deckNum - 1)
       setStatus('connected', `DECK ${deckNum}: AUBIO DETECTED ${Math.round(estimate.bpm)} BPM (${Math.round(estimate.confidence * 100)}% CONFIDENCE)`)
       return { bpm: estimate.bpm, source: 'aubio' }
     }
@@ -389,7 +399,7 @@ async function resolveSampleBpm(sample: SampleMeta, file: File, deckNum: number,
   } catch (e) {
     console.warn('[AUBIO] BPM analysis:', e)
     if (expectedSession !== tempoSessionId || !nexus) {
-      hideBpmDialogue(deckNum - 1)
+      resetBpmDialogue(deckNum - 1)
       return null
     }
     setStatus('connected', `DECK ${deckNum}: BPM ANALYSIS FAILED — MANUAL ENTRY REQUIRED`)
@@ -1033,6 +1043,8 @@ function initApp() {
   inputProjectUrl.addEventListener('input', () => localStorage.setItem('nexus_project_url', inputProjectUrl.value))
 
   projectUrlRow.style.display = 'none'
+  resetBpmDialogue(0)
+  resetBpmDialogue(1)
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
   el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()

@@ -231,6 +231,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .bpm-dialogue {
   flex: 1 1 280px;
   min-width: 0;
+  min-height: 126px;
   align-self: stretch;
   padding: 10px 12px;
   background: linear-gradient(180deg, rgba(42,0,0,0.7), rgba(8,0,0,0.7));
@@ -242,6 +243,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   gap: 7px;
 }
 .bpm-dialogue-title { font-family: var(--font-header); color: var(--red); font-size: 15px; letter-spacing: 2px; }
+.bpm-dialogue-title-idle { color: var(--grey-text); font-family: var(--font-data); font-size: 10px; line-height: 1.5; }
 .bpm-dialogue-form { display: flex; flex-direction: column; gap: 7px; }
 .bpm-dialogue-hint, .bpm-dialogue-error { min-height: 1.2em; font-family: var(--font-data); font-size: 10px; letter-spacing: 0.5px; color: var(--grey-text); }
 .bpm-dialogue-error { color: var(--red); }
