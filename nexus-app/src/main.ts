@@ -27,8 +27,12 @@ type EqBand = 'hi' | 'mid' | 'low'
 interface ReferenceAudio {
   blob: Blob
   fileName: string
-  deckNum: number
+  sourceLabel: string
   seconds: number
+}
+interface CaptureChunk {
+  left: Float32Array<ArrayBuffer>
+  right: Float32Array<ArrayBuffer>
 }
 interface BpmResolution {
   bpm: number
@@ -40,8 +44,9 @@ interface AubioBpmResult {
   reliable: boolean
 }
 
-const REFERENCE_AUDIO_SECONDS = 8
 const MAGIC_DURATION_BARS = 4
+const BEATS_PER_BAR = 4
+const CAPTURE_SAMPLE_RATE = 48_000
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
 const MIN_SUPPORTED_BPM = 40
 const MAX_SUPPORTED_BPM = 240
@@ -50,12 +55,19 @@ const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
-let lastLoadedDeckIndex: 0 | 1 | null = null
 let currentProjectBpm: number | null = null
 let tempoMasterEstablished = false
 let deckLoadQueue: Promise<void> = Promise.resolve()
 let tempoSessionId = 0
 let waveformAnimationFrame: number | null = null
+let liveAudioStream: MediaStream | null = null
+let liveAudioContext: AudioContext | null = null
+let liveAudioSource: MediaStreamAudioSourceNode | null = null
+let liveAudioWorklet: AudioWorkletNode | null = null
+let liveAudioSilentGain: GainNode | null = null
+let liveAudioBuffer: StereoPcmRingBuffer | null = null
+let liveAudioStatusTimer: number | null = null
+let liveAudioSessionId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
 
 const decks: [DeckState, DeckState, DeckState] = [
@@ -74,6 +86,10 @@ const btnLogin = el<HTMLButtonElement>('btn-login')
 const btnConnect = el<HTMLButtonElement>('btn-connect')
 const btnDisconnect = el<HTMLButtonElement>('btn-disconnect')
 const projectUrlRow = el<HTMLDivElement>('project-url-row')
+const audioCaptureRow = el<HTMLDivElement>('audio-capture-row')
+const btnAudioCapture = el<HTMLButtonElement>('btn-audio-capture')
+const audioCaptureDot = el<HTMLSpanElement>('audio-capture-dot')
+const audioCaptureLabel = el<HTMLSpanElement>('audio-capture-label')
 const inputProjectUrl = el<HTMLInputElement>('input-project-url')
 const magentaUrl = el<HTMLInputElement>('magenta-url')
 const btnGenerate = el<HTMLButtonElement>('btn-generate')
@@ -117,6 +133,7 @@ async function init() {
       setStatus('connected', `AUTHENTICATED AS ${result.userName.toUpperCase()}`)
       btnLogin.style.display = 'none'
       projectUrlRow.style.display = 'flex'
+      audioCaptureRow.style.display = 'flex'
       btnConnect.disabled = false
       btnDisconnect.disabled = false
       if (window.location.search.includes('code=')) {
@@ -147,11 +164,13 @@ async function init() {
 
 async function disconnectAll() {
   resetTempoMasterSession()
+  await stopLiveAudioCapture()
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
   if (at) { try { at.logout() } catch (_) {}; at = null }
   decks.forEach(clearDeckProjectEntities)
   statusUser.textContent = ''
   projectUrlRow.style.display = 'none'
+  audioCaptureRow.style.display = 'none'
   btnLogin.style.display = ''
   btnConnect.disabled = true
   btnDisconnect.disabled = true
@@ -261,6 +280,7 @@ function updateDeckBpmLabels(bpm: number | null) {
     if (deck.sampleBpm === null) deck.baseBpm = bpm
     updateDeckBpmLabel(index as WaveformDeckIndex)
   })
+  updateLiveAudioBufferStatus()
 }
 function updateDeckBpmLabel(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
@@ -616,7 +636,6 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File) {
   try {
     const buf = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
     deckStop(deck); clearDeckProjectEntities(deck); deck.audioBuffer = buf; deck.fileName = file.name
-    lastLoadedDeckIndex = deckIndex
     drawWaveform(`waveform-${deckIndex + 1}`, buf)
     await uploadToNexus(deckIndex + 1, file)
   } catch (e: unknown) { setStatus('error', `LOAD ERROR: ${e instanceof Error ? e.message : String(e)}`) }
@@ -785,7 +804,7 @@ function initKnob(canvas: HTMLCanvasElement) {
 }
 
 // ── MAGIC AUDIO ───────────────────────────────────────────────────────────────
-function drawMagicIdle(label = '[ GENERATE AUDIO FROM LAST 8 SECONDS ]') {
+function drawMagicIdle(label = '[ GENERATE AUDIO FROM LIVE 4-BAR BUFFER ]') {
   const ctx = magicWaveform.getContext('2d')!
   const W = magicWaveform.width, H = magicWaveform.height
   ctx.fillStyle = '#050000'; ctx.fillRect(0, 0, W, H)
@@ -803,40 +822,195 @@ function getDeckPositionSeconds(deck: DeckState) {
   return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
 }
 
-function selectReferenceDeck(): { deck: DeckState; deckIndex: 0 | 1 } | null {
-  const playingIndex = decks.findIndex((deck, index) => index < 2 && deck.isPlaying && deck.audioBuffer) as 0 | 1 | -1
-  if (playingIndex !== -1) return { deck: decks[playingIndex], deckIndex: playingIndex }
-  if (lastLoadedDeckIndex !== null && decks[lastLoadedDeckIndex].audioBuffer) {
-    return { deck: decks[lastLoadedDeckIndex], deckIndex: lastLoadedDeckIndex }
+class StereoPcmRingBuffer {
+  private readonly left: Float32Array
+  private readonly right: Float32Array
+  private writeIndex = 0
+  private totalFrames = 0
+
+  constructor(readonly capacityFrames: number) {
+    this.left = new Float32Array(capacityFrames)
+    this.right = new Float32Array(capacityFrames)
   }
-  const loadedIndex = decks.findIndex((deck, index) => index < 2 && deck.audioBuffer) as 0 | 1 | -1
-  if (loadedIndex !== -1) return { deck: decks[loadedIndex], deckIndex: loadedIndex }
-  return null
+
+  get availableFrames() {
+    return Math.min(this.totalFrames, this.capacityFrames)
+  }
+
+  write(chunk: CaptureChunk) {
+    const frames = Math.min(chunk.left.length, chunk.right.length)
+    if (frames <= 0) return
+
+    if (frames >= this.capacityFrames) {
+      this.left.set(chunk.left.subarray(frames - this.capacityFrames))
+      this.right.set(chunk.right.subarray(frames - this.capacityFrames))
+      this.writeIndex = 0
+      this.totalFrames += frames
+      return
+    }
+
+    const firstFrames = Math.min(frames, this.capacityFrames - this.writeIndex)
+    this.left.set(chunk.left.subarray(0, firstFrames), this.writeIndex)
+    this.right.set(chunk.right.subarray(0, firstFrames), this.writeIndex)
+    const remainingFrames = frames - firstFrames
+    if (remainingFrames > 0) {
+      this.left.set(chunk.left.subarray(firstFrames), 0)
+      this.right.set(chunk.right.subarray(firstFrames), 0)
+    }
+    this.writeIndex = (this.writeIndex + frames) % this.capacityFrames
+    this.totalFrames += frames
+  }
+
+  readLatest(frameCount: number): CaptureChunk | null {
+    if (frameCount <= 0 || this.availableFrames < frameCount) return null
+
+    const left = new Float32Array(frameCount)
+    const right = new Float32Array(frameCount)
+    const start = (this.writeIndex - frameCount + this.capacityFrames) % this.capacityFrames
+    const firstFrames = Math.min(frameCount, this.capacityFrames - start)
+    left.set(this.left.subarray(start, start + firstFrames))
+    right.set(this.right.subarray(start, start + firstFrames))
+    if (firstFrames < frameCount) {
+      left.set(this.left.subarray(0, frameCount - firstFrames), firstFrames)
+      right.set(this.right.subarray(0, frameCount - firstFrames), firstFrames)
+    }
+    return { left, right }
+  }
 }
 
-function createReferenceBuffer(deck: DeckState) {
-  if (!deck.audioBuffer) throw new Error('No audio loaded')
-  ensureCtx(deck)
+function fourBarsDurationSeconds(bpm: number) {
+  return MAGIC_DURATION_BARS * BEATS_PER_BAR * 60 / bpm
+}
 
-  const source = deck.audioBuffer
-  const sampleRate = source.sampleRate
-  const sourceLength = source.length
-  const channels = Math.min(source.numberOfChannels, 2)
-  if (sourceLength <= 0) throw new Error('Loaded audio is empty')
+function setAudioCaptureStatus(state: 'idle' | 'connecting' | 'connected' | 'error', label: string) {
+  audioCaptureDot.className = `dot ${state}`
+  audioCaptureLabel.textContent = label
+}
 
-  const length = Math.max(1, Math.min(Math.round(REFERENCE_AUDIO_SECONDS * sampleRate), sourceLength))
-  const startSample = Math.floor((sourceLength - length) / 2)
-  const output = deck.audioCtx!.createBuffer(channels, length, sampleRate)
+function requiredLiveAudioFrames(bpm: number) {
+  const sampleRate = liveAudioContext?.sampleRate ?? CAPTURE_SAMPLE_RATE
+  return Math.ceil(fourBarsDurationSeconds(bpm) * sampleRate)
+}
 
-  for (let channel = 0; channel < channels; channel++) {
-    const input = source.getChannelData(channel)
-    const out = output.getChannelData(channel)
-    for (let i = 0; i < length; i++) {
-      out[i] = input[startSample + i] ?? 0
-    }
+function updateLiveAudioBufferStatus() {
+  if (!liveAudioStream || !liveAudioContext || !liveAudioBuffer) return
+  if (!currentProjectBpm) {
+    setAudioCaptureStatus('connected', 'CAPTURING AUDIOTOOL AUDIO · CONNECT PROJECT FOR BPM')
+    return
   }
 
-  return output
+  const requiredFrames = requiredLiveAudioFrames(currentProjectBpm)
+  const progress = Math.min(1, liveAudioBuffer.availableFrames / requiredFrames)
+  if (progress < 1) {
+    setAudioCaptureStatus('connecting', `BUFFERING LIVE AUDIO · ${(progress * MAGIC_DURATION_BARS).toFixed(1)} / ${MAGIC_DURATION_BARS} BARS`)
+  } else {
+    setAudioCaptureStatus('connected', `READY · LAST ${MAGIC_DURATION_BARS} BARS BUFFERED AT ${Math.round(currentProjectBpm)} BPM`)
+  }
+}
+
+async function stopLiveAudioCapture(status?: string) {
+  liveAudioSessionId += 1
+  if (liveAudioStatusTimer !== null) {
+    window.clearInterval(liveAudioStatusTimer)
+    liveAudioStatusTimer = null
+  }
+
+  liveAudioWorklet?.disconnect()
+  liveAudioSource?.disconnect()
+  liveAudioSilentGain?.disconnect()
+  liveAudioStream?.getTracks().forEach((track) => track.stop())
+  if (liveAudioContext && liveAudioContext.state !== 'closed') await liveAudioContext.close()
+
+  liveAudioStream = null
+  liveAudioContext = null
+  liveAudioSource = null
+  liveAudioWorklet = null
+  liveAudioSilentGain = null
+  liveAudioBuffer = null
+  btnAudioCapture.disabled = false
+  btnAudioCapture.textContent = '⬡ SELECT AUDIOTOOL TAB'
+  setAudioCaptureStatus(status ? 'error' : 'idle', status ?? 'SELECT THE AUDIOTOOL TAB AND ENABLE TAB AUDIO — ONCE PER SESSION')
+}
+
+async function startLiveAudioCapture() {
+  if (liveAudioStream) return
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    setAudioCaptureStatus('error', 'TAB AUDIO CAPTURE IS NOT SUPPORTED IN THIS BROWSER')
+    return
+  }
+
+  btnAudioCapture.disabled = true
+  setAudioCaptureStatus('connecting', 'CHOOSE THE AUDIOTOOL TAB AND ENABLE SHARE TAB AUDIO…')
+  const sessionId = ++liveAudioSessionId
+
+  try {
+    const options = {
+      video: { frameRate: { ideal: 1, max: 1 } },
+      audio: {
+        autoGainControl: false,
+        echoCancellation: false,
+        noiseSuppression: false,
+        suppressLocalAudioPlayback: false,
+      },
+      preferCurrentTab: false,
+      selfBrowserSurface: 'exclude',
+      surfaceSwitching: 'exclude',
+      systemAudio: 'exclude',
+    } as DisplayMediaStreamOptions
+    const stream = await navigator.mediaDevices.getDisplayMedia(options)
+    if (sessionId !== liveAudioSessionId) {
+      stream.getTracks().forEach((track) => track.stop())
+      return
+    }
+
+    const audioTrack = stream.getAudioTracks()[0]
+    const videoTrack = stream.getVideoTracks()[0]
+    if (!audioTrack) {
+      stream.getTracks().forEach((track) => track.stop())
+      throw new Error('No tab audio was shared. Select the Audiotool tab and enable Share tab audio.')
+    }
+    const displaySurface = videoTrack?.getSettings().displaySurface
+    if (displaySurface && displaySurface !== 'browser') {
+      stream.getTracks().forEach((track) => track.stop())
+      throw new Error('Select the Audiotool browser tab, not a window or entire screen.')
+    }
+
+    const context = new AudioContext({ sampleRate: CAPTURE_SAMPLE_RATE, latencyHint: 'interactive' })
+    await context.audioWorklet.addModule(new URL('./audio-capture-worklet.js', import.meta.url))
+    const source = context.createMediaStreamSource(new MediaStream([audioTrack]))
+    const worklet = new AudioWorkletNode(context, 'pcm-capture-processor', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    })
+    const silentGain = context.createGain()
+    silentGain.gain.value = 0
+    source.connect(worklet).connect(silentGain).connect(context.destination)
+
+    const maximumSeconds = fourBarsDurationSeconds(MIN_SUPPORTED_BPM) + 1
+    const ringBuffer = new StereoPcmRingBuffer(Math.ceil(maximumSeconds * context.sampleRate))
+    worklet.port.onmessage = (event: MessageEvent<CaptureChunk>) => ringBuffer.write(event.data)
+
+    liveAudioStream = stream
+    liveAudioContext = context
+    liveAudioSource = source
+    liveAudioWorklet = worklet
+    liveAudioSilentGain = silentGain
+    liveAudioBuffer = ringBuffer
+
+    const handleEnded = () => {
+      if (sessionId === liveAudioSessionId) void stopLiveAudioCapture('AUDIO SHARING STOPPED · SELECT THE AUDIOTOOL TAB AGAIN')
+    }
+    audioTrack.addEventListener('ended', handleEnded, { once: true })
+    videoTrack?.addEventListener('ended', handleEnded, { once: true })
+    liveAudioStatusTimer = window.setInterval(updateLiveAudioBufferStatus, 250)
+    btnAudioCapture.textContent = '✓ AUDIOTOOL AUDIO CONNECTED'
+    updateLiveAudioBufferStatus()
+  } catch (error: unknown) {
+    if (sessionId !== liveAudioSessionId) return
+    const message = error instanceof Error ? error.message : String(error)
+    await stopLiveAudioCapture(message)
+  }
 }
 
 function writeAscii(view: DataView, offset: number, value: string) {
@@ -879,15 +1053,40 @@ function audioBufferToWav(buffer: AudioBuffer) {
   return new Blob([arrayBuffer], { type: 'audio/wav' })
 }
 
-function buildReferenceAudio(): ReferenceAudio {
-  const selection = selectReferenceDeck()
-  if (!selection) throw new Error('Load or play a deck before generating')
+function captureRms(chunk: CaptureChunk) {
+  let sumSquares = 0
+  for (let i = 0; i < chunk.left.length; i++) {
+    sumSquares += (chunk.left[i] * chunk.left[i]) + (chunk.right[i] * chunk.right[i])
+  }
+  return Math.sqrt(sumSquares / Math.max(1, chunk.left.length * 2))
+}
 
-  const buffer = createReferenceBuffer(selection.deck)
+function buildReferenceAudio(bpm: number): ReferenceAudio {
+  if (!liveAudioContext || !liveAudioStream || !liveAudioBuffer) {
+    throw new Error('Connect Audiotool live audio before generating')
+  }
+  if (!liveAudioStream.getAudioTracks().some((track) => track.readyState === 'live')) {
+    throw new Error('Audiotool audio sharing has stopped')
+  }
+
+  const requiredFrames = requiredLiveAudioFrames(bpm)
+  const chunk = liveAudioBuffer.readLatest(requiredFrames)
+  if (!chunk) {
+    const remainingFrames = requiredFrames - liveAudioBuffer.availableFrames
+    const remainingSeconds = Math.max(0, remainingFrames / liveAudioContext.sampleRate)
+    throw new Error(`Keep Audiotool playing for ${remainingSeconds.toFixed(1)} more seconds to buffer four bars`)
+  }
+  if (captureRms(chunk) < 0.0001) {
+    throw new Error('The last four bars are silent. Start playback in Audiotool and try again')
+  }
+
+  const buffer = liveAudioContext.createBuffer(2, requiredFrames, liveAudioContext.sampleRate)
+  buffer.copyToChannel(chunk.left, 0)
+  buffer.copyToChannel(chunk.right, 1)
   return {
     blob: audioBufferToWav(buffer),
-    fileName: `deck-${selection.deckIndex + 1}-middle-${REFERENCE_AUDIO_SECONDS}s.wav`,
-    deckNum: selection.deckIndex + 1,
+    fileName: `audiotool-live-${MAGIC_DURATION_BARS}-bars-${Math.round(bpm)}bpm.wav`,
+    sourceLabel: 'AUDIOTOOL LIVE',
     seconds: buffer.duration,
   }
 }
@@ -918,8 +1117,8 @@ async function generateMagicAudio() {
 
   setMagicStatus('generating', 'CAPTURING'); btnGenerate.disabled = true
   try {
-    const reference = buildReferenceAudio()
     const generationBpm = getMagicGenerationBpm()
+    const reference = buildReferenceAudio(generationBpm)
     const form = new FormData()
     form.append('audio_file', reference.blob, reference.fileName)
     form.append('prompt', promptText)
@@ -930,7 +1129,7 @@ async function generateMagicAudio() {
     form.append('stem_role', 'auto')
     form.append('avoid_clash', 'true')
 
-    setMagicStatus('generating', `MAGENTA ← DECK ${reference.deckNum}`)
+    setMagicStatus('generating', `MAGENTA ← ${reference.sourceLabel}`)
     const resp = await fetch(`${magentaEndpoint()}/generate`, { method: 'POST', body: form })
     if (!resp.ok) {
       const detail = await resp.text()
@@ -1046,10 +1245,12 @@ function initApp() {
   inputProjectUrl.addEventListener('input', () => localStorage.setItem('nexus_project_url', inputProjectUrl.value))
 
   projectUrlRow.style.display = 'none'
+  audioCaptureRow.style.display = 'none'
   resetBpmDialogue(0)
   resetBpmDialogue(1)
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
+  btnAudioCapture.onclick = () => startLiveAudioCapture()
   el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()
 
   setupDropZone('drop-1', 0)

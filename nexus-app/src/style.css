@@ -64,6 +64,9 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .conn-input { flex: 1; background: var(--black); border: 1px solid var(--grey-light); color: var(--white); font-family: var(--font-data); font-size: 11px; padding: 4px 8px; outline: none; transition: border-color 0.2s; }
 .conn-input:focus { border-color: var(--red); }
 .conn-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.audio-capture-row { flex-basis: 100%; }
+.audio-capture-status { display: flex; align-items: center; gap: 8px; min-width: 260px; font-family: var(--font-live); font-size: 11px; letter-spacing: 1px; color: var(--grey-text); }
+.audio-capture-status .dot { display: inline-block; }
 
 .btn-primary, .btn-danger { font-family: var(--font-header); font-size: 13px; letter-spacing: 2px; padding: 5px 14px; border: none; cursor: pointer; transition: all 0.15s; }
 .btn-primary { background: var(--red); color: var(--white); }
