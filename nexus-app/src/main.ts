@@ -122,6 +122,9 @@ async function init() {
       if (window.location.search.includes('code=')) {
         window.history.replaceState({}, '', '/')
       }
+      if (inputProjectUrl.value.trim()) {
+        await connectProject()
+      }
     } else {
       btnLogin.style.display = ''
       btnLogin.disabled = false
