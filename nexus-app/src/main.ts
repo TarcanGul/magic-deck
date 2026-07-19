@@ -30,17 +30,33 @@ interface ReferenceAudio {
   deckNum: number
   seconds: number
 }
+interface BpmResolution {
+  bpm: number
+  source: 'audiotool' | 'aubio' | 'manual' | 'project'
+}
+interface AubioBpmResult {
+  bpm: number | null
+  confidence: number
+  reliable: boolean
+}
 
 const REFERENCE_AUDIO_SECONDS = 8
 const MAGIC_DURATION_BARS = 4
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
+const MIN_SUPPORTED_BPM = 40
+const MAX_SUPPORTED_BPM = 240
+const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
 let lastLoadedDeckIndex: 0 | 1 | null = null
 let currentProjectBpm: number | null = null
+let tempoMasterEstablished = false
+let deckLoadQueue: Promise<void> = Promise.resolve()
+let tempoSessionId = 0
 let waveformAnimationFrame: number | null = null
+const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
 
 const decks: [DeckState, DeckState, DeckState] = [
   { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
@@ -127,6 +143,7 @@ async function init() {
 }
 
 async function disconnectAll() {
+  resetTempoMasterSession()
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
   if (at) { try { at.logout() } catch (_) {}; at = null }
   decks.forEach(clearDeckProjectEntities)
@@ -207,6 +224,7 @@ async function connectProject() {
   if (!projectUrl) { setStatus('error', 'PASTE AN AUDIOTOOL PROJECT URL ABOVE'); return }
   setStatus('connecting', 'OPENING PROJECT…')
   btnConnect.disabled = true
+  resetTempoMasterSession()
   try {
     nexus = await at.open(projectUrl)
     nexus.connected.subscribe((c) => setStatus(c ? 'connected' : 'error', c ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…'))
@@ -219,6 +237,18 @@ async function connectProject() {
     nexus = null
     btnConnect.disabled = false
   }
+}
+
+function resetTempoMasterSession() {
+  tempoSessionId += 1
+  tempoMasterEstablished = false
+  currentProjectBpm = null
+  deckLoadQueue = Promise.resolve()
+  pendingBpmResolutions.forEach((resolve, deckIndex) => {
+    resolve?.(null)
+    pendingBpmResolutions[deckIndex] = null
+    resetBpmDialogue(deckIndex)
+  })
 }
 
 // ── NEXUS ─────────────────────────────────────────────────────────────────────
@@ -252,13 +282,129 @@ function clearDeckProjectEntities(deck: DeckState) {
   deck.mixerChannelEntity = null
 }
 
-function getDetectedOrProjectBpm(sample: SampleMeta, deckNum: number) {
-  if (Number.isFinite(sample.bpm) && sample.bpm > 0) return sample.bpm
-  if (currentProjectBpm && currentProjectBpm > 0) {
-    setStatus('connected', `DECK ${deckNum}: NO BPM DETECTED — USING PROJECT BPM ${Math.round(currentProjectBpm)}`)
-    return currentProjectBpm
+function isSupportedBpm(value: number | null | undefined): value is number {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    && value >= MIN_SUPPORTED_BPM
+    && value <= MAX_SUPPORTED_BPM
+}
+
+function resetBpmDialogue(deckIndex: number) {
+  const prefix = `deck${deckIndex + 1}-bpm`
+  el<HTMLDivElement>(`${prefix}-dialogue`).classList.remove('is-hidden')
+  el<HTMLDivElement>(`${prefix}-form`).classList.add('is-hidden')
+  const title = el<HTMLDivElement>(`${prefix}-title`)
+  title.textContent = DECK_PROMPT_IDLE_TEXT
+  title.classList.add('bpm-dialogue-title-idle')
+}
+
+function showBpmAnalyzing(deckNum: number) {
+  const prefix = `deck${deckNum}-bpm`
+  el<HTMLDivElement>(`${prefix}-dialogue`).classList.remove('is-hidden')
+  el<HTMLDivElement>(`${prefix}-form`).classList.add('is-hidden')
+  const title = el<HTMLDivElement>(`${prefix}-title`)
+  title.textContent = 'ANALYZING BPM…'
+  title.classList.remove('bpm-dialogue-title-idle')
+}
+
+function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<BpmResolution | null> {
+  return new Promise((resolve) => {
+    const deckIndex = deckNum - 1
+    const prefix = `deck${deckNum}-bpm`
+    const dialogue = el<HTMLDivElement>(`${prefix}-dialogue`)
+    const form = el<HTMLDivElement>(`${prefix}-form`)
+    const input = el<HTMLInputElement>(`${prefix}-input`)
+    const confirm = el<HTMLButtonElement>(`${prefix}-accept`)
+    const fallback = el<HTMLButtonElement>(`${prefix}-skip`)
+    const hint = el<HTMLDivElement>(`${prefix}-hint`)
+    const error = el<HTMLDivElement>(`${prefix}-error`)
+    input.value = isSupportedBpm(estimate?.bpm) ? String(estimate.bpm) : ''
+    hint.textContent = isSupportedBpm(estimate?.bpm)
+      ? `AUBIO: ${estimate.bpm} BPM · ${Math.round(estimate.confidence * 100)}% CONFIDENCE`
+      : 'ENTER SOURCE BPM (40–240)'
+    error.textContent = ''
+    const title = el<HTMLDivElement>(`${prefix}-title`)
+    title.textContent = 'CONFIRM SOURCE BPM'
+    title.classList.remove('bpm-dialogue-title-idle')
+    dialogue.classList.remove('is-hidden')
+    form.classList.remove('is-hidden')
+
+    const close = (result: BpmResolution | null) => {
+      resetBpmDialogue(deckIndex)
+      confirm.onclick = null
+      fallback.onclick = null
+      input.onkeydown = null
+      pendingBpmResolutions[deckIndex] = null
+      resolve(result)
+    }
+    pendingBpmResolutions[deckIndex] = close
+    const submit = () => {
+      const bpm = Number(input.value)
+      if (!isSupportedBpm(bpm)) {
+        error.textContent = `BPM MUST BE BETWEEN ${MIN_SUPPORTED_BPM} AND ${MAX_SUPPORTED_BPM}`
+        return
+      }
+      close({ bpm, source: 'manual' })
+    }
+    input.onkeydown = (event: KeyboardEvent) => {
+      if (event.key === 'Enter') { event.preventDefault(); submit() }
+    }
+    confirm.onclick = submit
+    fallback.onclick = () => {
+      if (!isSupportedBpm(currentProjectBpm)) {
+        error.textContent = `PROJECT BPM IS NOT AVAILABLE IN THE ${MIN_SUPPORTED_BPM}–${MAX_SUPPORTED_BPM} RANGE`
+        return
+      }
+      close({ bpm: currentProjectBpm, source: 'project' })
+    }
+  })
+}
+
+async function requestAubioBpm(file: File): Promise<AubioBpmResult> {
+  const form = new FormData()
+  form.append('audio_file', file, file.name)
+  const response = await fetch(`${magentaEndpoint()}/detect-bpm`, { method: 'POST', body: form })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { detail?: string } | null
+    throw new Error(body?.detail || `BPM analysis failed (${response.status})`)
   }
-  throw new Error('No sample BPM detected and project BPM is unavailable')
+  return await response.json() as AubioBpmResult
+}
+
+async function resolveSampleBpm(sample: SampleMeta, file: File, deckNum: number, expectedSession: number): Promise<BpmResolution | null> {
+  if (isSupportedBpm(sample.bpm)) {
+    resetBpmDialogue(deckNum - 1)
+    setStatus('connected', `DECK ${deckNum}: AUDIOTOOL BPM METADATA ${Math.round(sample.bpm)} ACCEPTED`)
+    return { bpm: sample.bpm, source: 'audiotool' }
+  }
+  showBpmAnalyzing(deckNum)
+  setStatus('connecting', `DECK ${deckNum}: ANALYZING BPM WITH AUBIO…`)
+  try {
+    const estimate = await requestAubioBpm(file)
+    if (expectedSession !== tempoSessionId || !nexus) {
+      resetBpmDialogue(deckNum - 1)
+      return null
+    }
+    if (estimate.reliable && estimate.confidence >= 0.5 && isSupportedBpm(estimate.bpm)) {
+      resetBpmDialogue(deckNum - 1)
+      setStatus('connected', `DECK ${deckNum}: AUBIO DETECTED ${Math.round(estimate.bpm)} BPM (${Math.round(estimate.confidence * 100)}% CONFIDENCE)`)
+      return { bpm: estimate.bpm, source: 'aubio' }
+    }
+    if (isSupportedBpm(estimate.bpm)) {
+      setStatus('connected', `DECK ${deckNum}: LOW-CONFIDENCE AUBIO ESTIMATE — CONFIRM BPM`)
+    } else {
+      setStatus('connected', `DECK ${deckNum}: AUBIO COULD NOT RESOLVE BPM — MANUAL ENTRY REQUIRED`)
+    }
+    return showBpmDialogue(deckNum, estimate)
+  } catch (e) {
+    console.warn('[AUBIO] BPM analysis:', e)
+    if (expectedSession !== tempoSessionId || !nexus) {
+      resetBpmDialogue(deckNum - 1)
+      return null
+    }
+    setStatus('connected', `DECK ${deckNum}: BPM ANALYSIS FAILED — MANUAL ENTRY REQUIRED`)
+    return showBpmDialogue(deckNum)
+  }
 }
 
 function knobValueToEqDb(value: number) {
@@ -299,12 +445,20 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   return { track, audioDevice, mixerChannel }
 }
 
-async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, displayName: string, forceMagicLoop: boolean) {
+async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, displayName: string, forceMagicLoop: boolean, resolution?: BpmResolution, expectedSession = tempoSessionId) {
   if (!nexus) throw new Error('Project not connected')
+  const projectDocument = nexus
   const deck = decks[deckNum - 1]
-  const bpm = getDetectedOrProjectBpm(sample, deckNum)
+  const bpm = resolution?.bpm ?? (isSupportedBpm(sample.bpm) ? sample.bpm : currentProjectBpm)
+  if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
+  const establishesMaster = deckNum <= 2 && !tempoMasterEstablished
 
-  const inserted = await nexus.modify((t) => {
+  const inserted = await projectDocument.modify((t) => {
+    if (establishesMaster) {
+      const config = t.entities.ofTypes('config').get()[0]
+      if (!config) throw new Error('Project tempo configuration was not found')
+      t.update(config.fields.tempoBpm, bpm)
+    }
     const region = t.insertSample(sample, {
       sample: { bpm },
       region: forceMagicLoop
@@ -313,11 +467,20 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
       loop: forceMagicLoop ? true : undefined,
       displayName,
     })
+    if (deckNum <= 2 && !establishesMaster) t.update(region.fields.timestretchMode, 2)
     const entities = resolveInsertedProjectEntities(region, t)
     return { region, ...entities }
   })
+  if (expectedSession !== tempoSessionId || nexus !== projectDocument) {
+    throw new Error('Project connection changed during insertion')
+  }
 
-  deck.sampleBpm = sample.bpm > 0 ? sample.bpm : null
+  if (establishesMaster) {
+    tempoMasterEstablished = true
+    currentProjectBpm = bpm
+  }
+
+  deck.sampleBpm = bpm
   deck.baseBpm = bpm
   deck.regionEntity = inserted.region
   deck.trackEntity = inserted.track
@@ -329,15 +492,31 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   return inserted
 }
 
-async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false) {
+async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false, expectedSession = tempoSessionId) {
   if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
   setStatus('connected', `UPLOADING ${file.name}…`)
   try {
     const displayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
     const sample = await uploadSample(file, displayName)
+    if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during upload')
+    const resolution = deckNum <= 2 ? await resolveSampleBpm(sample, file, deckNum, expectedSession) : undefined
+    if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during BPM selection')
+    if (deckNum <= 2 && !resolution) {
+      setStatus('connected', `DECK ${deckNum}: BPM ENTRY CANCELLED — SAMPLE NOT INSERTED`)
+      return false
+    }
+    if (resolution?.source === 'project') {
+      setStatus('connected', `DECK ${deckNum}: BPM UNKNOWN — ASSUMING PROJECT BPM ${Math.round(resolution.bpm)}`)
+    } else if (resolution?.source === 'manual') {
+      setStatus('connected', `DECK ${deckNum}: MANUAL BPM ${Math.round(resolution.bpm)} SELECTED`)
+    }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
-    await insertSampleIntoProject(deckNum, sample, displayName, forceMagicLoop)
-    setStatus('connected', `DECK ${deckNum}: ${file.name} — PROJECT SYNCED ✓`)
+    const selectingMaster = deckNum <= 2 && !tempoMasterEstablished
+    await insertSampleIntoProject(deckNum, sample, displayName, forceMagicLoop, resolution ?? undefined, expectedSession)
+    setStatus('connected', selectingMaster
+      ? `DECK ${deckNum}: MASTER TEMPO SET TO ${Math.round(resolution!.bpm)} BPM — PROJECT SYNCED ✓`
+      : `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
+    return true
   } catch (e: unknown) {
     setStatus('error', `UPLOAD ERROR: ${e instanceof Error ? e.message : String(e)}`)
     throw e
@@ -438,6 +617,16 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File) {
     drawWaveform(`waveform-${deckIndex + 1}`, buf)
     await uploadToNexus(deckIndex + 1, file)
   } catch (e: unknown) { setStatus('error', `LOAD ERROR: ${e instanceof Error ? e.message : String(e)}`) }
+}
+
+function queueDeckLoad(deckIndex: 0 | 1, file: File) {
+  const expectedSession = tempoSessionId
+  deckLoadQueue = deckLoadQueue
+    .then(() => {
+      if (expectedSession !== tempoSessionId) return
+      return loadAudioFile(deckIndex, file)
+    })
+    .catch((error: unknown) => setStatus('error', `LOAD ERROR: ${error instanceof Error ? error.message : String(error)}`))
 }
 
 // ── WAVEFORM ──────────────────────────────────────────────────────────────────
@@ -784,7 +973,7 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
     if (!file) return
     if (!file.name.match(/\.(mp3|wav)$/i)) { setStatus('error', 'ONLY MP3 / WAV FILES ACCEPTED'); return }
     zone.classList.add('loaded'); label.textContent = file.name
-    await loadAudioFile(deckIndex, file)
+    queueDeckLoad(deckIndex, file)
   })
 }
 
@@ -854,6 +1043,8 @@ function initApp() {
   inputProjectUrl.addEventListener('input', () => localStorage.setItem('nexus_project_url', inputProjectUrl.value))
 
   projectUrlRow.style.display = 'none'
+  resetBpmDialogue(0)
+  resetBpmDialogue(1)
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
   el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()

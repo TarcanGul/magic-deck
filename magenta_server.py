@@ -2,11 +2,13 @@
 Magenta RT2 FastAPI Server
 --------------------------
 Endpoints:
+  POST /detect-bpm — detect tempo from an uploaded audio file with aubio
   POST /generate  — generate audio from audio file + text prompt
   GET  /health    — health check
 """
 
 import io
+import logging
 import math
 import tempfile
 import os
@@ -15,6 +17,13 @@ from typing import Any
 import numpy as np
 import librosa
 import soundfile as sf
+
+aubio_load_error: Exception | None = None
+try:
+    import aubio
+except (ImportError, OSError) as e:
+    aubio = None
+    aubio_load_error = e
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +68,9 @@ MINOR_KEY_PROFILE = np.array(
     dtype=np.float32,
 )
 TONIC_KEY_WEIGHT = 0.08
+MAX_LOGGED_BPM_CANDIDATES = 5
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Magenta RT2 API", version="1.0.0")
 app.add_middleware(
@@ -71,6 +83,10 @@ app.add_middleware(
 magenta_audio: Any | None = None
 style_model: Any | None = None
 mrt: Any | None = None
+
+
+class AubioUnavailableError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -103,6 +119,79 @@ def get_magenta_runtime() -> tuple[Any, Any, Any]:
         print("Models loaded. Server ready.")
 
     return magenta_audio, style_model, mrt
+
+
+def get_aubio_runtime() -> Any:
+    """Load aubio independently from the much heavier Magenta runtime."""
+    if aubio is None:
+        raise AubioUnavailableError(str(aubio_load_error))
+    return aubio
+
+
+def log_bpm_candidates(estimates: list[float], confidences: list[float]) -> None:
+    candidates: dict[float, float] = {}
+    for estimate, confidence in zip(estimates, confidences):
+        rounded_bpm = round(estimate, 2)
+        candidates[rounded_bpm] = max(candidates.get(rounded_bpm, 0.0), confidence)
+
+    ranked = sorted(candidates.items(), key=lambda candidate: candidate[1], reverse=True)
+    top_candidates = ranked[:MAX_LOGGED_BPM_CANDIDATES]
+    if not top_candidates:
+        logger.info("BPM detection produced no candidates")
+        return
+
+    logger.info("BPM detection top %d candidate(s):", len(top_candidates))
+    for rank, (bpm, confidence) in enumerate(top_candidates, start=1):
+        logger.info(
+            "  #%d bpm=%.2f confidence=%.3f (%d%%)",
+            rank,
+            bpm,
+            confidence,
+            round(confidence * 100),
+        )
+
+
+def detect_bpm_from_file(
+    path: str,
+    aubio_module: Any | None = None,
+    log_candidates: bool = False,
+) -> dict[str, float | bool | None]:
+    aubio_module = aubio_module or get_aubio_runtime()
+    window_size = 1024
+    hop_size = 512
+    source = aubio_module.source(path, 0, hop_size)
+    tempo = aubio_module.tempo("default", window_size, hop_size, source.samplerate)
+    estimates: list[float] = []
+    confidences: list[float] = []
+
+    while True:
+        samples, frames_read = source()
+        if tempo(samples):
+            estimate = float(tempo.get_bpm())
+            if math.isfinite(estimate) and estimate > 0:
+                estimates.append(estimate)
+                confidence = float(tempo.get_confidence())
+                confidences.append(clamp01(confidence))
+        if frames_read < hop_size:
+            break
+
+    if log_candidates:
+        log_bpm_candidates(estimates, confidences)
+
+    if len(estimates) < 2:
+        return {"bpm": None, "confidence": 0.0, "reliable": False}
+
+    bpm = float(np.median(estimates))
+    relative_deviation = float(np.median(np.abs(np.asarray(estimates) - bpm))) / bpm
+    if relative_deviation > 0.1:
+        return {"bpm": None, "confidence": 0.0, "reliable": False}
+
+    confidence = float(np.median(confidences)) if confidences else 0.0
+    return {
+        "bpm": round(bpm, 2),
+        "confidence": round(confidence, 3),
+        "reliable": confidence >= 0.5,
+    }
 
 
 def validate_generation_bpm(bpm: float | None, required: bool = True) -> float | None:
@@ -629,6 +718,36 @@ def health():
         "model": MAGENTA_MODEL,
         "magenta_home": MAGENTA_RT_HOME,
     }
+
+
+@app.post("/detect-bpm")
+async def detect_bpm(audio_file: UploadFile = File(..., description="Original audio file")):
+    try:
+        aubio_module = get_aubio_runtime()
+    except AubioUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"Aubio BPM detection unavailable: {e}") from e
+
+    suffix = os.path.splitext(audio_file.filename or "")[-1] or ".audio"
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            contents = await audio_file.read()
+            if not contents:
+                raise HTTPException(status_code=400, detail="Could not read audio file: file is empty.")
+            tmp.write(contents)
+        try:
+            return detect_bpm_from_file(tmp_path, aubio_module, log_candidates=True)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read audio file: {e}") from e
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 @app.post("/generate")

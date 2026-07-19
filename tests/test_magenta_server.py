@@ -1,13 +1,20 @@
+import asyncio
+import io
 import unittest
+from unittest.mock import patch
 
 import numpy as np
+from fastapi import HTTPException, UploadFile
 
 from magenta_server import (
     DetectedKey,
+    AubioUnavailableError,
     blend_style_vectors,
     build_conditioning,
     build_mrt_style_prompt,
     detect_key,
+    detect_bpm,
+    detect_bpm_from_file,
     embed_musiccoca_styles,
     frames_per_beat_for_bpm,
     pitch_classes_for_key,
@@ -17,7 +24,84 @@ from magenta_server import (
 )
 
 
+class FakeAubio:
+    def __init__(self, bpms, confidence=0.8):
+        self.bpms = list(bpms)
+        self.confidence = confidence
+
+    def source(self, path, sample_rate, hop_size):
+        class Source:
+            samplerate = 48_000
+
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                frames = hop_size if self.calls <= len(self_bpms) else 0
+                return np.zeros(hop_size, dtype=np.float32), frames
+
+        self_bpms = self.bpms
+        return Source()
+
+    def tempo(self, method, window_size, hop_size, sample_rate):
+        class Tempo:
+            def __init__(self):
+                self.index = -1
+
+            def __call__(self, samples):
+                self.index += 1
+                return self.index < len(self_bpms)
+
+            def get_bpm(self):
+                return self_bpms[self.index]
+
+            def get_confidence(self):
+                return self_confidence
+
+        self_bpms = self.bpms
+        self_confidence = self.confidence
+        return Tempo()
+
+
 class MagentaServerHelperTests(unittest.TestCase):
+    def test_aubio_bpm_detection_returns_reliable_tempo(self):
+        result = detect_bpm_from_file("track.wav", FakeAubio([119.8, 120.1, 120.0], 0.82))
+
+        self.assertEqual(result, {"bpm": 120.0, "confidence": 0.82, "reliable": True})
+
+    def test_aubio_bpm_detection_preserves_low_confidence_estimate(self):
+        result = detect_bpm_from_file("track.wav", FakeAubio([127.9, 128.1], 0.31))
+
+        self.assertEqual(result, {"bpm": 128.0, "confidence": 0.31, "reliable": False})
+
+    def test_aubio_bpm_detection_returns_no_tempo_without_enough_beats(self):
+        result = detect_bpm_from_file("track.wav", FakeAubio([120.0], 0.9))
+
+        self.assertEqual(result, {"bpm": None, "confidence": 0.0, "reliable": False})
+
+    def test_aubio_bpm_detection_rejects_unreadable_audio(self):
+        class InvalidAubio:
+            def source(self, path, sample_rate, hop_size):
+                raise RuntimeError("invalid audio")
+
+        upload = UploadFile(filename="broken.audio", file=io.BytesIO(b"not audio"))
+        with patch("magenta_server.get_aubio_runtime", return_value=InvalidAubio()):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(detect_bpm(upload))
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("Could not read audio file", raised.exception.detail)
+
+    def test_aubio_unavailable_has_distinct_error(self):
+        upload = UploadFile(filename="track.wav", file=io.BytesIO(b"audio"))
+        with patch("magenta_server.get_aubio_runtime", side_effect=AubioUnavailableError("not installed")):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(detect_bpm(upload))
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("Aubio BPM detection unavailable", raised.exception.detail)
+
     def test_embed_musiccoca_styles_uses_joint_model_without_mapper(self):
         audio_prompt = object()
 

@@ -55,6 +55,18 @@ Run commands from `nexus-app/src`:
 - `npm run build`: run TypeScript checking and create a production build.
 - `npm run preview`: serve the production build locally for inspection.
 
+The Python server uses aubio for BPM detection. If the PyPI source release fails to compile against the active Python/NumPy toolchain, install the upstream source directly:
+
+```bash
+pip install -Iv git+https://git.aubio.org/aubio/aubio
+```
+
+Keep NumPy below 2.4 for compatibility with Magenta's `recurrentgemma` and Numba dependencies. To repair an environment that has a newer NumPy version installed, run:
+
+```bash
+python -m pip install --force-reinstall "numpy<2.4"
+```
+
 ## Coding Style & Naming Conventions
 
 Use TypeScript with strict typing. Follow `main.ts`: two-space indentation, single quotes, no semicolons, explicit interfaces, and focused helper functions. Prefer DOM IDs and constants that match UI labels, such as `btnConnect`, `magicGain`, and `deckPlay`.

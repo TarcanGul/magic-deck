@@ -87,6 +87,18 @@
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
             </div>
+            <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
+              <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
+              <div class="bpm-dialogue-form is-hidden" id="deck1-bpm-form">
+                <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
+                <div class="bpm-dialogue-actions">
+                  <input type="number" id="deck1-bpm-input" class="bpm-dialogue-input" min="40" max="240" step="0.01" placeholder="BPM" inputmode="decimal" aria-label="Deck A source BPM">
+                  <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-accept">ACCEPT</button>
+                  <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-skip">SKIP</button>
+                </div>
+                <div class="bpm-dialogue-error" id="deck1-bpm-error"></div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -136,6 +148,18 @@
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+            </div>
+            <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
+              <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
+              <div class="bpm-dialogue-form is-hidden" id="deck2-bpm-form">
+                <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>
+                <div class="bpm-dialogue-actions">
+                  <input type="number" id="deck2-bpm-input" class="bpm-dialogue-input" min="40" max="240" step="0.01" placeholder="BPM" inputmode="decimal" aria-label="Deck B source BPM">
+                  <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-accept">ACCEPT</button>
+                  <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-skip">SKIP</button>
+                </div>
+                <div class="bpm-dialogue-error" id="deck2-bpm-error"></div>
+              </div>
             </div>
           </div>
         </div>
