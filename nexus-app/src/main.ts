@@ -87,6 +87,7 @@ const btnConnect = el<HTMLButtonElement>('btn-connect')
 const btnDisconnect = el<HTMLButtonElement>('btn-disconnect')
 const projectUrlRow = el<HTMLDivElement>('project-url-row')
 const audioCaptureRow = el<HTMLDivElement>('audio-capture-row')
+const btnOpenAudiotool = el<HTMLButtonElement>('btn-open-audiotool')
 const btnAudioCapture = el<HTMLButtonElement>('btn-audio-capture')
 const audioCaptureDot = el<HTMLSpanElement>('audio-capture-dot')
 const audioCaptureLabel = el<HTMLSpanElement>('audio-capture-label')
@@ -887,6 +888,40 @@ function setAudioCaptureStatus(state: 'idle' | 'connecting' | 'connected' | 'err
   audioCaptureLabel.textContent = label
 }
 
+function isFirefox() {
+  return navigator.userAgent.includes('Firefox/')
+}
+
+function resetAudioCaptureAvailability() {
+  if (isFirefox()) {
+    btnAudioCapture.disabled = true
+    setAudioCaptureStatus('error', 'FIREFOX CANNOT CAPTURE TAB AUDIO · USE CHROME OR EDGE')
+    return
+  }
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    btnAudioCapture.disabled = true
+    setAudioCaptureStatus('error', 'TAB AUDIO CAPTURE IS NOT SUPPORTED IN THIS BROWSER')
+    return
+  }
+
+  btnAudioCapture.disabled = false
+  setAudioCaptureStatus('idle', '1. OPEN THE PROJECT TAB · 2. SHARE THAT TAB WITH AUDIO')
+}
+
+function openAudiotoolProjectTab() {
+  const projectUrl = inputProjectUrl.value.trim()
+  if (!projectUrl) {
+    setAudioCaptureStatus('error', 'PASTE AN AUDIOTOOL PROJECT URL FIRST')
+    inputProjectUrl.focus()
+    return
+  }
+
+  window.open(projectUrl, '_blank', 'noopener,noreferrer')
+  if (!isFirefox()) {
+    setAudioCaptureStatus('idle', 'RETURN HERE, CLICK SHARE PROJECT AUDIO, THEN SELECT THE AUDIOTOOL TAB')
+  }
+}
+
 function requiredLiveAudioFrames(bpm: number) {
   const sampleRate = liveAudioContext?.sampleRate ?? CAPTURE_SAMPLE_RATE
   return Math.ceil(fourBarsDurationSeconds(bpm) * sampleRate)
@@ -927,15 +962,23 @@ async function stopLiveAudioCapture(status?: string) {
   liveAudioWorklet = null
   liveAudioSilentGain = null
   liveAudioBuffer = null
-  btnAudioCapture.disabled = false
-  btnAudioCapture.textContent = '⬡ SELECT AUDIOTOOL TAB'
-  setAudioCaptureStatus(status ? 'error' : 'idle', status ?? 'SELECT THE AUDIOTOOL TAB AND ENABLE TAB AUDIO — ONCE PER SESSION')
+  btnAudioCapture.textContent = '⬡ SHARE PROJECT AUDIO'
+  if (status) {
+    btnAudioCapture.disabled = false
+    setAudioCaptureStatus('error', status)
+  } else {
+    resetAudioCaptureAvailability()
+  }
 }
 
 async function startLiveAudioCapture() {
   if (liveAudioStream) return
+  if (isFirefox()) {
+    resetAudioCaptureAvailability()
+    return
+  }
   if (!navigator.mediaDevices?.getDisplayMedia) {
-    setAudioCaptureStatus('error', 'TAB AUDIO CAPTURE IS NOT SUPPORTED IN THIS BROWSER')
+    resetAudioCaptureAvailability()
     return
   }
 
@@ -945,7 +988,10 @@ async function startLiveAudioCapture() {
 
   try {
     const options = {
-      video: { frameRate: { ideal: 1, max: 1 } },
+      video: {
+        displaySurface: 'browser',
+        frameRate: { ideal: 1, max: 1 },
+      },
       audio: {
         autoGainControl: false,
         echoCancellation: false,
@@ -956,6 +1002,8 @@ async function startLiveAudioCapture() {
       selfBrowserSurface: 'exclude',
       surfaceSwitching: 'exclude',
       systemAudio: 'exclude',
+      windowAudio: 'exclude',
+      monitorTypeSurfaces: 'exclude',
     } as DisplayMediaStreamOptions
     const stream = await navigator.mediaDevices.getDisplayMedia(options)
     if (sessionId !== liveAudioSessionId) {
@@ -1250,7 +1298,9 @@ function initApp() {
   resetBpmDialogue(1)
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
+  btnOpenAudiotool.onclick = () => openAudiotoolProjectTab()
   btnAudioCapture.onclick = () => startLiveAudioCapture()
+  resetAudioCaptureAvailability()
   el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()
 
   setupDropZone('drop-1', 0)
