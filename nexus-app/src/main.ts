@@ -3,6 +3,7 @@ import { Ticks } from '@audiotool/nexus/utils'
 import type { AuthenticatedClient, SyncedDocument } from '@audiotool/nexus'
 import type { SampleMeta } from '@audiotool/nexus/api'
 import type { NexusEntity, SafeTransactionBuilder } from '@audiotool/nexus/document'
+import type { Terminable } from '@audiotool/nexus/utils'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -20,6 +21,7 @@ interface DeckState {
   sampleBpm: number | null; regionEntity: NexusEntity<'audioRegion'> | null
   trackEntity: NexusEntity<'audioTrack'> | null; audioDeviceEntity: NexusEntity<'audioDevice'> | null
   mixerChannelEntity: NexusEntity<'mixerChannel'> | null
+  regionSubscriptions: Terminable[]
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
@@ -71,9 +73,9 @@ let liveAudioSessionId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -299,6 +301,8 @@ function loadBPM() {
 }
 
 function clearDeckProjectEntities(deck: DeckState) {
+  deck.regionSubscriptions.forEach((subscription) => subscription.terminate())
+  deck.regionSubscriptions = []
   deck.sampleBpm = null
   deck.regionEntity = null
   deck.trackEntity = null
@@ -469,6 +473,46 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   return { track, audioDevice, mixerChannel }
 }
 
+function getMagicLoopDurationTicks(t: SafeTransactionBuilder) {
+  return decks.slice(0, 2).reduce((durationTicks, deck) => {
+    if (!deck.regionEntity) return durationTicks
+    const region = t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
+    return region
+      ? Math.max(durationTicks, region.fields.region.fields.durationTicks.value)
+      : durationTicks
+  }, Ticks.Bars(MAGIC_DURATION_BARS))
+}
+
+async function syncMagicLoopDuration(projectDocument: SyncedDocument, expectedSession: number) {
+  if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
+  await projectDocument.modify((t) => {
+    const magicRegionId = decks[2].regionEntity?.id
+    if (!magicRegionId) return
+    const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
+    if (!magicRegion) return
+    const durationTicks = getMagicLoopDurationTicks(t)
+    if (magicRegion.fields.region.fields.durationTicks.value !== durationTicks) {
+      t.update(magicRegion.fields.region.fields.durationTicks, durationTicks)
+    }
+  })
+}
+
+function watchDeckRegionDuration(deckIndex: 0 | 1, projectDocument: SyncedDocument, region: NexusEntity<'audioRegion'>, expectedSession: number) {
+  const deck = decks[deckIndex]
+  deck.regionSubscriptions.push(
+    projectDocument.events.onUpdate(region.fields.region.fields.durationTicks, () => {
+      if (deck.regionEntity?.id === region.id) {
+        void syncMagicLoopDuration(projectDocument, expectedSession)
+      }
+    }),
+    projectDocument.events.onRemove(region, () => {
+      if (deck.regionEntity?.id !== region.id) return
+      clearDeckProjectEntities(deck)
+      void syncMagicLoopDuration(projectDocument, expectedSession)
+    }),
+  )
+}
+
 async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, displayName: string, forceMagicLoop: boolean, resolution?: BpmResolution, expectedSession = tempoSessionId) {
   if (!nexus) throw new Error('Project not connected')
   const projectDocument = nexus
@@ -486,7 +530,7 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
     const region = t.insertSample(sample, {
       sample: { bpm },
       region: forceMagicLoop
-        ? { positionTicks: 0, durationTicks: Ticks.Bars(MAGIC_DURATION_BARS) }
+        ? { positionTicks: 0, durationTicks: getMagicLoopDurationTicks(t) }
         : { positionTicks: 0 },
       loop: forceMagicLoop ? true : undefined,
       displayName,
@@ -510,6 +554,10 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   deck.trackEntity = inserted.track
   deck.audioDeviceEntity = inserted.audioDevice
   deck.mixerChannelEntity = inserted.mixerChannel
+  if (deckNum <= 2) {
+    watchDeckRegionDuration((deckNum - 1) as 0 | 1, projectDocument, inserted.region, expectedSession)
+    await syncMagicLoopDuration(projectDocument, expectedSession)
+  }
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
   applyCurrentDeckEq((deckNum - 1) as WaveformDeckIndex)
   void applyCurrentDeckLevels((deckNum - 1) as WaveformDeckIndex)
