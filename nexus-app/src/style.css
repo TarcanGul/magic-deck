@@ -280,6 +280,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .status-dot-magic.generating { background: #ff8800; box-shadow: 0 0 8px #ff8800; animation: blink 0.6s infinite; }
 .status-dot-magic.error { background: var(--red); box-shadow: 0 0 8px var(--red); }
 .status-dot-magic.done { background: #00cc44; box-shadow: 0 0 6px #00cc44; }
+.status-dot-magic.warning { background: #ffb000; box-shadow: 0 0 7px #ffb000; }
 .status-label-magic { font-family: var(--font-live); font-size: 12px; letter-spacing: 2px; color: var(--grey-text); }
 
 .magic-config-row { display: flex; align-items: center; gap: 10px; }

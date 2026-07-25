@@ -1,5 +1,6 @@
 import asyncio
 import io
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -9,26 +10,39 @@ from fastapi import HTTPException, UploadFile
 from magenta_server import (
     DetectedKey,
     AubioUnavailableError,
+    TimingDiagnostics,
+    add_confident_subdivision_anchors,
+    align_reference_capture,
+    analyze_onset_alignment,
     blend_style_vectors,
+    build_beat_time_map,
     build_conditioning,
     build_mrt_style_prompt,
+    correct_generation_timing,
     detect_key,
     detect_bpm,
     detect_bpm_from_file,
     embed_musiccoca_styles,
     frames_per_beat_for_bpm,
+    model_frame_boundaries,
+    model_frame_schedule,
     normalize_to_full_scale,
     pitch_classes_for_key,
     post_process_generation,
     resolve_duration_seconds,
     resolve_stem_role,
+    timing_response_headers,
 )
 
 
 class FakeAubio:
     def __init__(self, bpms, confidence=0.8):
         self.bpms = list(bpms)
-        self.confidence = confidence
+        self.confidences = (
+            list(confidence)
+            if isinstance(confidence, (list, tuple))
+            else [confidence] * len(self.bpms)
+        )
 
     def source(self, path, sample_rate, hop_size):
         class Source:
@@ -58,23 +72,84 @@ class FakeAubio:
                 return self_bpms[self.index]
 
             def get_confidence(self):
-                return self_confidence
+                return self_confidences[self.index]
 
         self_bpms = self.bpms
-        self_confidence = self.confidence
+        self_confidences = self.confidences
         return Tempo()
 
 
 class MagentaServerHelperTests(unittest.TestCase):
-    def test_aubio_bpm_detection_returns_reliable_tempo(self):
-        result = detect_bpm_from_file("track.wav", FakeAubio([119.8, 120.1, 120.0], 0.82))
+    @staticmethod
+    def synthetic_capture(
+        bpm=120,
+        sample_rate=8_000,
+        offset_seconds=0.17,
+        downbeat_phase=0,
+        downbeat_gain=1.0,
+        beat_gain=0.25,
+    ):
+        samples_per_beat = sample_rate * 60.0 / bpm
+        total_samples = int(round(5 * 4 * samples_per_beat))
+        samples = np.zeros((total_samples, 1), dtype=np.float32)
+        offset_samples = int(round(offset_seconds * sample_rate))
+        window = np.hanning(160).astype(np.float32)[:80]
+        for beat in range(20):
+            position = int(round(offset_samples + (beat * samples_per_beat)))
+            if position >= total_samples:
+                break
+            gain = downbeat_gain if beat % 4 == downbeat_phase else beat_gain
+            length = min(len(window), total_samples - position)
+            samples[position:position + length, 0] += gain * window[:length]
+        return samples, offset_samples
 
-        self.assertEqual(result, {"bpm": 120.0, "confidence": 0.82, "reliable": True})
+    def test_aubio_bpm_detection_returns_reliable_tempo(self):
+        result = detect_bpm_from_file("track.wav", FakeAubio([119.8, 120.1, 120.0], 0.8234))
+
+        self.assertEqual(result, {"bpm": 120, "confidence": 0.8234, "reliable": True})
+        self.assertIsInstance(result["bpm"], int)
 
     def test_aubio_bpm_detection_preserves_low_confidence_estimate(self):
         result = detect_bpm_from_file("track.wav", FakeAubio([127.9, 128.1], 0.31))
 
-        self.assertEqual(result, {"bpm": 128.0, "confidence": 0.31, "reliable": False})
+        self.assertEqual(result, {"bpm": 128, "confidence": 0.31, "reliable": False})
+
+    def test_differing_bpm_candidates_do_not_reduce_aubio_confidence(self):
+        result = detect_bpm_from_file(
+            "track.wav",
+            FakeAubio([123.6, 123.7, 124.6, 124.7], 0.91),
+        )
+
+        self.assertEqual(result, {"bpm": 124, "confidence": 0.91, "reliable": True})
+
+    def test_aubio_bpm_detection_uses_median_tracker_confidence(self):
+        result = detect_bpm_from_file(
+            "track.wav",
+            FakeAubio([119.8, 120.0, 120.2], [0.2, 0.9, 0.6]),
+        )
+
+        self.assertEqual(result, {"bpm": 120, "confidence": 0.6, "reliable": True})
+
+    def test_aubio_bpm_detection_clamps_median_tracker_confidence(self):
+        result = detect_bpm_from_file(
+            "track.wav",
+            FakeAubio([119.8, 120.2], [0.8, 1.4]),
+        )
+
+        self.assertEqual(result, {"bpm": 120, "confidence": 1.0, "reliable": True})
+
+    def test_logged_aubio_confidence_matches_result(self):
+        with self.assertLogs("uvicorn.error", level="INFO") as captured:
+            result = detect_bpm_from_file(
+                "track.wav",
+                FakeAubio([119.8, 120.2], 0.8234),
+                log_result=True,
+            )
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn(f"aubio_confidence={result['confidence']}", captured.output[0])
+        self.assertIn("bpm=120", captured.output[0])
+        self.assertIn("reliable=True", captured.output[0])
 
     def test_aubio_bpm_detection_returns_no_tempo_without_enough_beats(self):
         result = detect_bpm_from_file("track.wav", FakeAubio([120.0], 0.9))
@@ -93,6 +168,20 @@ class MagentaServerHelperTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("Could not read audio file", raised.exception.detail)
+
+    def test_detect_bpm_api_returns_helper_confidence(self):
+        upload = UploadFile(filename="track.wav", file=io.BytesIO(b"audio"))
+        expected = {"bpm": 120, "confidence": 0.8234, "reliable": True}
+
+        with (
+            patch("magenta_server.get_aubio_runtime", return_value=object()),
+            patch("magenta_server.detect_bpm_from_file", return_value=expected) as helper,
+        ):
+            result = asyncio.run(detect_bpm(upload))
+
+        self.assertEqual(result, expected)
+        helper.assert_called_once()
+        self.assertTrue(helper.call_args.kwargs["log_result"])
 
     def test_aubio_unavailable_has_distinct_error(self):
         upload = UploadFile(filename="track.wav", file=io.BytesIO(b"audio"))
@@ -164,6 +253,24 @@ class MagentaServerHelperTests(unittest.TestCase):
             "128 bpm bass stem, tech house in A minor",
         )
 
+    def test_drum_style_prompt_requests_straight_project_grid(self):
+        detected_key = DetectedKey(
+            root_pitch_class=9,
+            mode="minor",
+            major_score=0.0,
+            minor_score=1.0,
+            confidence=1.0,
+        )
+
+        prompt = build_mrt_style_prompt(
+            "tech house",
+            128.0,
+            detected_key,
+            "drums",
+        )
+
+        self.assertIn("tightly quantized to a straight 4/4 project grid", prompt)
+
     def test_resolve_duration_seconds_for_4_bars(self):
         cases = [
             (80, 12.0),
@@ -196,6 +303,240 @@ class MagentaServerHelperTests(unittest.TestCase):
         self.assertGreater(frames_at_160, 0)
         self.assertGreater(frames_at_80, frames_at_120)
         self.assertGreater(frames_at_120, frames_at_160)
+
+    def test_fractional_frame_schedule_alternates_at_120_bpm(self):
+        schedule = model_frame_schedule(120, 16)
+
+        self.assertEqual(schedule, [13, 12] * 8)
+
+    def test_fractional_frame_schedules_are_positive_exact_and_bounded(self):
+        for bpm in (80, 120, 124, 128, 160):
+            with self.subTest(bpm=bpm):
+                total_beats = 16
+                frames_per_beat = 25.0 * 60.0 / bpm
+                boundaries = model_frame_boundaries(bpm, total_beats)
+                schedule = model_frame_schedule(bpm, total_beats)
+
+                self.assertTrue(all(chunk_frames > 0 for chunk_frames in schedule))
+                self.assertEqual(sum(schedule), int(np.floor(total_beats * frames_per_beat + 0.5)))
+                for beat, boundary in enumerate(boundaries):
+                    self.assertLessEqual(abs(boundary - (beat * frames_per_beat)), 0.5)
+
+    def test_beat_time_maps_cover_exact_source_and_target_lengths(self):
+        for bpm in (80, 120, 124, 128, 160):
+            with self.subTest(bpm=bpm):
+                boundaries = model_frame_boundaries(bpm, 16)
+                time_map = build_beat_time_map(boundaries, 385_123, 384_000)
+
+                self.assertEqual(time_map[0], (0, 0))
+                self.assertEqual(time_map[-1], (385_123, 384_000))
+                self.assertEqual(len(time_map), 17)
+                self.assertTrue(
+                    all(
+                        source_end > source_start and target_end > target_start
+                        for (source_start, target_start), (source_end, target_end)
+                        in zip(time_map, time_map[1:])
+                    )
+                )
+
+    def test_five_bar_capture_is_cropped_to_four_bars_from_downbeat(self):
+        samples, offset_samples = self.synthetic_capture(downbeat_phase=0)
+
+        alignment = align_reference_capture(samples, 8_000, 120, 4)
+
+        self.assertEqual(len(alignment.samples), 64_000)
+        self.assertEqual(alignment.downbeat_phase, 0)
+        self.assertLessEqual(abs(alignment.start_sample - offset_samples), 512)
+        self.assertIsNone(alignment.warning)
+
+    def test_downbeat_scoring_selects_expected_four_beat_phase(self):
+        samples, offset_samples = self.synthetic_capture(downbeat_phase=2)
+
+        alignment = align_reference_capture(samples, 8_000, 120, 4)
+
+        expected_start = offset_samples + (2 * 8_000 * 60 / 120)
+        self.assertEqual(alignment.downbeat_phase, 2)
+        self.assertLessEqual(abs(alignment.start_sample - expected_start), 512)
+
+    def test_ambiguous_capture_continues_with_uncertain_warning(self):
+        samples, _ = self.synthetic_capture(
+            downbeat_gain=0.5,
+            beat_gain=0.5,
+        )
+
+        alignment = align_reference_capture(samples, 8_000, 120, 4)
+
+        self.assertEqual(len(alignment.samples), 64_000)
+        self.assertIsNotNone(alignment.warning)
+        self.assertLess(alignment.confidence, 0.12)
+
+    def test_librosa_fallback_reaches_exact_duration(self):
+        samples, _ = self.synthetic_capture(sample_rate=4_000)
+        raw = samples[:31_123]
+        duration_seconds = 8.0
+        boundaries = model_frame_boundaries(120, 16)
+
+        correction = correct_generation_timing(
+            raw,
+            4_000,
+            120,
+            duration_seconds,
+            boundaries,
+            rubberband_executable="",
+        )
+
+        self.assertEqual(correction.samples.shape, (32_000, 1))
+        self.assertEqual(correction.correction_type, "librosa_global")
+        self.assertIn("librosa", correction.fallback_warning)
+
+    def test_successful_rubberband_time_map_is_used(self):
+        samples = np.zeros((31_000, 1), dtype=np.float32)
+        boundaries = model_frame_boundaries(120, 16)
+
+        with patch(
+            "magenta_server._run_rubberband_time_map",
+            return_value=np.zeros((32_000, 1), dtype=np.float32),
+        ) as run_rubberband:
+            correction = correct_generation_timing(
+                samples,
+                4_000,
+                120,
+                8.0,
+                boundaries,
+                rubberband_executable="/usr/bin/rubberband",
+            )
+
+        self.assertEqual(correction.samples.shape, (32_000, 1))
+        self.assertEqual(correction.correction_type, "rubberband_beat_map")
+        self.assertIsNone(correction.fallback_warning)
+        run_rubberband.assert_called_once()
+
+    def test_rubberband_correction_is_exact_at_requested_tempos(self):
+        sample_rate = 2_000
+
+        def fake_rubberband(samples, source_rate, target_samples, time_map, executable):
+            self.assertEqual(source_rate, sample_rate)
+            self.assertEqual(time_map[-1][1], target_samples)
+            return np.zeros((target_samples, samples.shape[1]), dtype=np.float32)
+
+        with patch(
+            "magenta_server._run_rubberband_time_map",
+            side_effect=fake_rubberband,
+        ):
+            for bpm in (80, 120, 124, 128, 160):
+                with self.subTest(bpm=bpm):
+                    duration_seconds = 16 * 60 / bpm
+                    target_samples = int(round(duration_seconds * sample_rate))
+                    correction = correct_generation_timing(
+                        np.zeros((target_samples + 37, 1), dtype=np.float32),
+                        sample_rate,
+                        bpm,
+                        duration_seconds,
+                        model_frame_boundaries(bpm, 16),
+                        rubberband_executable="/usr/bin/rubberband",
+                    )
+
+                    self.assertEqual(
+                        correction.samples.shape,
+                        (target_samples, 1),
+                    )
+
+    @unittest.skipUnless(shutil.which("rubberband"), "Rubber Band is not installed")
+    def test_installed_rubberband_produces_exact_sample_count(self):
+        sample_rate = 8_000
+        target_samples = sample_rate * 8
+        samples = np.zeros((target_samples + 257, 1), dtype=np.float32)
+        samples[::4_000, 0] = 0.5
+
+        correction = correct_generation_timing(
+            samples,
+            sample_rate,
+            120,
+            8.0,
+            model_frame_boundaries(120, 16),
+            rubberband_executable=shutil.which("rubberband"),
+        )
+
+        self.assertEqual(correction.samples.shape, (target_samples, 1))
+        self.assertTrue(correction.correction_type.startswith("rubberband_"))
+        self.assertIsNone(correction.fallback_warning)
+
+    def test_rubberband_failure_uses_librosa_fallback(self):
+        samples = np.zeros((31_000, 1), dtype=np.float32)
+        boundaries = model_frame_boundaries(120, 16)
+
+        with patch(
+            "magenta_server._run_rubberband_time_map",
+            side_effect=RuntimeError("failed"),
+        ):
+            correction = correct_generation_timing(
+                samples,
+                4_000,
+                120,
+                8.0,
+                boundaries,
+                rubberband_executable="/usr/bin/rubberband",
+            )
+
+        self.assertEqual(correction.samples.shape, (32_000, 1))
+        self.assertEqual(correction.correction_type, "librosa_global")
+        self.assertIn("failed", correction.fallback_warning)
+
+    def test_onset_phase_shift_is_bounded(self):
+        samples, _ = self.synthetic_capture(offset_seconds=0.06)
+        four_bars = samples[:64_000]
+
+        alignment = analyze_onset_alignment(four_bars, 8_000, 120)
+
+        self.assertLessEqual(abs(alignment.phase_shift_samples), 640)
+
+    def test_subdivision_anchors_preserve_time_map_endpoints(self):
+        samples, _ = self.synthetic_capture()
+        base_map = build_beat_time_map(
+            model_frame_boundaries(120, 16),
+            len(samples),
+            64_000,
+        )
+
+        dense_map = add_confident_subdivision_anchors(
+            samples,
+            8_000,
+            120,
+            base_map,
+        )
+
+        self.assertEqual(dense_map[0], base_map[0])
+        self.assertEqual(dense_map[-1], base_map[-1])
+        self.assertTrue(all(anchor in dense_map for anchor in base_map))
+        self.assertTrue(
+            all(
+                source_end > source_start and target_end > target_start
+                for (source_start, target_start), (source_end, target_end)
+                in zip(dense_map, dense_map[1:])
+            )
+        )
+
+    def test_timing_headers_include_status_warning_and_alignment(self):
+        diagnostics = TimingDiagnostics(
+            capture_phase_samples=256,
+            capture_downbeat_phase=1,
+            capture_alignment_confidence=0.05,
+            model_frame_schedule=[13, 12],
+            raw_duration_seconds=8.04,
+            corrected_duration_seconds=8.0,
+            correction_type="librosa_global",
+            phase_shift_ms=-4.0,
+            residual_median_ms=12.345,
+            residual_p95_ms=26.0,
+            timing_status="fallback",
+            warning="Rubber Band unavailable.",
+        )
+
+        headers = timing_response_headers(diagnostics)
+
+        self.assertEqual(headers["X-Magenta-Timing-Status"], "fallback")
+        self.assertEqual(headers["X-Magenta-Timing-Warning"], "Rubber Band unavailable.")
+        self.assertEqual(headers["X-Magenta-Alignment-Ms"], "12.35")
 
     def test_full_scale_normalization_amplifies_quiet_signal(self):
         samples = np.array([[0.05], [-0.25], [0.10]], dtype=np.float32)

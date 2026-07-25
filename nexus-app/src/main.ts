@@ -71,6 +71,7 @@ interface AubioBpmResult {
 }
 
 const MAGIC_DURATION_BARS = 4
+const MAGIC_CAPTURE_BARS = 5
 const BEATS_PER_BAR = 4
 const CAPTURE_SAMPLE_RATE = 48_000
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
@@ -133,7 +134,7 @@ function setStatus(state: 'idle' | 'connecting' | 'connected' | 'error', msg: st
   statusText.textContent = msg
   console.log(`[STATUS] ${state}: ${msg}`)
 }
-function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done', label: string) {
+function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done' | 'warning', label: string) {
   magicDot.className = `status-dot-magic ${state}`
   magicStatusLabel.textContent = label
 }
@@ -906,8 +907,8 @@ function getDeckPositionSeconds(deck: DeckState) {
   return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
 }
 
-function fourBarsDurationSeconds(bpm: number) {
-  return MAGIC_DURATION_BARS * BEATS_PER_BAR * 60 / bpm
+function barsDurationSeconds(bars: number, bpm: number) {
+  return bars * BEATS_PER_BAR * 60 / bpm
 }
 
 function setAudioCaptureStatus(state: 'idle' | 'connecting' | 'connected' | 'error', label: string) {
@@ -967,12 +968,12 @@ function openAudiotoolProjectTab() {
 
 function requiredLiveAudioFrames(bpm: number) {
   const sampleRate = liveAudioContext?.sampleRate ?? CAPTURE_SAMPLE_RATE
-  return Math.ceil(fourBarsDurationSeconds(bpm) * sampleRate)
+  return Math.ceil(barsDurationSeconds(MAGIC_CAPTURE_BARS, bpm) * sampleRate)
 }
 
 function updateLiveAudioShareStatus() {
   if (!hasActiveLiveAudioShare() || activeLiveAudioRecording) return
-  setAudioCaptureStatus('connected', 'AUDIO SHARING READY · THE NEXT 4 BARS RECORD WHEN YOU CLICK GENERATE')
+  setAudioCaptureStatus('connected', 'AUDIO SHARING READY · THE NEXT 5 BARS RECORD WHEN YOU CLICK GENERATE')
 }
 
 function describeDisplayMediaError(error: unknown) {
@@ -1012,15 +1013,15 @@ function handleCaptureWorkletMessage(event: MessageEvent<CaptureWorkletMessage>)
     if (now - recording.lastProgressUpdate >= 250 || recording.capturedFrames === recording.targetFrames) {
       recording.lastProgressUpdate = now
       const progress = Math.min(1, recording.capturedFrames / recording.targetFrames)
-      const barsRecorded = (progress * MAGIC_DURATION_BARS).toFixed(1)
-      setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · ${barsRecorded} / ${MAGIC_DURATION_BARS} BARS`)
-      setMagicStatus('generating', `RECORDING ${barsRecorded} / ${MAGIC_DURATION_BARS} BARS`)
+      const barsRecorded = (progress * MAGIC_CAPTURE_BARS).toFixed(1)
+      setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
+      setMagicStatus('generating', `RECORDING ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
     }
     return
   }
 
   if (recording.capturedFrames !== recording.targetFrames) {
-    cancelActiveLiveAudioRecording('The tab-audio recording ended before four bars were captured. Keep Audiotool playing and try again.')
+    cancelActiveLiveAudioRecording('The tab-audio recording ended before five bars were captured. Keep Audiotool playing and try again.')
     return
   }
 
@@ -1030,24 +1031,24 @@ function handleCaptureWorkletMessage(event: MessageEvent<CaptureWorkletMessage>)
   recording.resolve({ left: recording.left, right: recording.right })
 }
 
-async function recordNextFourBars(bpm: number) {
+async function recordNextFiveBars(bpm: number) {
   if (!hasActiveLiveAudioShare() || !liveAudioContext || !liveAudioWorklet) {
     throw new LiveAudioCaptureError('Share the Audiotool tab with audio before recording.')
   }
   if (activeLiveAudioRecording) {
-    throw new LiveAudioCaptureError('A four-bar recording is already in progress.')
+    throw new LiveAudioCaptureError('A five-bar recording is already in progress.')
   }
 
   await liveAudioContext.resume()
   const targetFrames = requiredLiveAudioFrames(bpm)
   const timeoutMs = Math.ceil((targetFrames / liveAudioContext.sampleRate) * 1000) + 5000
 
-  setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · 0.0 / ${MAGIC_DURATION_BARS} BARS`)
-  setMagicStatus('generating', `RECORDING 0.0 / ${MAGIC_DURATION_BARS} BARS`)
+  setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
+  setMagicStatus('generating', `RECORDING 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
   return new Promise<CaptureChunk>((resolve, reject) => {
     const recordingId = ++liveAudioRecordingId
     const timeoutId = window.setTimeout(() => {
-      const message = 'Four-bar recording timed out. Keep Audiotool playing in the shared tab and try again.'
+      const message = 'Five-bar recording timed out. Keep Audiotool playing in the shared tab and try again.'
       setAudioCaptureStatus('error', message.toUpperCase())
       cancelActiveLiveAudioRecording(message)
     }, timeoutMs)
@@ -1069,7 +1070,7 @@ async function recordNextFourBars(bpm: number) {
 
 async function stopLiveAudioCapture(status?: string) {
   liveAudioSessionId += 1
-  cancelActiveLiveAudioRecording(status || 'Audio sharing stopped before the four-bar recording completed.')
+  cancelActiveLiveAudioRecording(status || 'Audio sharing stopped before the five-bar recording completed.')
 
   liveAudioWorklet?.disconnect()
   liveAudioSource?.disconnect()
@@ -1246,13 +1247,13 @@ function captureRms(chunk: CaptureChunk) {
 }
 
 async function captureReferenceAudio(bpm: number): Promise<ReferenceAudio> {
-  const chunk = await recordNextFourBars(bpm)
+  const chunk = await recordNextFiveBars(bpm)
   if (!liveAudioContext) {
     throw new LiveAudioCaptureError('Audiotool audio sharing stopped before the recording could be prepared.')
   }
   const requiredFrames = requiredLiveAudioFrames(bpm)
   if (captureRms(chunk) < 0.0001) {
-    throw new LiveAudioCaptureError('The new four-bar recording is silent. Start playback in Audiotool, then click Generate again.')
+    throw new LiveAudioCaptureError('The new five-bar recording is silent. Start playback in Audiotool, then click Generate again.')
   }
 
   const buffer = liveAudioContext.createBuffer(2, requiredFrames, liveAudioContext.sampleRate)
@@ -1260,7 +1261,7 @@ async function captureReferenceAudio(bpm: number): Promise<ReferenceAudio> {
   buffer.copyToChannel(chunk.right, 1)
   return {
     blob: audioBufferToWav(buffer),
-    fileName: `audiotool-live-${MAGIC_DURATION_BARS}-bars-${Math.round(bpm)}bpm.wav`,
+    fileName: `audiotool-live-${MAGIC_CAPTURE_BARS}-bars-${Math.round(bpm)}bpm.wav`,
     sourceLabel: 'AUDIOTOOL LIVE',
     seconds: buffer.duration,
   }
@@ -1320,6 +1321,14 @@ async function generateMagicAudio() {
       const detail = await resp.text()
       throw new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`)
     }
+    const timingStatus = resp.headers.get('X-Magenta-Timing-Status') || 'aligned'
+    const timingWarning = resp.headers.get('X-Magenta-Timing-Warning')
+    const alignmentMs = resp.headers.get('X-Magenta-Alignment-Ms')
+    console.info('[MAGENTA] timing', {
+      status: timingStatus,
+      warning: timingWarning,
+      alignmentMs,
+    })
 
     setMagicStatus('generating', 'LOADING WAV')
     const generatedBlob = await resp.blob()
@@ -1337,7 +1346,15 @@ async function generateMagicAudio() {
     syncTransportUi('d3', magicDeck)
     await uploadToNexus(3, generatedFile, true)
 
-    setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF`); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
+    if (timingWarning || timingStatus !== 'aligned') {
+      const warning = timingWarning || `Timing status: ${timingStatus}`
+      setMagicStatus('warning', `⚠ ${warning.toUpperCase().slice(0, 72)}`)
+      setTimeout(() => setMagicStatus('idle', 'IDLE'), 8000)
+    } else {
+      const alignmentLabel = alignmentMs ? ` · ${alignmentMs}ms` : ''
+      setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF${alignmentLabel}`)
+      setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
+    }
   } catch (e: unknown) {
     console.error('[MAGENTA] generate:', e)
     const message = describeMagentaError(e)
