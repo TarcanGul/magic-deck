@@ -681,10 +681,10 @@ def apply_spectral_ducking(samples: np.ndarray, reference: np.ndarray, sample_ra
     return processed
 
 
-def normalize_with_headroom(samples: np.ndarray, peak: float = 0.89) -> np.ndarray:
+def normalize_to_full_scale(samples: np.ndarray) -> np.ndarray:
     max_abs = float(np.max(np.abs(samples))) if samples.size else 0.0
     if max_abs > 1e-8:
-        samples = samples * min(1.0, peak / max_abs)
+        samples = samples / max_abs
     return np.clip(samples, -1.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -700,7 +700,7 @@ def post_process_generation(
     output = smooth_loop_boundary(output, sample_rate)
     if avoid_clash:
         output = apply_spectral_ducking(output, trim_or_tile(reference, target_samples), sample_rate)
-    return normalize_with_headroom(exact_length(output, target_samples))
+    return normalize_to_full_scale(exact_length(output, target_samples))
 
 
 def safe_filename(prompt: str) -> str:
