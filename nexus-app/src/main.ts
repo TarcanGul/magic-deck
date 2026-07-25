@@ -36,6 +36,30 @@ interface CaptureChunk {
   left: Float32Array<ArrayBuffer>
   right: Float32Array<ArrayBuffer>
 }
+interface CaptureWorkletChunk extends CaptureChunk {
+  type: 'chunk'
+  recordingId: number
+  capturedFrames: number
+  targetFrames: number
+}
+interface CaptureWorkletComplete {
+  type: 'complete'
+  recordingId: number
+  capturedFrames: number
+  targetFrames: number
+}
+type CaptureWorkletMessage = CaptureWorkletChunk | CaptureWorkletComplete
+interface ActiveLiveAudioRecording {
+  recordingId: number
+  targetFrames: number
+  capturedFrames: number
+  left: Float32Array<ArrayBuffer>
+  right: Float32Array<ArrayBuffer>
+  lastProgressUpdate: number
+  timeoutId: number
+  resolve: (chunk: CaptureChunk) => void
+  reject: (error: Error) => void
+}
 interface BpmResolution {
   bpm: number
   source: 'audiotool' | 'aubio' | 'manual' | 'project'
@@ -47,11 +71,13 @@ interface AubioBpmResult {
 }
 
 const MAGIC_DURATION_BARS = 4
+const MAGIC_CAPTURE_BARS = 5
 const BEATS_PER_BAR = 4
 const CAPTURE_SAMPLE_RATE = 48_000
 const PROJECT_PRE_GAIN_BASE = 0.39810699224472046
 const MIN_SUPPORTED_BPM = 40
 const MAX_SUPPORTED_BPM = 240
+const AUBIO_AUTO_ACCEPT_CONFIDENCE = 0.8
 const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -67,9 +93,10 @@ let liveAudioContext: AudioContext | null = null
 let liveAudioSource: MediaStreamAudioSourceNode | null = null
 let liveAudioWorklet: AudioWorkletNode | null = null
 let liveAudioSilentGain: GainNode | null = null
-let liveAudioBuffer: StereoPcmRingBuffer | null = null
-let liveAudioStatusTimer: number | null = null
+let activeLiveAudioRecording: ActiveLiveAudioRecording | null = null
+let liveAudioShareRequest: Promise<void> | null = null
 let liveAudioSessionId = 0
+let liveAudioRecordingId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
 
 const decks: [DeckState, DeckState, DeckState] = [
@@ -99,10 +126,6 @@ const btnGenerate = el<HTMLButtonElement>('btn-generate')
 const magicDot = el<HTMLSpanElement>('magic-dot')
 const magicStatusLabel = el<HTMLSpanElement>('magic-status-label')
 const magicPrompt = el<HTMLInputElement>('magic-prompt')
-const magicAudioWeight = el<HTMLInputElement>('magic-audio-weight')
-const magicTextWeight = el<HTMLInputElement>('magic-text-weight')
-const audioWeightVal = el<HTMLSpanElement>('audio-weight-val')
-const textWeightVal = el<HTMLSpanElement>('text-weight-val')
 const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -111,7 +134,7 @@ function setStatus(state: 'idle' | 'connecting' | 'connected' | 'error', msg: st
   statusText.textContent = msg
   console.log(`[STATUS] ${state}: ${msg}`)
 }
-function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done', label: string) {
+function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done' | 'warning', label: string) {
   magicDot.className = `status-dot-magic ${state}`
   magicStatusLabel.textContent = label
 }
@@ -278,17 +301,18 @@ function resetTempoMasterSession() {
 
 // ── NEXUS ─────────────────────────────────────────────────────────────────────
 function updateDeckBpmLabels(bpm: number | null) {
-  currentProjectBpm = bpm
+  const normalizedBpm = normalizeBpm(bpm)
+  currentProjectBpm = normalizedBpm
   decks.forEach((deck, index) => {
-    if (deck.sampleBpm === null) deck.baseBpm = bpm
+    if (deck.sampleBpm === null) deck.baseBpm = normalizedBpm
     updateDeckBpmLabel(index as WaveformDeckIndex)
   })
-  updateLiveAudioBufferStatus()
+  updateLiveAudioShareStatus()
 }
 function updateDeckBpmLabel(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
-  const value = deck.sampleBpm ?? deck.baseBpm
-  el(`deck${deckIndex + 1}-bpm`).textContent = value === null ? '—' : String(Math.round(value))
+  const bpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+  el(`deck${deckIndex + 1}-bpm`).textContent = bpm === null ? '—' : String(bpm)
 }
 function loadBPM() {
   if (!nexus) return
@@ -308,6 +332,12 @@ function clearDeckProjectEntities(deck: DeckState) {
   deck.trackEntity = null
   deck.audioDeviceEntity = null
   deck.mixerChannelEntity = null
+}
+
+function normalizeBpm(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.round(value)
+    : null
 }
 
 function isSupportedBpm(value: number | null | undefined): value is number {
@@ -346,9 +376,11 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
     const fallback = el<HTMLButtonElement>(`${prefix}-skip`)
     const hint = el<HTMLDivElement>(`${prefix}-hint`)
     const error = el<HTMLDivElement>(`${prefix}-error`)
-    input.value = isSupportedBpm(estimate?.bpm) ? String(estimate.bpm) : ''
-    hint.textContent = isSupportedBpm(estimate?.bpm)
-      ? `AUBIO: ${estimate.bpm} BPM · ${Math.round(estimate.confidence * 100)}% CONFIDENCE`
+    const detectedBpm = normalizeBpm(estimate?.bpm)
+    const confidencePercent = Math.round((estimate?.confidence ?? 0) * 100)
+    input.value = isSupportedBpm(detectedBpm) ? String(detectedBpm) : ''
+    hint.textContent = isSupportedBpm(detectedBpm)
+      ? `AUBIO: ${detectedBpm} BPM · ${confidencePercent}% CONFIDENCE`
       : 'ENTER SOURCE BPM (40–240)'
     error.textContent = ''
     const title = el<HTMLDivElement>(`${prefix}-title`)
@@ -367,7 +399,7 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
     }
     pendingBpmResolutions[deckIndex] = close
     const submit = () => {
-      const bpm = Number(input.value)
+      const bpm = normalizeBpm(Number(input.value))
       if (!isSupportedBpm(bpm)) {
         error.textContent = `BPM MUST BE BETWEEN ${MIN_SUPPORTED_BPM} AND ${MAX_SUPPORTED_BPM}`
         return
@@ -379,11 +411,12 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
     }
     confirm.onclick = submit
     fallback.onclick = () => {
-      if (!isSupportedBpm(currentProjectBpm)) {
+      const projectBpm = normalizeBpm(currentProjectBpm)
+      if (!isSupportedBpm(projectBpm)) {
         error.textContent = `PROJECT BPM IS NOT AVAILABLE IN THE ${MIN_SUPPORTED_BPM}–${MAX_SUPPORTED_BPM} RANGE`
         return
       }
-      close({ bpm: currentProjectBpm, source: 'project' })
+      close({ bpm: projectBpm, source: 'project' })
     }
   })
 }
@@ -400,30 +433,32 @@ async function requestAubioBpm(file: File): Promise<AubioBpmResult> {
 }
 
 async function resolveSampleBpm(sample: SampleMeta, file: File, deckNum: number, expectedSession: number): Promise<BpmResolution | null> {
-  if (isSupportedBpm(sample.bpm)) {
+  const metadataBpm = normalizeBpm(sample.bpm)
+  if (isSupportedBpm(metadataBpm)) {
     resetBpmDialogue(deckNum - 1)
-    setStatus('connected', `DECK ${deckNum}: AUDIOTOOL BPM METADATA ${Math.round(sample.bpm)} ACCEPTED`)
-    return { bpm: sample.bpm, source: 'audiotool' }
+    setStatus('connected', `DECK ${deckNum}: AUDIOTOOL BPM METADATA ${metadataBpm} ACCEPTED`)
+    return { bpm: metadataBpm, source: 'audiotool' }
   }
   showBpmAnalyzing(deckNum)
   setStatus('connecting', `DECK ${deckNum}: ANALYZING BPM WITH AUBIO…`)
   try {
     const estimate = await requestAubioBpm(file)
+    const normalizedEstimate = { ...estimate, bpm: normalizeBpm(estimate.bpm) }
     if (expectedSession !== tempoSessionId || !nexus) {
       resetBpmDialogue(deckNum - 1)
       return null
     }
-    if (estimate.reliable && estimate.confidence >= 0.5 && isSupportedBpm(estimate.bpm)) {
+    if (normalizedEstimate.confidence > AUBIO_AUTO_ACCEPT_CONFIDENCE && isSupportedBpm(normalizedEstimate.bpm)) {
       resetBpmDialogue(deckNum - 1)
-      setStatus('connected', `DECK ${deckNum}: AUBIO DETECTED ${Math.round(estimate.bpm)} BPM (${Math.round(estimate.confidence * 100)}% CONFIDENCE)`)
-      return { bpm: estimate.bpm, source: 'aubio' }
+      setStatus('connected', `DECK ${deckNum}: AUBIO DETECTED ${normalizedEstimate.bpm} BPM (${Math.round(normalizedEstimate.confidence * 100)}% CONFIDENCE)`)
+      return { bpm: normalizedEstimate.bpm, source: 'aubio' }
     }
-    if (isSupportedBpm(estimate.bpm)) {
-      setStatus('connected', `DECK ${deckNum}: LOW-CONFIDENCE AUBIO ESTIMATE — CONFIRM BPM`)
+    if (isSupportedBpm(normalizedEstimate.bpm)) {
+      setStatus('connected', `DECK ${deckNum}: AUBIO ESTIMATE ${normalizedEstimate.bpm} BPM (${Math.round(normalizedEstimate.confidence * 100)}% CONFIDENCE) — CONFIRM BPM`)
     } else {
       setStatus('connected', `DECK ${deckNum}: AUBIO COULD NOT RESOLVE BPM — MANUAL ENTRY REQUIRED`)
     }
-    return showBpmDialogue(deckNum, estimate)
+    return showBpmDialogue(deckNum, normalizedEstimate)
   } catch (e) {
     console.warn('[AUBIO] BPM analysis:', e)
     if (expectedSession !== tempoSessionId || !nexus) {
@@ -517,7 +552,8 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   if (!nexus) throw new Error('Project not connected')
   const projectDocument = nexus
   const deck = decks[deckNum - 1]
-  const bpm = resolution?.bpm ?? (isSupportedBpm(sample.bpm) ? sample.bpm : currentProjectBpm)
+  const sampleBpm = normalizeBpm(sample.bpm)
+  const bpm = normalizeBpm(resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
   if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
   const establishesMaster = deckNum <= 2 && !tempoMasterEstablished
 
@@ -578,15 +614,15 @@ async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false
       return false
     }
     if (resolution?.source === 'project') {
-      setStatus('connected', `DECK ${deckNum}: BPM UNKNOWN — ASSUMING PROJECT BPM ${Math.round(resolution.bpm)}`)
+      setStatus('connected', `DECK ${deckNum}: BPM UNKNOWN — ASSUMING PROJECT BPM ${resolution.bpm}`)
     } else if (resolution?.source === 'manual') {
-      setStatus('connected', `DECK ${deckNum}: MANUAL BPM ${Math.round(resolution.bpm)} SELECTED`)
+      setStatus('connected', `DECK ${deckNum}: MANUAL BPM ${resolution.bpm} SELECTED`)
     }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
     const selectingMaster = deckNum <= 2 && !tempoMasterEstablished
     await insertSampleIntoProject(deckNum, sample, displayName, forceMagicLoop, resolution ?? undefined, expectedSession)
     setStatus('connected', selectingMaster
-      ? `DECK ${deckNum}: MASTER TEMPO SET TO ${Math.round(resolution!.bpm)} BPM — PROJECT SYNCED ✓`
+      ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — PROJECT SYNCED ✓`
       : `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
     return true
   } catch (e: unknown) {
@@ -853,7 +889,7 @@ function initKnob(canvas: HTMLCanvasElement) {
 }
 
 // ── MAGIC AUDIO ───────────────────────────────────────────────────────────────
-function drawMagicIdle(label = '[ GENERATE AUDIO FROM LIVE 4-BAR BUFFER ]') {
+function drawMagicIdle(label = '[ GENERATE AUDIO FROM THE NEXT 4 BARS ]') {
   const ctx = magicWaveform.getContext('2d')!
   const W = magicWaveform.width, H = magicWaveform.height
   ctx.fillStyle = '#050000'; ctx.fillRect(0, 0, W, H)
@@ -871,64 +907,8 @@ function getDeckPositionSeconds(deck: DeckState) {
   return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
 }
 
-class StereoPcmRingBuffer {
-  private readonly left: Float32Array
-  private readonly right: Float32Array
-  private writeIndex = 0
-  private totalFrames = 0
-
-  constructor(readonly capacityFrames: number) {
-    this.left = new Float32Array(capacityFrames)
-    this.right = new Float32Array(capacityFrames)
-  }
-
-  get availableFrames() {
-    return Math.min(this.totalFrames, this.capacityFrames)
-  }
-
-  write(chunk: CaptureChunk) {
-    const frames = Math.min(chunk.left.length, chunk.right.length)
-    if (frames <= 0) return
-
-    if (frames >= this.capacityFrames) {
-      this.left.set(chunk.left.subarray(frames - this.capacityFrames))
-      this.right.set(chunk.right.subarray(frames - this.capacityFrames))
-      this.writeIndex = 0
-      this.totalFrames += frames
-      return
-    }
-
-    const firstFrames = Math.min(frames, this.capacityFrames - this.writeIndex)
-    this.left.set(chunk.left.subarray(0, firstFrames), this.writeIndex)
-    this.right.set(chunk.right.subarray(0, firstFrames), this.writeIndex)
-    const remainingFrames = frames - firstFrames
-    if (remainingFrames > 0) {
-      this.left.set(chunk.left.subarray(firstFrames), 0)
-      this.right.set(chunk.right.subarray(firstFrames), 0)
-    }
-    this.writeIndex = (this.writeIndex + frames) % this.capacityFrames
-    this.totalFrames += frames
-  }
-
-  readLatest(frameCount: number): CaptureChunk | null {
-    if (frameCount <= 0 || this.availableFrames < frameCount) return null
-
-    const left = new Float32Array(frameCount)
-    const right = new Float32Array(frameCount)
-    const start = (this.writeIndex - frameCount + this.capacityFrames) % this.capacityFrames
-    const firstFrames = Math.min(frameCount, this.capacityFrames - start)
-    left.set(this.left.subarray(start, start + firstFrames))
-    right.set(this.right.subarray(start, start + firstFrames))
-    if (firstFrames < frameCount) {
-      left.set(this.left.subarray(0, frameCount - firstFrames), firstFrames)
-      right.set(this.right.subarray(0, frameCount - firstFrames), firstFrames)
-    }
-    return { left, right }
-  }
-}
-
-function fourBarsDurationSeconds(bpm: number) {
-  return MAGIC_DURATION_BARS * BEATS_PER_BAR * 60 / bpm
+function barsDurationSeconds(bars: number, bpm: number) {
+  return bars * BEATS_PER_BAR * 60 / bpm
 }
 
 function setAudioCaptureStatus(state: 'idle' | 'connecting' | 'connected' | 'error', label: string) {
@@ -938,6 +918,22 @@ function setAudioCaptureStatus(state: 'idle' | 'connecting' | 'connected' | 'err
 
 function isFirefox() {
   return navigator.userAgent.includes('Firefox/')
+}
+
+class LiveAudioCaptureError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LiveAudioCaptureError'
+  }
+}
+
+function hasActiveLiveAudioShare() {
+  return Boolean(
+    liveAudioStream
+    && liveAudioContext
+    && liveAudioWorklet
+    && liveAudioStream.getAudioTracks().some((track) => track.readyState === 'live'),
+  )
 }
 
 function resetAudioCaptureAvailability() {
@@ -953,7 +949,7 @@ function resetAudioCaptureAvailability() {
   }
 
   btnAudioCapture.disabled = false
-  setAudioCaptureStatus('idle', '1. OPEN THE PROJECT TAB · 2. SHARE THAT TAB WITH AUDIO')
+  setAudioCaptureStatus('idle', 'SHARE AUDIO NOW, OR GENERATE WILL ASK · RECORDING STARTS ON GENERATE')
 }
 
 function openAudiotoolProjectTab() {
@@ -966,37 +962,115 @@ function openAudiotoolProjectTab() {
 
   window.open(projectUrl, '_blank', 'noopener,noreferrer')
   if (!isFirefox()) {
-    setAudioCaptureStatus('idle', 'RETURN HERE, CLICK SHARE PROJECT AUDIO, THEN SELECT THE AUDIOTOOL TAB')
+    setAudioCaptureStatus('idle', 'RETURN HERE AND SHARE AUDIO, OR CLICK GENERATE TO CHOOSE THE PROJECT TAB')
   }
 }
 
 function requiredLiveAudioFrames(bpm: number) {
   const sampleRate = liveAudioContext?.sampleRate ?? CAPTURE_SAMPLE_RATE
-  return Math.ceil(fourBarsDurationSeconds(bpm) * sampleRate)
+  return Math.ceil(barsDurationSeconds(MAGIC_CAPTURE_BARS, bpm) * sampleRate)
 }
 
-function updateLiveAudioBufferStatus() {
-  if (!liveAudioStream || !liveAudioContext || !liveAudioBuffer) return
-  if (!currentProjectBpm) {
-    setAudioCaptureStatus('connected', 'CAPTURING AUDIOTOOL AUDIO · CONNECT PROJECT FOR BPM')
+function updateLiveAudioShareStatus() {
+  if (!hasActiveLiveAudioShare() || activeLiveAudioRecording) return
+  setAudioCaptureStatus('connected', 'AUDIO SHARING READY · THE NEXT 5 BARS RECORD WHEN YOU CLICK GENERATE')
+}
+
+function describeDisplayMediaError(error: unknown) {
+  if (error instanceof DOMException && error.name === 'NotAllowedError') {
+    return 'Tab sharing was cancelled or denied. Try again and select the Audiotool tab with Share tab audio enabled.'
+  }
+  if (error instanceof DOMException && error.name === 'NotFoundError') {
+    return 'No shareable tab audio source was found. Open the Audiotool project in Chrome or Edge and try again.'
+  }
+  return error instanceof Error ? error.message : String(error)
+}
+
+function cancelActiveLiveAudioRecording(message: string) {
+  const recording = activeLiveAudioRecording
+  if (!recording) return
+
+  activeLiveAudioRecording = null
+  window.clearTimeout(recording.timeoutId)
+  liveAudioWorklet?.port.postMessage({ type: 'stop' })
+  recording.reject(new LiveAudioCaptureError(message))
+}
+
+function handleCaptureWorkletMessage(event: MessageEvent<CaptureWorkletMessage>) {
+  const recording = activeLiveAudioRecording
+  if (!recording) return
+
+  const message = event.data
+  if (message.recordingId !== recording.recordingId) return
+  if (message.type === 'chunk') {
+    const remainingFrames = recording.targetFrames - recording.capturedFrames
+    const frameCount = Math.min(message.left.length, message.right.length, remainingFrames)
+    if (frameCount <= 0) return
+    recording.left.set(message.left.subarray(0, frameCount), recording.capturedFrames)
+    recording.right.set(message.right.subarray(0, frameCount), recording.capturedFrames)
+    recording.capturedFrames += frameCount
+    const now = performance.now()
+    if (now - recording.lastProgressUpdate >= 250 || recording.capturedFrames === recording.targetFrames) {
+      recording.lastProgressUpdate = now
+      const progress = Math.min(1, recording.capturedFrames / recording.targetFrames)
+      const barsRecorded = (progress * MAGIC_CAPTURE_BARS).toFixed(1)
+      setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
+      setMagicStatus('generating', `RECORDING ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
+    }
     return
   }
 
-  const requiredFrames = requiredLiveAudioFrames(currentProjectBpm)
-  const progress = Math.min(1, liveAudioBuffer.availableFrames / requiredFrames)
-  if (progress < 1) {
-    setAudioCaptureStatus('connecting', `BUFFERING LIVE AUDIO · ${(progress * MAGIC_DURATION_BARS).toFixed(1)} / ${MAGIC_DURATION_BARS} BARS`)
-  } else {
-    setAudioCaptureStatus('connected', `READY · LAST ${MAGIC_DURATION_BARS} BARS BUFFERED AT ${Math.round(currentProjectBpm)} BPM`)
+  if (recording.capturedFrames !== recording.targetFrames) {
+    cancelActiveLiveAudioRecording('The tab-audio recording ended before five bars were captured. Keep Audiotool playing and try again.')
+    return
   }
+
+  activeLiveAudioRecording = null
+  window.clearTimeout(recording.timeoutId)
+  updateLiveAudioShareStatus()
+  recording.resolve({ left: recording.left, right: recording.right })
+}
+
+async function recordNextFiveBars(bpm: number) {
+  if (!hasActiveLiveAudioShare() || !liveAudioContext || !liveAudioWorklet) {
+    throw new LiveAudioCaptureError('Share the Audiotool tab with audio before recording.')
+  }
+  if (activeLiveAudioRecording) {
+    throw new LiveAudioCaptureError('A five-bar recording is already in progress.')
+  }
+
+  await liveAudioContext.resume()
+  const targetFrames = requiredLiveAudioFrames(bpm)
+  const timeoutMs = Math.ceil((targetFrames / liveAudioContext.sampleRate) * 1000) + 5000
+
+  setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
+  setMagicStatus('generating', `RECORDING 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
+  return new Promise<CaptureChunk>((resolve, reject) => {
+    const recordingId = ++liveAudioRecordingId
+    const timeoutId = window.setTimeout(() => {
+      const message = 'Five-bar recording timed out. Keep Audiotool playing in the shared tab and try again.'
+      setAudioCaptureStatus('error', message.toUpperCase())
+      cancelActiveLiveAudioRecording(message)
+    }, timeoutMs)
+
+    activeLiveAudioRecording = {
+      recordingId,
+      targetFrames,
+      capturedFrames: 0,
+      left: new Float32Array(targetFrames),
+      right: new Float32Array(targetFrames),
+      lastProgressUpdate: performance.now(),
+      timeoutId,
+      resolve,
+      reject,
+    }
+    liveAudioWorklet!.port.postMessage({ type: 'start', recordingId, frameCount: targetFrames })
+  })
 }
 
 async function stopLiveAudioCapture(status?: string) {
   liveAudioSessionId += 1
-  if (liveAudioStatusTimer !== null) {
-    window.clearInterval(liveAudioStatusTimer)
-    liveAudioStatusTimer = null
-  }
+  cancelActiveLiveAudioRecording(status || 'Audio sharing stopped before the five-bar recording completed.')
 
   liveAudioWorklet?.disconnect()
   liveAudioSource?.disconnect()
@@ -1009,7 +1083,6 @@ async function stopLiveAudioCapture(status?: string) {
   liveAudioSource = null
   liveAudioWorklet = null
   liveAudioSilentGain = null
-  liveAudioBuffer = null
   btnAudioCapture.textContent = '⬡ SHARE PROJECT AUDIO'
   if (status) {
     btnAudioCapture.disabled = false
@@ -1020,19 +1093,22 @@ async function stopLiveAudioCapture(status?: string) {
 }
 
 async function startLiveAudioCapture() {
-  if (liveAudioStream) return
+  if (hasActiveLiveAudioShare()) return
+  if (liveAudioStream) await stopLiveAudioCapture()
   if (isFirefox()) {
     resetAudioCaptureAvailability()
-    return
+    throw new LiveAudioCaptureError('Firefox cannot capture shared tab audio. Use Chrome or Edge.')
   }
   if (!navigator.mediaDevices?.getDisplayMedia) {
     resetAudioCaptureAvailability()
-    return
+    throw new LiveAudioCaptureError('Tab audio capture is not supported in this browser. Use Chrome or Edge.')
   }
 
   btnAudioCapture.disabled = true
   setAudioCaptureStatus('connecting', 'CHOOSE THE AUDIOTOOL TAB AND ENABLE SHARE TAB AUDIO…')
   const sessionId = ++liveAudioSessionId
+  let pendingStream: MediaStream | null = null
+  let pendingContext: AudioContext | null = null
 
   try {
     const options = {
@@ -1054,9 +1130,9 @@ async function startLiveAudioCapture() {
       monitorTypeSurfaces: 'exclude',
     } as DisplayMediaStreamOptions
     const stream = await navigator.mediaDevices.getDisplayMedia(options)
+    pendingStream = stream
     if (sessionId !== liveAudioSessionId) {
-      stream.getTracks().forEach((track) => track.stop())
-      return
+      throw new LiveAudioCaptureError('Tab audio sharing was cancelled.')
     }
 
     const audioTrack = stream.getAudioTracks()[0]
@@ -1072,6 +1148,7 @@ async function startLiveAudioCapture() {
     }
 
     const context = new AudioContext({ sampleRate: CAPTURE_SAMPLE_RATE, latencyHint: 'interactive' })
+    pendingContext = context
     await context.audioWorklet.addModule(new URL('./audio-capture-worklet.js', import.meta.url))
     const source = context.createMediaStreamSource(new MediaStream([audioTrack]))
     const worklet = new AudioWorkletNode(context, 'pcm-capture-processor', {
@@ -1079,34 +1156,46 @@ async function startLiveAudioCapture() {
       numberOfOutputs: 1,
       outputChannelCount: [1],
     })
+    worklet.port.onmessage = handleCaptureWorkletMessage
     const silentGain = context.createGain()
     silentGain.gain.value = 0
     source.connect(worklet).connect(silentGain).connect(context.destination)
-
-    const maximumSeconds = fourBarsDurationSeconds(MIN_SUPPORTED_BPM) + 1
-    const ringBuffer = new StereoPcmRingBuffer(Math.ceil(maximumSeconds * context.sampleRate))
-    worklet.port.onmessage = (event: MessageEvent<CaptureChunk>) => ringBuffer.write(event.data)
 
     liveAudioStream = stream
     liveAudioContext = context
     liveAudioSource = source
     liveAudioWorklet = worklet
     liveAudioSilentGain = silentGain
-    liveAudioBuffer = ringBuffer
+    pendingStream = null
+    pendingContext = null
 
     const handleEnded = () => {
       if (sessionId === liveAudioSessionId) void stopLiveAudioCapture('AUDIO SHARING STOPPED · SELECT THE AUDIOTOOL TAB AGAIN')
     }
     audioTrack.addEventListener('ended', handleEnded, { once: true })
     videoTrack?.addEventListener('ended', handleEnded, { once: true })
-    liveAudioStatusTimer = window.setInterval(updateLiveAudioBufferStatus, 250)
     btnAudioCapture.textContent = '✓ AUDIOTOOL AUDIO CONNECTED'
-    updateLiveAudioBufferStatus()
+    updateLiveAudioShareStatus()
   } catch (error: unknown) {
-    if (sessionId !== liveAudioSessionId) return
-    const message = error instanceof Error ? error.message : String(error)
+    pendingStream?.getTracks().forEach((track) => track.stop())
+    if (pendingContext && pendingContext.state !== 'closed') await pendingContext.close()
+    if (sessionId !== liveAudioSessionId) {
+      throw new LiveAudioCaptureError('Tab audio sharing was cancelled.')
+    }
+    const message = describeDisplayMediaError(error)
     await stopLiveAudioCapture(message)
+    throw new LiveAudioCaptureError(message)
   }
+}
+
+function ensureLiveAudioCapture() {
+  if (hasActiveLiveAudioShare()) return Promise.resolve()
+  if (!liveAudioShareRequest) {
+    liveAudioShareRequest = startLiveAudioCapture().finally(() => {
+      liveAudioShareRequest = null
+    })
+  }
+  return liveAudioShareRequest
 }
 
 function writeAscii(view: DataView, offset: number, value: string) {
@@ -1157,23 +1246,14 @@ function captureRms(chunk: CaptureChunk) {
   return Math.sqrt(sumSquares / Math.max(1, chunk.left.length * 2))
 }
 
-function buildReferenceAudio(bpm: number): ReferenceAudio {
-  if (!liveAudioContext || !liveAudioStream || !liveAudioBuffer) {
-    throw new Error('Connect Audiotool live audio before generating')
+async function captureReferenceAudio(bpm: number): Promise<ReferenceAudio> {
+  const chunk = await recordNextFiveBars(bpm)
+  if (!liveAudioContext) {
+    throw new LiveAudioCaptureError('Audiotool audio sharing stopped before the recording could be prepared.')
   }
-  if (!liveAudioStream.getAudioTracks().some((track) => track.readyState === 'live')) {
-    throw new Error('Audiotool audio sharing has stopped')
-  }
-
   const requiredFrames = requiredLiveAudioFrames(bpm)
-  const chunk = liveAudioBuffer.readLatest(requiredFrames)
-  if (!chunk) {
-    const remainingFrames = requiredFrames - liveAudioBuffer.availableFrames
-    const remainingSeconds = Math.max(0, remainingFrames / liveAudioContext.sampleRate)
-    throw new Error(`Keep Audiotool playing for ${remainingSeconds.toFixed(1)} more seconds to buffer four bars`)
-  }
   if (captureRms(chunk) < 0.0001) {
-    throw new Error('The last four bars are silent. Start playback in Audiotool and try again')
+    throw new LiveAudioCaptureError('The new five-bar recording is silent. Start playback in Audiotool, then click Generate again.')
   }
 
   const buffer = liveAudioContext.createBuffer(2, requiredFrames, liveAudioContext.sampleRate)
@@ -1181,7 +1261,7 @@ function buildReferenceAudio(bpm: number): ReferenceAudio {
   buffer.copyToChannel(chunk.right, 1)
   return {
     blob: audioBufferToWav(buffer),
-    fileName: `audiotool-live-${MAGIC_DURATION_BARS}-bars-${Math.round(bpm)}bpm.wav`,
+    fileName: `audiotool-live-${MAGIC_CAPTURE_BARS}-bars-${Math.round(bpm)}bpm.wav`,
     sourceLabel: 'AUDIOTOOL LIVE',
     seconds: buffer.duration,
   }
@@ -1192,7 +1272,12 @@ function magentaEndpoint() {
 }
 
 function getMagicGenerationBpm() {
-  if (!currentProjectBpm || currentProjectBpm <= 0) throw new Error('Project BPM required for beat-synced generation')
+  if (!currentProjectBpm || !Number.isFinite(currentProjectBpm)) {
+    throw new Error('Project BPM required for beat-synced generation')
+  }
+  if (currentProjectBpm < MIN_SUPPORTED_BPM || currentProjectBpm > MAX_SUPPORTED_BPM) {
+    throw new Error(`Project BPM must be between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM}`)
+  }
   return currentProjectBpm
 }
 
@@ -1206,20 +1291,25 @@ function describeMagentaError(error: unknown) {
 // ── MAGENTA ───────────────────────────────────────────────────────────────────
 async function generateMagicAudio() {
   const promptText = magicPrompt.value.trim()
-  const audioWeight = parseFloat(magicAudioWeight.value)
-  const textWeight = parseFloat(magicTextWeight.value)
   if (!promptText) { setMagicStatus('error', 'PROMPT REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
-  if (audioWeight + textWeight <= 0) { setMagicStatus('error', 'WEIGHTS REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
 
-  setMagicStatus('generating', 'CAPTURING'); btnGenerate.disabled = true
+  let generationBpm: number
   try {
-    const generationBpm = getMagicGenerationBpm()
-    const reference = buildReferenceAudio(generationBpm)
+    generationBpm = getMagicGenerationBpm()
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    setMagicStatus('error', message.toUpperCase())
+    setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
+    return
+  }
+
+  setMagicStatus('generating', 'PREPARING AUDIO CAPTURE'); btnGenerate.disabled = true
+  try {
+    await ensureLiveAudioCapture()
+    const reference = await captureReferenceAudio(generationBpm)
     const form = new FormData()
     form.append('audio_file', reference.blob, reference.fileName)
     form.append('prompt', promptText)
-    form.append('audio_weight', String(audioWeight))
-    form.append('text_weight', String(textWeight))
     form.append('duration_bars', String(MAGIC_DURATION_BARS))
     form.append('bpm', String(generationBpm))
     form.append('stem_role', 'auto')
@@ -1231,6 +1321,14 @@ async function generateMagicAudio() {
       const detail = await resp.text()
       throw new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`)
     }
+    const timingStatus = resp.headers.get('X-Magenta-Timing-Status') || 'aligned'
+    const timingWarning = resp.headers.get('X-Magenta-Timing-Warning')
+    const alignmentMs = resp.headers.get('X-Magenta-Alignment-Ms')
+    console.info('[MAGENTA] timing', {
+      status: timingStatus,
+      warning: timingWarning,
+      alignmentMs,
+    })
 
     setMagicStatus('generating', 'LOADING WAV')
     const generatedBlob = await resp.blob()
@@ -1248,11 +1346,22 @@ async function generateMagicAudio() {
     syncTransportUi('d3', magicDeck)
     await uploadToNexus(3, generatedFile, true)
 
-    setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF`); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
+    if (timingWarning || timingStatus !== 'aligned') {
+      const warning = timingWarning || `Timing status: ${timingStatus}`
+      setMagicStatus('warning', `⚠ ${warning.toUpperCase().slice(0, 72)}`)
+      setTimeout(() => setMagicStatus('idle', 'IDLE'), 8000)
+    } else {
+      const alignmentLabel = alignmentMs ? ` · ${alignmentMs}ms` : ''
+      setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF${alignmentLabel}`)
+      setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
+    }
   } catch (e: unknown) {
     console.error('[MAGENTA] generate:', e)
     const message = describeMagentaError(e)
-    setMagicStatus('error', message.toUpperCase().slice(0, 24))
+    if (e instanceof LiveAudioCaptureError) {
+      setAudioCaptureStatus('error', message.toUpperCase())
+    }
+    setMagicStatus('error', message.toUpperCase().slice(0, 48))
     setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
   }
   finally { btnGenerate.disabled = false }
@@ -1347,7 +1456,7 @@ function initApp() {
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
   btnOpenAudiotool.onclick = () => openAudiotoolProjectTab()
-  btnAudioCapture.onclick = () => startLiveAudioCapture()
+  btnAudioCapture.onclick = () => { void ensureLiveAudioCapture().catch(() => {}) }
   resetAudioCaptureAvailability()
   el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()
 
@@ -1358,8 +1467,6 @@ function initApp() {
   wireTransport('d3', 2)
   document.querySelectorAll<HTMLCanvasElement>('.eq-knob').forEach(initKnob)
 
-  magicAudioWeight.addEventListener('input', () => { audioWeightVal.textContent = parseFloat(magicAudioWeight.value).toFixed(1) })
-  magicTextWeight.addEventListener('input', () => { textWeightVal.textContent = parseFloat(magicTextWeight.value).toFixed(1) })
   btnGenerate.addEventListener('click', generateMagicAudio)
   drawMagicIdle()
 

@@ -8,11 +8,14 @@ Endpoints:
 """
 
 import io
+import json
 import logging
 import math
-import tempfile
 import os
-from dataclasses import dataclass
+import shutil
+import subprocess
+import tempfile
+from dataclasses import asdict, dataclass
 from typing import Any
 import numpy as np
 import librosa
@@ -45,6 +48,8 @@ MRT_FRAMES_PER_SECOND = 25.0
 BEATS_PER_BAR = 4
 MIN_GENERATION_BPM = 40.0
 MAX_GENERATION_BPM = 240.0
+AUDIO_STYLE_WEIGHT = 0.0
+TEXT_STYLE_WEIGHT = 1.0
 PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 MAJOR_SCALE = np.array([0, 2, 4, 5, 7, 9, 11], dtype=np.int16)
 MINOR_SCALE = np.array([0, 2, 3, 5, 7, 8, 10], dtype=np.int16)
@@ -68,7 +73,16 @@ MINOR_KEY_PROFILE = np.array(
     dtype=np.float32,
 )
 TONIC_KEY_WEIGHT = 0.08
-MAX_LOGGED_BPM_CANDIDATES = 5
+CAPTURE_ALIGNMENT_CONFIDENCE_THRESHOLD = 0.12
+ONSET_HOP_LENGTH = 256
+MAX_PHASE_SHIFT_SECONDS = 0.08
+MAX_MEDIAN_ALIGNMENT_MS = 20.0
+MAX_P95_ALIGNMENT_MS = 40.0
+TIMING_HEADER_NAMES = (
+    "X-Magenta-Timing-Status",
+    "X-Magenta-Timing-Warning",
+    "X-Magenta-Alignment-Ms",
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -78,6 +92,7 @@ app.add_middleware(
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    expose_headers=list(TIMING_HEADER_NAMES),
 )
 
 magenta_audio: Any | None = None
@@ -100,6 +115,49 @@ class DetectedKey:
     @property
     def name(self) -> str:
         return f"{PITCH_CLASS_NAMES[self.root_pitch_class]} {self.mode}"
+
+
+@dataclass(frozen=True)
+class CaptureAlignment:
+    samples: np.ndarray
+    start_sample: int
+    beat_phase_sample: int
+    downbeat_phase: int
+    confidence: float
+    warning: str | None
+
+
+@dataclass(frozen=True)
+class OnsetAlignment:
+    median_ms: float | None
+    p95_ms: float | None
+    phase_shift_samples: int
+    phase_confidence: float
+
+
+@dataclass(frozen=True)
+class TimingCorrection:
+    samples: np.ndarray
+    correction_type: str
+    phase_shift_ms: float
+    alignment: OnsetAlignment
+    fallback_warning: str | None
+
+
+@dataclass
+class TimingDiagnostics:
+    capture_phase_samples: int
+    capture_downbeat_phase: int
+    capture_alignment_confidence: float
+    model_frame_schedule: list[int]
+    raw_duration_seconds: float
+    corrected_duration_seconds: float
+    correction_type: str
+    phase_shift_ms: float
+    residual_median_ms: float | None
+    residual_p95_ms: float | None
+    timing_status: str
+    warning: str | None
 
 
 def get_magenta_runtime() -> tuple[Any, Any, Any]:
@@ -128,33 +186,10 @@ def get_aubio_runtime() -> Any:
     return aubio
 
 
-def log_bpm_candidates(estimates: list[float], confidences: list[float]) -> None:
-    candidates: dict[float, float] = {}
-    for estimate, confidence in zip(estimates, confidences):
-        rounded_bpm = round(estimate, 2)
-        candidates[rounded_bpm] = max(candidates.get(rounded_bpm, 0.0), confidence)
-
-    ranked = sorted(candidates.items(), key=lambda candidate: candidate[1], reverse=True)
-    top_candidates = ranked[:MAX_LOGGED_BPM_CANDIDATES]
-    if not top_candidates:
-        logger.info("BPM detection produced no candidates")
-        return
-
-    logger.info("BPM detection top %d candidate(s):", len(top_candidates))
-    for rank, (bpm, confidence) in enumerate(top_candidates, start=1):
-        logger.info(
-            "  #%d bpm=%.2f confidence=%.3f (%d%%)",
-            rank,
-            bpm,
-            confidence,
-            round(confidence * 100),
-        )
-
-
 def detect_bpm_from_file(
     path: str,
     aubio_module: Any | None = None,
-    log_candidates: bool = False,
+    log_result: bool = False,
 ) -> dict[str, float | bool | None]:
     aubio_module = aubio_module or get_aubio_runtime()
     window_size = 1024
@@ -171,12 +206,9 @@ def detect_bpm_from_file(
             if math.isfinite(estimate) and estimate > 0:
                 estimates.append(estimate)
                 confidence = float(tempo.get_confidence())
-                confidences.append(clamp01(confidence))
+                confidences.append(confidence)
         if frames_read < hop_size:
             break
-
-    if log_candidates:
-        log_bpm_candidates(estimates, confidences)
 
     if len(estimates) < 2:
         return {"bpm": None, "confidence": 0.0, "reliable": False}
@@ -186,11 +218,21 @@ def detect_bpm_from_file(
     if relative_deviation > 0.1:
         return {"bpm": None, "confidence": 0.0, "reliable": False}
 
-    confidence = float(np.median(confidences)) if confidences else 0.0
+    rounded_bpm = math.floor(bpm + 0.5)
+    confidence = clamp01(float(np.median(confidences))) if confidences else 0.0
+    reliable = confidence >= 0.5
+    if log_result:
+        logger.info(
+            "BPM detection selected bpm=%d aubio_confidence=%s (%d%%) reliable=%s",
+            rounded_bpm,
+            confidence,
+            round(confidence * 100),
+            reliable,
+        )
     return {
-        "bpm": round(bpm, 2),
-        "confidence": round(confidence, 3),
-        "reliable": confidence >= 0.5,
+        "bpm": rounded_bpm,
+        "confidence": confidence,
+        "reliable": reliable,
     }
 
 
@@ -230,19 +272,6 @@ def resolve_duration_seconds(duration_bars: int | None, bpm: float | None) -> fl
     return duration_seconds
 
 
-def validate_generation_weights(audio_weight: float, text_weight: float) -> tuple[float, float]:
-    if not math.isfinite(audio_weight):
-        raise HTTPException(status_code=400, detail="audio_weight must be a finite number.")
-    if audio_weight < 0 or audio_weight > 1:
-        raise HTTPException(status_code=400, detail="audio_weight must be between 0 and 1.")
-    if not math.isfinite(text_weight):
-        raise HTTPException(status_code=400, detail="text_weight must be a finite number.")
-    if text_weight < 1 or text_weight > 5:
-        raise HTTPException(status_code=400, detail="text_weight must be between 1 and 5.")
-
-    return audio_weight, text_weight
-
-
 def format_bpm_for_style_prompt(bpm: float) -> str:
     rounded_bpm = round(bpm)
     if math.isclose(bpm, rounded_bpm, abs_tol=0.05):
@@ -256,7 +285,13 @@ def build_mrt_style_prompt(prompt: str, bpm: float, detected_key: DetectedKey, s
     if stem_role:
         role_name = "drum" if stem_role == "drums" else stem_role
         stem_prefix = f"{role_name} stem, "
-    return f"{format_bpm_for_style_prompt(bpm)} bpm {stem_prefix}{clean_prompt} in {detected_key.name}"
+    grid_prompt = ""
+    if stem_role == "drums":
+        grid_prompt = ", tightly quantized to a straight 4/4 project grid"
+    return (
+        f"{format_bpm_for_style_prompt(bpm)} bpm {stem_prefix}{clean_prompt}"
+        f"{grid_prompt} in {detected_key.name}"
+    )
 
 
 def as_style_vector(style: Any) -> np.ndarray:
@@ -280,25 +315,16 @@ def embed_musiccoca_styles(style_model: Any, audio_prompt: Any, text_prompt: str
     return styles[0], styles[1]
 
 
-def blend_style_vectors(audio_style: Any, text_style: Any, audio_weight: float, text_weight: float) -> np.ndarray:
-    weights = np.array([audio_weight, text_weight], dtype=np.float32)
-    weight_sum = float(weights.sum())
-    if weight_sum <= 0:
-        raise HTTPException(status_code=400, detail="audio_weight and text_weight must sum to greater than 0.")
-
+def blend_style_vectors(audio_style: Any, text_style: Any) -> np.ndarray:
     styles = np.stack([as_style_vector(audio_style), as_style_vector(text_style)])
-    weights_norm = weights / weight_sum
-    return np.sum(weights_norm[:, np.newaxis] * styles, axis=0).astype(np.float32)
+    weights = np.array([AUDIO_STYLE_WEIGHT, TEXT_STYLE_WEIGHT], dtype=np.float32)
+    normalized_weights = weights / float(weights.sum())
+    return np.sum(normalized_weights[:, np.newaxis] * styles, axis=0).astype(np.float32)
 
 
-def log_style_embedding_norms(
-    audio_style: Any,
-    text_style: Any,
-    audio_weight: float,
-    text_weight: float,
-) -> None:
-    weights = np.array([audio_weight, text_weight], dtype=np.float32)
-    weights /= float(weights.sum())
+def log_style_embedding_norms(audio_style: Any, text_style: Any) -> None:
+    weights = np.array([AUDIO_STYLE_WEIGHT, TEXT_STYLE_WEIGHT], dtype=np.float32)
+    normalized_weights = weights / float(weights.sum())
     audio_vector = as_style_vector(audio_style)
     text_vector = as_style_vector(text_style)
     audio_norm = float(np.linalg.norm(audio_vector))
@@ -306,8 +332,8 @@ def log_style_embedding_norms(
     print(
         "MusicCoCa embedding norms: "
         f"audio={audio_norm:.3f}, text={text_norm:.3f}, "
-        f"weighted_audio={audio_norm * float(weights[0]):.3f}, "
-        f"weighted_text={text_norm * float(weights[1]):.3f}"
+        f"weighted_audio={audio_norm * float(normalized_weights[0]):.3f}, "
+        f"weighted_text={text_norm * float(normalized_weights[1]):.3f}"
     )
 
 
@@ -315,6 +341,26 @@ def frames_per_beat_for_bpm(bpm: float) -> int:
     validated_bpm = validate_generation_bpm(bpm, required=True)
     seconds_per_beat = 60.0 / validated_bpm
     return max(1, int(round(MRT_FRAMES_PER_SECOND * seconds_per_beat)))
+
+
+def model_frame_boundaries(bpm: float, total_beats: int) -> list[int]:
+    validated_bpm = validate_generation_bpm(bpm, required=True)
+    if total_beats <= 0:
+        raise ValueError("total_beats must be greater than 0")
+
+    frames_per_beat = MRT_FRAMES_PER_SECOND * 60.0 / validated_bpm
+    boundaries = [
+        int(math.floor((beat * frames_per_beat) + 0.5))
+        for beat in range(total_beats + 1)
+    ]
+    if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
+        raise ValueError("BPM produces a zero-length Magenta frame chunk")
+    return boundaries
+
+
+def model_frame_schedule(bpm: float, total_beats: int) -> list[int]:
+    boundaries = model_frame_boundaries(bpm, total_beats)
+    return [end - start for start, end in zip(boundaries, boundaries[1:])]
 
 
 def clamp01(value: float) -> float:
@@ -352,6 +398,176 @@ def normalize_vector(values: np.ndarray) -> np.ndarray:
     if max_value <= 1e-8:
         return np.zeros_like(values)
     return values / max_value
+
+
+def onset_envelopes(
+    mono: np.ndarray,
+    sample_rate: int,
+    hop_length: int = ONSET_HOP_LENGTH,
+) -> tuple[np.ndarray, np.ndarray]:
+    broadband = librosa.onset.onset_strength(
+        y=mono,
+        sr=sample_rate,
+        hop_length=hop_length,
+    )
+    spectrum = np.abs(librosa.stft(mono, n_fft=2048, hop_length=hop_length))
+    frequencies = librosa.fft_frequencies(sr=sample_rate, n_fft=2048)
+    low_bins = spectrum[frequencies <= 250.0]
+    if low_bins.size:
+        low_db = librosa.amplitude_to_db(low_bins, ref=np.max)
+        low_frequency = librosa.onset.onset_strength(
+            S=low_db,
+            sr=sample_rate,
+            hop_length=hop_length,
+            aggregate=np.mean,
+        )
+    else:
+        low_frequency = np.zeros_like(broadband)
+
+    length = min(len(broadband), len(low_frequency))
+    return normalize_vector(broadband[:length]), normalize_vector(low_frequency[:length])
+
+
+def _sample_local_envelope_peaks(
+    envelope: np.ndarray,
+    positions: np.ndarray,
+    radius: int,
+) -> np.ndarray:
+    values = np.zeros(len(positions), dtype=np.float32)
+    for index, position in enumerate(positions):
+        center = int(round(position))
+        start = max(0, center - radius)
+        end = min(len(envelope), center + radius + 1)
+        if end > start:
+            values[index] = float(np.max(envelope[start:end]))
+    return values
+
+
+def align_reference_capture(
+    samples: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    output_bars: int,
+) -> CaptureAlignment:
+    validated_bpm = validate_generation_bpm(bpm, required=True)
+    target_samples = int(round(output_bars * BEATS_PER_BAR * 60.0 * sample_rate / validated_bpm))
+    if len(samples) <= target_samples:
+        return CaptureAlignment(
+            samples=exact_length(samples, target_samples),
+            start_sample=0,
+            beat_phase_sample=0,
+            downbeat_phase=0,
+            confidence=0.0,
+            warning="Capture was too short for confident downbeat alignment.",
+        )
+
+    mono = np.mean(samples, axis=1)
+    try:
+        broadband, low_frequency = onset_envelopes(mono, sample_rate)
+    except Exception as error:
+        logger.warning("Capture onset analysis failed: %s", error)
+        return CaptureAlignment(
+            samples=exact_length(samples[:target_samples], target_samples),
+            start_sample=0,
+            beat_phase_sample=0,
+            downbeat_phase=0,
+            confidence=0.0,
+            warning="Downbeat detection was uncertain; using the best available beat phase.",
+        )
+
+    beat_frames = sample_rate * 60.0 / (validated_bpm * ONSET_HOP_LENGTH)
+    phase_count = max(1, int(math.ceil(beat_frames)))
+    combined = (0.58 * broadband) + (0.42 * low_frequency)
+    local_peak_radius = max(1, int(round(0.08 * beat_frames)))
+    phase_scores = np.zeros(phase_count, dtype=np.float64)
+    for phase in range(phase_count):
+        positions = phase + np.arange(
+            max(0, int(math.floor((len(combined) - 1 - phase) / beat_frames)) + 1),
+            dtype=np.float64,
+        ) * beat_frames
+        beat_values = _sample_local_envelope_peaks(
+            combined,
+            positions,
+            local_peak_radius,
+        )
+        offbeat_values = _sample_local_envelope_peaks(
+            combined,
+            positions + (beat_frames * 0.5),
+            local_peak_radius,
+        )
+        if beat_values.size:
+            phase_scores[phase] = float(np.mean(beat_values) - (0.25 * np.mean(offbeat_values)))
+
+    best_phase = int(np.argmax(phase_scores))
+    beat_positions = best_phase + np.arange(
+        max(0, int(math.floor((len(combined) - 1 - best_phase) / beat_frames)) + 1),
+        dtype=np.float64,
+    ) * beat_frames
+    broadband_beats = _sample_local_envelope_peaks(
+        broadband,
+        beat_positions,
+        local_peak_radius,
+    )
+    low_beats = _sample_local_envelope_peaks(
+        low_frequency,
+        beat_positions,
+        local_peak_radius,
+    )
+    beat_strengths = (0.55 * broadband_beats) + (0.45 * low_beats)
+
+    downbeat_scores = np.array(
+        [
+            float(np.mean(beat_strengths[phase::BEATS_PER_BAR]))
+            if len(beat_strengths[phase::BEATS_PER_BAR])
+            else 0.0
+            for phase in range(BEATS_PER_BAR)
+        ],
+        dtype=np.float64,
+    )
+    downbeat_phase = int(np.argmax(downbeat_scores))
+    sorted_downbeat_scores = np.sort(downbeat_scores)
+    best_downbeat_score = float(sorted_downbeat_scores[-1]) if sorted_downbeat_scores.size else 0.0
+    second_downbeat_score = float(sorted_downbeat_scores[-2]) if sorted_downbeat_scores.size > 1 else 0.0
+    downbeat_confidence = (
+        (best_downbeat_score - second_downbeat_score) / max(best_downbeat_score, 1e-8)
+    )
+
+    exclusion_radius = max(1, int(round(0.08 * beat_frames)))
+    competing_scores = np.array(
+        [
+            score
+            for index, score in enumerate(phase_scores)
+            if min(abs(index - best_phase), phase_count - abs(index - best_phase)) > exclusion_radius
+        ],
+        dtype=np.float64,
+    )
+    best_phase_score = float(phase_scores[best_phase])
+    second_phase_score = float(np.max(competing_scores)) if competing_scores.size else 0.0
+    beat_phase_confidence = (
+        (best_phase_score - second_phase_score) / max(abs(best_phase_score), 1e-8)
+    )
+    confidence = clamp01(0.25 * beat_phase_confidence + 0.75 * downbeat_confidence)
+
+    beat_phase_sample = int(round(best_phase * ONSET_HOP_LENGTH))
+    start_sample = int(round((best_phase + (downbeat_phase * beat_frames)) * ONSET_HOP_LENGTH))
+    while start_sample + target_samples > len(samples) and start_sample >= int(
+        round(BEATS_PER_BAR * beat_frames * ONSET_HOP_LENGTH)
+    ):
+        start_sample -= int(round(BEATS_PER_BAR * beat_frames * ONSET_HOP_LENGTH))
+    start_sample = max(0, min(start_sample, len(samples) - target_samples))
+    aligned = exact_length(samples[start_sample:start_sample + target_samples], target_samples)
+    warning = None
+    if confidence < CAPTURE_ALIGNMENT_CONFIDENCE_THRESHOLD:
+        warning = "Downbeat detection was uncertain; using the best available beat phase."
+
+    return CaptureAlignment(
+        samples=aligned.astype(np.float32, copy=False),
+        start_sample=start_sample,
+        beat_phase_sample=beat_phase_sample,
+        downbeat_phase=downbeat_phase,
+        confidence=confidence,
+        warning=warning,
+    )
 
 
 def beat_grid_features(mono: np.ndarray, sample_rate: int, bpm: float, total_beats: int) -> tuple[np.ndarray, np.ndarray]:
@@ -646,6 +862,331 @@ def waveform_to_samples(waveform: Any) -> tuple[np.ndarray, int]:
     return samples.astype(np.float32, copy=False), int(sample_rate)
 
 
+def build_beat_time_map(
+    frame_boundaries: list[int],
+    source_samples: int,
+    target_samples: int,
+) -> list[tuple[int, int]]:
+    if len(frame_boundaries) < 2 or frame_boundaries[0] != 0:
+        raise ValueError("frame_boundaries must begin at zero and contain at least one beat")
+    if source_samples <= 0 or target_samples <= 0:
+        raise ValueError("source_samples and target_samples must be greater than zero")
+    total_frames = frame_boundaries[-1]
+    if total_frames <= 0:
+        raise ValueError("final model-frame boundary must be greater than zero")
+
+    total_beats = len(frame_boundaries) - 1
+    time_map = [
+        (
+            int(round((boundary / total_frames) * source_samples)),
+            int(round((beat / total_beats) * target_samples)),
+        )
+        for beat, boundary in enumerate(frame_boundaries)
+    ]
+    time_map[0] = (0, 0)
+    time_map[-1] = (source_samples, target_samples)
+    return time_map
+
+
+def _run_rubberband_time_map(
+    samples: np.ndarray,
+    sample_rate: int,
+    target_samples: int,
+    time_map: list[tuple[int, int]],
+    executable: str,
+) -> np.ndarray:
+    duration_seconds = target_samples / sample_rate
+    with tempfile.TemporaryDirectory(prefix="magenta-timing-") as temp_dir:
+        input_path = os.path.join(temp_dir, "input.wav")
+        output_path = os.path.join(temp_dir, "output.wav")
+        map_path = os.path.join(temp_dir, "timemap.txt")
+        sf.write(input_path, samples, sample_rate, subtype="FLOAT")
+        with open(map_path, "w", encoding="utf-8") as map_file:
+            map_file.write(
+                "\n".join(f"{source_frame} {target_frame}" for source_frame, target_frame in time_map)
+            )
+            map_file.write("\n")
+
+        completed = subprocess.run(
+            [
+                executable,
+                "--fine",
+                "--duration",
+                f"{duration_seconds:.9f}",
+                "--timemap",
+                map_path,
+                input_path,
+                output_path,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"Rubber Band exited with {completed.returncode}: {detail}")
+        corrected, corrected_sample_rate = sf.read(output_path, dtype="float32", always_2d=True)
+        if corrected_sample_rate != sample_rate:
+            raise RuntimeError(
+                f"Rubber Band changed the sample rate from {sample_rate} to {corrected_sample_rate}"
+            )
+        return exact_length(corrected.astype(np.float32, copy=False), target_samples)
+
+
+def librosa_global_time_stretch(samples: np.ndarray, target_samples: int) -> np.ndarray:
+    if target_samples <= 0:
+        raise ValueError("target_samples must be greater than zero")
+    if len(samples) == target_samples:
+        return samples.astype(np.float32, copy=True)
+    rate = len(samples) / target_samples
+    stretched = librosa.effects.time_stretch(samples.T, rate=rate).T
+    return exact_length(stretched.astype(np.float32, copy=False), target_samples)
+
+
+def _confident_onset_samples(
+    samples: np.ndarray,
+    sample_rate: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    mono = np.mean(samples, axis=1)
+    envelope = librosa.onset.onset_strength(
+        y=mono,
+        sr=sample_rate,
+        hop_length=ONSET_HOP_LENGTH,
+    )
+    if envelope.size == 0 or float(np.max(envelope)) <= 1e-8:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=envelope,
+        sr=sample_rate,
+        hop_length=ONSET_HOP_LENGTH,
+        backtrack=False,
+        units="frames",
+    )
+    if onset_frames.size == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+    strengths = envelope[onset_frames].astype(np.float32)
+    threshold = float(np.quantile(strengths, 0.35))
+    mask = strengths >= threshold
+    return (onset_frames[mask] * ONSET_HOP_LENGTH).astype(np.int64), strengths[mask]
+
+
+def analyze_onset_alignment(
+    samples: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+) -> OnsetAlignment:
+    onset_samples, strengths = _confident_onset_samples(samples, sample_rate)
+    if onset_samples.size == 0:
+        return OnsetAlignment(
+            median_ms=None,
+            p95_ms=None,
+            phase_shift_samples=0,
+            phase_confidence=0.0,
+        )
+
+    sixteenth_samples = sample_rate * 60.0 / (bpm * 4.0)
+    signed_errors = (
+        (onset_samples + (sixteenth_samples / 2.0)) % sixteenth_samples
+    ) - (sixteenth_samples / 2.0)
+    absolute_errors_ms = np.abs(signed_errors) * 1000.0 / sample_rate
+    angles = signed_errors * (2.0 * math.pi / sixteenth_samples)
+    weights = strengths / max(float(np.sum(strengths)), 1e-8)
+    mean_vector = np.sum(weights * np.exp(1j * angles))
+    phase_confidence = float(np.abs(mean_vector))
+    phase_error_samples = (
+        float(np.angle(mean_vector)) * sixteenth_samples / (2.0 * math.pi)
+        if phase_confidence > 1e-8
+        else 0.0
+    )
+    max_shift_samples = int(round(MAX_PHASE_SHIFT_SECONDS * sample_rate))
+    phase_shift_samples = 0
+    if phase_confidence >= 0.58:
+        phase_shift_samples = int(
+            round(np.clip(-phase_error_samples, -max_shift_samples, max_shift_samples))
+        )
+
+    return OnsetAlignment(
+        median_ms=float(np.median(absolute_errors_ms)),
+        p95_ms=float(np.percentile(absolute_errors_ms, 95)),
+        phase_shift_samples=phase_shift_samples,
+        phase_confidence=phase_confidence,
+    )
+
+
+def apply_circular_phase_shift(samples: np.ndarray, shift_samples: int) -> np.ndarray:
+    if shift_samples == 0 or len(samples) == 0:
+        return samples
+    bounded_shift = int(
+        np.clip(shift_samples, -len(samples) + 1, len(samples) - 1)
+    )
+    return np.roll(samples, bounded_shift, axis=0)
+
+
+def residual_alignment_exceeds_threshold(alignment: OnsetAlignment) -> bool:
+    if alignment.median_ms is None or alignment.p95_ms is None:
+        return False
+    return (
+        alignment.median_ms > MAX_MEDIAN_ALIGNMENT_MS
+        or alignment.p95_ms > MAX_P95_ALIGNMENT_MS
+    )
+
+
+def add_confident_subdivision_anchors(
+    samples: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    base_time_map: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    onset_samples, strengths = _confident_onset_samples(samples, sample_rate)
+    if onset_samples.size == 0:
+        return base_time_map
+
+    source_points = np.array([point[0] for point in base_time_map], dtype=np.float64)
+    target_points = np.array([point[1] for point in base_time_map], dtype=np.float64)
+    sixteenth_samples = sample_rate * 60.0 / (bpm * 4.0)
+    candidate_anchors: list[tuple[int, int]] = []
+    strong_threshold = float(np.quantile(strengths, 0.65))
+    maximum_anchor_error = min(
+        0.45 * sixteenth_samples,
+        MAX_PHASE_SHIFT_SECONDS * sample_rate,
+    )
+    for onset_sample, strength in zip(onset_samples, strengths):
+        if strength < strong_threshold:
+            continue
+        mapped_target = float(np.interp(onset_sample, source_points, target_points))
+        quantized_target = int(round(mapped_target / sixteenth_samples) * sixteenth_samples)
+        if abs(mapped_target - quantized_target) <= maximum_anchor_error:
+            candidate_anchors.append((int(onset_sample), quantized_target))
+
+    dense_map = [base_time_map[0]]
+    for left_anchor, right_anchor in zip(base_time_map, base_time_map[1:]):
+        interval_candidates = sorted(
+            (
+                anchor
+                for anchor in candidate_anchors
+                if left_anchor[0] < anchor[0] < right_anchor[0]
+                and left_anchor[1] < anchor[1] < right_anchor[1]
+            ),
+            key=lambda point: (point[0], point[1]),
+        )
+        for anchor in interval_candidates:
+            if anchor[0] > dense_map[-1][0] and anchor[1] > dense_map[-1][1]:
+                dense_map.append(anchor)
+        dense_map.append(right_anchor)
+    return dense_map
+
+
+def _phase_correct_and_measure(
+    samples: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+) -> tuple[np.ndarray, float, OnsetAlignment]:
+    initial_alignment = analyze_onset_alignment(samples, sample_rate, bpm)
+    shifted = apply_circular_phase_shift(samples, initial_alignment.phase_shift_samples)
+    phase_shift_ms = initial_alignment.phase_shift_samples * 1000.0 / sample_rate
+    final_alignment = (
+        analyze_onset_alignment(shifted, sample_rate, bpm)
+        if initial_alignment.phase_shift_samples
+        else initial_alignment
+    )
+    return shifted, phase_shift_ms, final_alignment
+
+
+def correct_generation_timing(
+    samples: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    duration_seconds: float,
+    frame_boundaries: list[int],
+    rubberband_executable: str | None = None,
+) -> TimingCorrection:
+    target_samples = int(round(duration_seconds * sample_rate))
+    beat_time_map = build_beat_time_map(frame_boundaries, len(samples), target_samples)
+    executable = (
+        shutil.which("rubberband")
+        if rubberband_executable is None
+        else rubberband_executable
+    )
+    fallback_warning: str | None = None
+
+    if executable:
+        try:
+            corrected = _run_rubberband_time_map(
+                samples,
+                sample_rate,
+                target_samples,
+                beat_time_map,
+                executable,
+            )
+            corrected, phase_shift_ms, alignment = _phase_correct_and_measure(
+                corrected,
+                sample_rate,
+                bpm,
+            )
+            correction_type = "rubberband_beat_map"
+            if residual_alignment_exceeds_threshold(alignment):
+                dense_time_map = add_confident_subdivision_anchors(
+                    samples,
+                    sample_rate,
+                    bpm,
+                    beat_time_map,
+                )
+                if len(dense_time_map) > len(beat_time_map):
+                    dense = _run_rubberband_time_map(
+                        samples,
+                        sample_rate,
+                        target_samples,
+                        dense_time_map,
+                        executable,
+                    )
+                    dense, dense_phase_shift_ms, dense_alignment = _phase_correct_and_measure(
+                        dense,
+                        sample_rate,
+                        bpm,
+                    )
+                    current_error = (
+                        alignment.p95_ms if alignment.p95_ms is not None else math.inf
+                    )
+                    dense_error = (
+                        dense_alignment.p95_ms
+                        if dense_alignment.p95_ms is not None
+                        else math.inf
+                    )
+                    if dense_error < current_error:
+                        corrected = dense
+                        phase_shift_ms = dense_phase_shift_ms
+                        alignment = dense_alignment
+                        correction_type = "rubberband_subdivision_map"
+            return TimingCorrection(
+                samples=exact_length(corrected, target_samples),
+                correction_type=correction_type,
+                phase_shift_ms=phase_shift_ms,
+                alignment=alignment,
+                fallback_warning=None,
+            )
+        except Exception as error:
+            logger.warning("Rubber Band timing correction failed; using librosa fallback: %s", error)
+            fallback_warning = "Rubber Band correction failed; used librosa timing fallback."
+    else:
+        logger.warning("Rubber Band is unavailable; using librosa timing fallback")
+        fallback_warning = "Rubber Band is unavailable; used librosa timing fallback."
+
+    corrected = librosa_global_time_stretch(samples, target_samples)
+    corrected, phase_shift_ms, alignment = _phase_correct_and_measure(
+        corrected,
+        sample_rate,
+        bpm,
+    )
+    return TimingCorrection(
+        samples=exact_length(corrected, target_samples),
+        correction_type="librosa_global",
+        phase_shift_ms=phase_shift_ms,
+        alignment=alignment,
+        fallback_warning=fallback_warning,
+    )
+
+
 def exact_length(samples: np.ndarray, target_samples: int) -> np.ndarray:
     if len(samples) > target_samples:
         return samples[:target_samples]
@@ -707,6 +1248,24 @@ def safe_filename(prompt: str) -> str:
     clean = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in prompt[:30])
     return clean.strip("_") or "magic"
 
+
+def combine_timing_warnings(*warnings: str | None) -> str | None:
+    unique: list[str] = []
+    for warning in warnings:
+        if warning and warning not in unique:
+            unique.append(warning)
+    return " ".join(unique) if unique else None
+
+
+def timing_response_headers(diagnostics: TimingDiagnostics) -> dict[str, str]:
+    headers = {"X-Magenta-Timing-Status": diagnostics.timing_status}
+    if diagnostics.warning:
+        headers["X-Magenta-Timing-Warning"] = diagnostics.warning
+    if diagnostics.residual_median_ms is not None:
+        headers["X-Magenta-Alignment-Ms"] = f"{diagnostics.residual_median_ms:.2f}"
+    return headers
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -737,7 +1296,7 @@ async def detect_bpm(audio_file: UploadFile = File(..., description="Original au
                 raise HTTPException(status_code=400, detail="Could not read audio file: file is empty.")
             tmp.write(contents)
         try:
-            return detect_bpm_from_file(tmp_path, aubio_module, log_candidates=True)
+            return detect_bpm_from_file(tmp_path, aubio_module, log_result=True)
         except HTTPException:
             raise
         except Exception as e:
@@ -754,8 +1313,6 @@ async def detect_bpm(audio_file: UploadFile = File(..., description="Original au
 async def generate(
     audio_file: UploadFile = File(..., description="Reference audio file (WAV, 48kHz preferred)"),
     prompt: str = Form(..., description="Text style prompt e.g. 'dark trap 808s'"),
-    audio_weight: float = Form(0.5, description="Weight for audio prompt (default 0.5)"),
-    text_weight: float = Form(1.0, description="Weight for text prompt (default 1.0)"),
     duration_bars: int | None = Form(None, description="Output duration in bars"),
     bpm: float | None = Form(None, description="Project tempo in beats per minute"),
     stem_role: str = Form("auto", description="Complementary stem role: auto, melody, bass, drums, or texture"),
@@ -773,7 +1330,6 @@ async def generate(
     # --- Resolve and validate duration ---
     generation_bpm = validate_generation_bpm(bpm, required=True)
     duration_seconds = resolve_duration_seconds(duration_bars, bpm)
-    validate_generation_weights(audio_weight, text_weight)
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be greater than 0.")
 
@@ -783,19 +1339,47 @@ async def generate(
         raise HTTPException(status_code=503, detail=f"Magenta runtime unavailable: {e}") from e
 
     # --- Save uploaded file to temp ---
-    suffix = os.path.splitext(audio_file.filename)[-1] or ".wav"
+    suffix = os.path.splitext(audio_file.filename or "")[-1] or ".wav"
+    uploaded_audio = await audio_file.read()
+    if not uploaded_audio:
+        raise HTTPException(status_code=400, detail="Reference audio file is empty.")
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await audio_file.read())
+        tmp.write(uploaded_audio)
         tmp_path = tmp.name
 
+    aligned_path: str | None = None
     try:
-        # --- Load audio ---
+        # --- Load and align the five-bar capture to a four-bar downbeat ---
         try:
-            my_audio = audio.Waveform.from_file(tmp_path)
+            reference_samples = load_reference_audio(tmp_path, MAGENTA_SAMPLE_RATE)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Could not read audio file: {e}")
-        reference_samples = load_reference_audio(tmp_path, MAGENTA_SAMPLE_RATE)
-        analysis = analyze_reference(reference_samples, MAGENTA_SAMPLE_RATE, generation_bpm, duration_bars, duration_seconds)
+        capture_alignment = align_reference_capture(
+            reference_samples,
+            MAGENTA_SAMPLE_RATE,
+            generation_bpm,
+            int(duration_bars),
+        )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as aligned_file:
+            aligned_path = aligned_file.name
+        sf.write(
+            aligned_path,
+            capture_alignment.samples,
+            MAGENTA_SAMPLE_RATE,
+            subtype="FLOAT",
+        )
+        try:
+            my_audio = audio.Waveform.from_file(aligned_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not prepare aligned audio: {e}")
+
+        analysis = analyze_reference(
+            capture_alignment.samples,
+            MAGENTA_SAMPLE_RATE,
+            generation_bpm,
+            duration_bars,
+            duration_seconds,
+        )
         resolved_stem_role = resolve_stem_role(
             stem_role,
             analysis["spectral"],
@@ -820,14 +1404,21 @@ async def generate(
         mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key, resolved_stem_role)
         print(f"MRT style prompt: {mrt_style_prompt}")
         audio_style, text_style = embed_musiccoca_styles(style_model, my_audio, mrt_style_prompt)
-        log_style_embedding_norms(audio_style, text_style, audio_weight, text_weight)
-        blended_style = blend_style_vectors(audio_style, text_style, audio_weight, text_weight)
+        log_style_embedding_norms(audio_style, text_style)
+        blended_style = blend_style_vectors(audio_style, text_style)
 
         # --- Generate beat-grid chunks ---
         chunks = []
         state = None
-        frames_per_beat = frames_per_beat_for_bpm(generation_bpm)
-        for notes, drums in conditioning:
+        frame_boundaries = model_frame_boundaries(
+            generation_bpm,
+            len(conditioning),
+        )
+        frame_schedule = [
+            end - start
+            for start, end in zip(frame_boundaries, frame_boundaries[1:])
+        ]
+        for (notes, drums), frames in zip(conditioning, frame_schedule):
             chunk, state = mrt.generate(
                 style=blended_style,
                 notes=notes,
@@ -837,19 +1428,58 @@ async def generate(
                 temperature=temperature,
                 top_k=top_k,
                 state=state,
-                frames=frames_per_beat,
+                frames=frames,
             )
             chunks.append(chunk)
 
         # --- Concatenate & return as WAV bytes ---
         output_waveform = audio.concatenate(chunks)
         samples, sample_rate = waveform_to_samples(output_waveform)
-        processed = post_process_generation(
+        timing_correction = correct_generation_timing(
             samples,
+            sample_rate,
+            generation_bpm,
+            duration_seconds,
+            frame_boundaries,
+        )
+        processed = post_process_generation(
+            timing_correction.samples,
             sample_rate,
             analysis["reference"],
             duration_seconds,
             avoid_clash,
+        )
+        residual_warning = None
+        if residual_alignment_exceeds_threshold(timing_correction.alignment):
+            residual_warning = "Residual onset alignment remains above the timing target."
+        warning = combine_timing_warnings(
+            capture_alignment.warning,
+            timing_correction.fallback_warning,
+            residual_warning,
+        )
+        if timing_correction.fallback_warning:
+            timing_status = "fallback"
+        elif capture_alignment.warning or residual_warning:
+            timing_status = "uncertain"
+        else:
+            timing_status = "aligned"
+        diagnostics = TimingDiagnostics(
+            capture_phase_samples=capture_alignment.beat_phase_sample,
+            capture_downbeat_phase=capture_alignment.downbeat_phase,
+            capture_alignment_confidence=capture_alignment.confidence,
+            model_frame_schedule=frame_schedule,
+            raw_duration_seconds=len(samples) / sample_rate,
+            corrected_duration_seconds=len(processed) / sample_rate,
+            correction_type=timing_correction.correction_type,
+            phase_shift_ms=timing_correction.phase_shift_ms,
+            residual_median_ms=timing_correction.alignment.median_ms,
+            residual_p95_ms=timing_correction.alignment.p95_ms,
+            timing_status=timing_status,
+            warning=warning,
+        )
+        logger.info(
+            "Magenta timing diagnostics: %s",
+            json.dumps(asdict(diagnostics), sort_keys=True),
         )
 
         buf = io.BytesIO()
@@ -857,14 +1487,23 @@ async def generate(
         buf.seek(0)
 
         filename = f"magenta_{safe_filename(prompt)}.wav"
+        response_headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            **timing_response_headers(diagnostics),
+        }
         return StreamingResponse(
             buf,
             media_type="audio/wav",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers=response_headers,
         )
 
     finally:
-        os.unlink(tmp_path)
+        for path in (aligned_path, tmp_path):
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
 
 # ---------------------------------------------------------------------------

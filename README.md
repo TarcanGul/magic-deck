@@ -13,3 +13,17 @@ If the PyPI release fails to compile against the active Python/NumPy toolchain, 
 ```bash
 pip install -Iv git+https://git.aubio.org/aubio/aubio
 ```
+
+## Beat-locked generation
+
+Install the Rubber Band command-line utility for the preferred per-beat timing
+correction:
+
+```bash
+brew install rubberband
+```
+
+`magenta_server.py` detects the `rubberband` executable at runtime. If it is not
+installed, or if its time-map correction fails, generation continues with
+librosa global time-stretching and returns a visible timing warning to the
+frontend. Trim/pad is used only for final sample-count cleanup.
