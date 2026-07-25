@@ -22,7 +22,6 @@ from magenta_server import (
     post_process_generation,
     resolve_duration_seconds,
     resolve_stem_role,
-    validate_generation_weights,
 )
 
 
@@ -179,27 +178,13 @@ class MagentaServerHelperTests(unittest.TestCase):
                     expected_seconds,
                 )
 
-    def test_blend_style_vectors_uses_weighted_sum(self):
+    def test_blend_style_vectors_uses_arithmetic_midpoint(self):
         blended = blend_style_vectors(
             np.array([[2.0, 0.0]], dtype=np.float32),
             np.array([0.0, 6.0], dtype=np.float32),
-            1.0,
-            3.0,
         )
 
-        np.testing.assert_allclose(blended, np.array([0.5, 4.5], dtype=np.float32))
-
-    def test_rejects_audio_weight_outside_zero_to_one(self):
-        for audio_weight in (-0.1, 1.1):
-            with self.subTest(audio_weight=audio_weight):
-                with self.assertRaisesRegex(Exception, "audio_weight must be between 0 and 1"):
-                    validate_generation_weights(audio_weight, 1.0)
-
-    def test_rejects_text_weight_outside_one_to_five(self):
-        for text_weight in (0.9, 5.1):
-            with self.subTest(text_weight=text_weight):
-                with self.assertRaisesRegex(Exception, "text_weight must be between 1 and 5"):
-                    validate_generation_weights(0.5, text_weight)
+        np.testing.assert_allclose(blended, np.array([1.0, 3.0], dtype=np.float32))
 
     def test_frames_per_beat_changes_inversely_with_bpm(self):
         frames_at_80 = frames_per_beat_for_bpm(80)

@@ -35,7 +35,7 @@
         <button id="btn-audio-capture" class="btn-primary">⬡ SHARE PROJECT AUDIO</button>
         <div class="audio-capture-status" aria-live="polite">
           <span id="audio-capture-dot" class="dot idle"></span>
-          <span id="audio-capture-label">1. OPEN THE PROJECT TAB · 2. SHARE THAT TAB WITH AUDIO</span>
+          <span id="audio-capture-label">SHARE AUDIO NOW, OR GENERATE WILL ASK · RECORDING STARTS ON GENERATE</span>
         </div>
       </div>
       <!-- Hidden inputs still in DOM for JS refs -->
@@ -194,19 +194,7 @@
             <label class="magic-config-label">PROMPT</label>
             <input type="text" id="magic-prompt" class="magic-input magic-prompt" value="dark trap 808s" />
           </div>
-          <div class="magic-params">
-            <div class="magic-param">
-              <label class="magic-param-label">AUDIO WT <span id="audio-weight-val">0.5</span></label>
-              <input type="range" id="magic-audio-weight" min="0" max="1" step="0.1" value="0.5" class="magic-slider">
-            </div>
-            <div class="magic-param">
-              <label class="magic-param-label">TEXT WT <span id="text-weight-val">1.0</span></label>
-              <input type="range" id="magic-text-weight" min="1" max="5" step="0.1" value="1" class="magic-slider">
-            </div>
-            <div class="magic-param">
-              <div class="magic-duration-label">DURATION: 4 BARS</div>
-            </div>
-          </div>
+          <div class="magic-duration-label">DURATION: 4 BARS</div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE FROM LIVE AUDIO</button>
           <div class="magic-playback-row">
             <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>

@@ -45,6 +45,8 @@ MRT_FRAMES_PER_SECOND = 25.0
 BEATS_PER_BAR = 4
 MIN_GENERATION_BPM = 40.0
 MAX_GENERATION_BPM = 240.0
+AUDIO_STYLE_WEIGHT = 1.0
+TEXT_STYLE_WEIGHT = 1.0
 PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 MAJOR_SCALE = np.array([0, 2, 4, 5, 7, 9, 11], dtype=np.int16)
 MINOR_SCALE = np.array([0, 2, 3, 5, 7, 8, 10], dtype=np.int16)
@@ -230,19 +232,6 @@ def resolve_duration_seconds(duration_bars: int | None, bpm: float | None) -> fl
     return duration_seconds
 
 
-def validate_generation_weights(audio_weight: float, text_weight: float) -> tuple[float, float]:
-    if not math.isfinite(audio_weight):
-        raise HTTPException(status_code=400, detail="audio_weight must be a finite number.")
-    if audio_weight < 0 or audio_weight > 1:
-        raise HTTPException(status_code=400, detail="audio_weight must be between 0 and 1.")
-    if not math.isfinite(text_weight):
-        raise HTTPException(status_code=400, detail="text_weight must be a finite number.")
-    if text_weight < 1 or text_weight > 5:
-        raise HTTPException(status_code=400, detail="text_weight must be between 1 and 5.")
-
-    return audio_weight, text_weight
-
-
 def format_bpm_for_style_prompt(bpm: float) -> str:
     rounded_bpm = round(bpm)
     if math.isclose(bpm, rounded_bpm, abs_tol=0.05):
@@ -280,25 +269,16 @@ def embed_musiccoca_styles(style_model: Any, audio_prompt: Any, text_prompt: str
     return styles[0], styles[1]
 
 
-def blend_style_vectors(audio_style: Any, text_style: Any, audio_weight: float, text_weight: float) -> np.ndarray:
-    weights = np.array([audio_weight, text_weight], dtype=np.float32)
-    weight_sum = float(weights.sum())
-    if weight_sum <= 0:
-        raise HTTPException(status_code=400, detail="audio_weight and text_weight must sum to greater than 0.")
-
+def blend_style_vectors(audio_style: Any, text_style: Any) -> np.ndarray:
     styles = np.stack([as_style_vector(audio_style), as_style_vector(text_style)])
-    weights_norm = weights / weight_sum
-    return np.sum(weights_norm[:, np.newaxis] * styles, axis=0).astype(np.float32)
+    weights = np.array([AUDIO_STYLE_WEIGHT, TEXT_STYLE_WEIGHT], dtype=np.float32)
+    normalized_weights = weights / float(weights.sum())
+    return np.sum(normalized_weights[:, np.newaxis] * styles, axis=0).astype(np.float32)
 
 
-def log_style_embedding_norms(
-    audio_style: Any,
-    text_style: Any,
-    audio_weight: float,
-    text_weight: float,
-) -> None:
-    weights = np.array([audio_weight, text_weight], dtype=np.float32)
-    weights /= float(weights.sum())
+def log_style_embedding_norms(audio_style: Any, text_style: Any) -> None:
+    weights = np.array([AUDIO_STYLE_WEIGHT, TEXT_STYLE_WEIGHT], dtype=np.float32)
+    normalized_weights = weights / float(weights.sum())
     audio_vector = as_style_vector(audio_style)
     text_vector = as_style_vector(text_style)
     audio_norm = float(np.linalg.norm(audio_vector))
@@ -306,8 +286,8 @@ def log_style_embedding_norms(
     print(
         "MusicCoCa embedding norms: "
         f"audio={audio_norm:.3f}, text={text_norm:.3f}, "
-        f"weighted_audio={audio_norm * float(weights[0]):.3f}, "
-        f"weighted_text={text_norm * float(weights[1]):.3f}"
+        f"weighted_audio={audio_norm * float(normalized_weights[0]):.3f}, "
+        f"weighted_text={text_norm * float(normalized_weights[1]):.3f}"
     )
 
 
@@ -754,8 +734,6 @@ async def detect_bpm(audio_file: UploadFile = File(..., description="Original au
 async def generate(
     audio_file: UploadFile = File(..., description="Reference audio file (WAV, 48kHz preferred)"),
     prompt: str = Form(..., description="Text style prompt e.g. 'dark trap 808s'"),
-    audio_weight: float = Form(0.5, description="Weight for audio prompt (default 0.5)"),
-    text_weight: float = Form(1.0, description="Weight for text prompt (default 1.0)"),
     duration_bars: int | None = Form(None, description="Output duration in bars"),
     bpm: float | None = Form(None, description="Project tempo in beats per minute"),
     stem_role: str = Form("auto", description="Complementary stem role: auto, melody, bass, drums, or texture"),
@@ -773,7 +751,6 @@ async def generate(
     # --- Resolve and validate duration ---
     generation_bpm = validate_generation_bpm(bpm, required=True)
     duration_seconds = resolve_duration_seconds(duration_bars, bpm)
-    validate_generation_weights(audio_weight, text_weight)
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be greater than 0.")
 
@@ -820,8 +797,8 @@ async def generate(
         mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key, resolved_stem_role)
         print(f"MRT style prompt: {mrt_style_prompt}")
         audio_style, text_style = embed_musiccoca_styles(style_model, my_audio, mrt_style_prompt)
-        log_style_embedding_norms(audio_style, text_style, audio_weight, text_weight)
-        blended_style = blend_style_vectors(audio_style, text_style, audio_weight, text_weight)
+        log_style_embedding_norms(audio_style, text_style)
+        blended_style = blend_style_vectors(audio_style, text_style)
 
         # --- Generate beat-grid chunks ---
         chunks = []
