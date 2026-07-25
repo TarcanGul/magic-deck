@@ -17,7 +17,9 @@ from magenta_server import (
     detect_bpm_from_file,
     embed_musiccoca_styles,
     frames_per_beat_for_bpm,
+    normalize_to_full_scale,
     pitch_classes_for_key,
+    post_process_generation,
     resolve_duration_seconds,
     resolve_stem_role,
     validate_generation_weights,
@@ -209,6 +211,63 @@ class MagentaServerHelperTests(unittest.TestCase):
         self.assertGreater(frames_at_160, 0)
         self.assertGreater(frames_at_80, frames_at_120)
         self.assertGreater(frames_at_120, frames_at_160)
+
+    def test_full_scale_normalization_amplifies_quiet_signal(self):
+        samples = np.array([[0.05], [-0.25], [0.10]], dtype=np.float32)
+
+        normalized = normalize_to_full_scale(samples)
+
+        self.assertAlmostEqual(float(np.max(np.abs(normalized))), 1.0)
+        np.testing.assert_allclose(normalized[:, 0], np.array([0.2, -1.0, 0.4], dtype=np.float32))
+
+    def test_full_scale_normalization_attenuates_over_range_signal(self):
+        samples = np.array([[2.0], [-4.0], [1.0]], dtype=np.float32)
+
+        normalized = normalize_to_full_scale(samples)
+
+        self.assertAlmostEqual(float(np.max(np.abs(normalized))), 1.0)
+        np.testing.assert_allclose(normalized[:, 0], np.array([0.5, -1.0, 0.25], dtype=np.float32))
+
+    def test_full_scale_normalization_preserves_stereo_balance(self):
+        samples = np.array(
+            [
+                [0.125, 0.25],
+                [-0.25, -0.50],
+            ],
+            dtype=np.float32,
+        )
+
+        normalized = normalize_to_full_scale(samples)
+
+        np.testing.assert_allclose(normalized, samples * 2.0)
+        np.testing.assert_allclose(normalized[:, 0], normalized[:, 1] * 0.5)
+
+    def test_full_scale_normalization_leaves_silence_finite(self):
+        samples = np.zeros((8, 2), dtype=np.float32)
+
+        normalized = normalize_to_full_scale(samples)
+
+        np.testing.assert_array_equal(normalized, samples)
+        self.assertTrue(np.all(np.isfinite(normalized)))
+
+    def test_post_processing_returns_exact_duration_at_full_scale(self):
+        samples = np.array(
+            [[0.1], [0.2], [-0.4], [0.3], [0.1], [-0.2]],
+            dtype=np.float32,
+        )
+        sample_rate = 100
+        duration_seconds = 0.1
+
+        processed = post_process_generation(
+            samples,
+            sample_rate,
+            np.zeros_like(samples),
+            duration_seconds,
+            avoid_clash=False,
+        )
+
+        self.assertEqual(processed.shape, (10, 1))
+        self.assertAlmostEqual(float(np.max(np.abs(processed))), 1.0)
 
     def test_pitch_classes_for_c_major_chroma(self):
         chroma = np.zeros(12, dtype=np.float32)
