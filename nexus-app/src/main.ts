@@ -20,7 +20,9 @@ interface DeckState {
   volume: number; gainTrim: number
   sampleBpm: number | null; regionEntity: NexusEntity<'audioRegion'> | null
   trackEntity: NexusEntity<'audioTrack'> | null; audioDeviceEntity: NexusEntity<'audioDevice'> | null
-  mixerChannelEntity: NexusEntity<'mixerChannel'> | null
+  mixerChannelEntity: NexusEntity<'mixerChannel'> | null; sampleEntity: NexusEntity<'sample'> | null
+  automationCollectionEntity: NexusEntity<'automationCollection'> | null
+  cableEntity: NexusEntity<'desktopAudioCable'> | null
   regionSubscriptions: Terminable[]
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
@@ -69,6 +71,11 @@ interface AubioBpmResult {
   confidence: number
   reliable: boolean
 }
+interface DeckOperationState {
+  pendingCount: number
+  activeKind: 'loading' | 'replacing' | 'unloading' | null
+  suppressProjectRemovalSync: boolean
+}
 
 const MAGIC_DURATION_BARS = 4
 const MAGIC_CAPTURE_BARS = 5
@@ -83,6 +90,7 @@ const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
+let projectConnected = false
 let currentProjectBpm: number | null = null
 let tempoMasterEstablished = false
 let deckLoadQueue: Promise<void> = Promise.resolve()
@@ -98,11 +106,15 @@ let liveAudioShareRequest: Promise<void> | null = null
 let liveAudioSessionId = 0
 let liveAudioRecordingId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
+const deckOperationStates: [DeckOperationState, DeckOperationState] = [
+  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
+]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, regionSubscriptions: [] },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -192,8 +204,11 @@ async function disconnectAll() {
   resetTempoMasterSession()
   await stopLiveAudioCapture()
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
+  projectConnected = false
   if (at) { try { at.logout() } catch (_) {}; at = null }
   decks.forEach(clearDeckProjectEntities)
+  updateSourceDeckUi(0)
+  updateSourceDeckUi(1)
   statusUser.textContent = ''
   projectUrlRow.style.display = 'none'
   audioCaptureRow.style.display = 'none'
@@ -275,23 +290,32 @@ async function connectProject() {
   resetTempoMasterSession()
   try {
     nexus = await at.open(projectUrl)
-    nexus.connected.subscribe((c) => setStatus(c ? 'connected' : 'error', c ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…'))
+    nexus.connected.subscribe((connected) => {
+      projectConnected = connected
+      updateSourceDeckUi(0)
+      updateSourceDeckUi(1)
+      setStatus(connected ? 'connected' : 'error', connected ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…')
+    })
     loadBPM()
     await nexus.start()
+    projectConnected = true
+    updateSourceDeckUi(0)
+    updateSourceDeckUi(1)
     setStatus('connected', 'SYNCED ↔ PROJECT ACTIVE')
     localStorage.setItem('nexus_project_url', projectUrl)
   } catch (e: unknown) {
     setStatus('error', `PROJECT ERROR: ${e instanceof Error ? e.message : String(e)}`)
     nexus = null
+    projectConnected = false
     btnConnect.disabled = false
   }
 }
 
 function resetTempoMasterSession() {
   tempoSessionId += 1
+  projectConnected = false
   tempoMasterEstablished = false
   currentProjectBpm = null
-  deckLoadQueue = Promise.resolve()
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
     pendingBpmResolutions[deckIndex] = null
@@ -311,6 +335,10 @@ function updateDeckBpmLabels(bpm: number | null) {
 }
 function updateDeckBpmLabel(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
+  if (deckIndex < 2 && !isSourceDeckSynchronized(deckIndex as 0 | 1)) {
+    el(`deck${deckIndex + 1}-bpm`).textContent = '—'
+    return
+  }
   const bpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
   el(`deck${deckIndex + 1}-bpm`).textContent = bpm === null ? '—' : String(bpm)
 }
@@ -332,6 +360,64 @@ function clearDeckProjectEntities(deck: DeckState) {
   deck.trackEntity = null
   deck.audioDeviceEntity = null
   deck.mixerChannelEntity = null
+  deck.sampleEntity = null
+  deck.automationCollectionEntity = null
+  deck.cableEntity = null
+}
+
+function isSourceDeckSynchronized(deckIndex: 0 | 1) {
+  const deck = decks[deckIndex]
+  return deck.audioBuffer !== null
+    && deck.fileName !== null
+    && deck.regionEntity !== null
+    && deck.trackEntity !== null
+    && deck.audioDeviceEntity !== null
+    && deck.mixerChannelEntity !== null
+    && deck.sampleEntity !== null
+    && deck.automationCollectionEntity !== null
+    && deck.cableEntity !== null
+}
+
+function clearWaveformCanvas(deckIndex: 0 | 1) {
+  const canvas = el<HTMLCanvasElement>(`waveform-${deckIndex + 1}`)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.fillStyle = '#111'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+}
+
+function updateSourceDeckUi(deckIndex: 0 | 1) {
+  const deck = decks[deckIndex]
+  const operation = deckOperationStates[deckIndex]
+  const loaded = isSourceDeckSynchronized(deckIndex)
+  const pending = operation.pendingCount > 0
+  const zone = el<HTMLDivElement>(`drop-${deckIndex + 1}`)
+  const filename = el<HTMLDivElement>(`drop${deckIndex + 1}-filename`)
+  const unload = el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`)
+
+  zone.classList.toggle('loaded', loaded)
+  zone.classList.toggle('pending', pending)
+  zone.setAttribute('aria-busy', String(pending))
+  filename.textContent = loaded ? deck.fileName ?? '' : ''
+  unload.classList.toggle('is-hidden', !loaded)
+  unload.disabled = pending || !projectConnected
+  updateDeckBpmLabel(deckIndex)
+
+  if (loaded && deck.audioBuffer) {
+    redrawDeckWaveform(deckIndex)
+  } else {
+    clearWaveformCanvas(deckIndex)
+  }
+}
+
+function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
+  const deck = decks[deckIndex]
+  deckStop(deck)
+  deck.audioBuffer = null
+  deck.fileName = null
+  deck.baseBpm = null
+  deck.playbackRate = 1
+  clearWaveformCanvas(deckIndex)
 }
 
 function normalizeBpm(value: number | null | undefined): number | null {
@@ -492,6 +578,14 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   const track = t.entities.ofTypes('audioTrack').getEntity(trackId)
   if (!track) throw new Error('Inserted audio track was not found')
 
+  const sample = t.entities.ofTypes('sample').getEntity(region.fields.sample.value.entityId)
+  if (!sample) throw new Error('Inserted sample entity was not found')
+
+  const automationCollection = t.entities
+    .ofTypes('automationCollection')
+    .getEntity(region.fields.playbackAutomationCollection.value.entityId)
+  if (!automationCollection) throw new Error('Inserted automation collection was not found')
+
   const audioDeviceId = track.fields.player.value.entityId
   const audioDevice = t.entities.ofTypes('audioDevice').getEntity(audioDeviceId)
   if (!audioDevice) throw new Error('Inserted audio device was not found')
@@ -505,7 +599,7 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   const mixerChannel = t.entities.ofTypes('mixerChannel').getEntity(cable.fields.toSocket.value.entityId)
   if (!mixerChannel) throw new Error('Inserted mixer channel was not found')
 
-  return { track, audioDevice, mixerChannel }
+  return { track, audioDevice, mixerChannel, sample, automationCollection, cable }
 }
 
 function getMagicLoopDurationTicks(t: SafeTransactionBuilder) {
@@ -532,7 +626,27 @@ async function syncMagicLoopDuration(projectDocument: SyncedDocument, expectedSe
   })
 }
 
-function watchDeckRegionDuration(deckIndex: 0 | 1, projectDocument: SyncedDocument, region: NexusEntity<'audioRegion'>, expectedSession: number) {
+function handleExternalDeckEntityRemoval(
+  deckIndex: 0 | 1,
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+  removedEntity: 'region' | 'track',
+) {
+  if (deckOperationStates[deckIndex].suppressProjectRemovalSync) return
+  clearSourceDeckLocalMedia(deckIndex)
+  clearDeckProjectEntities(decks[deckIndex])
+  updateSourceDeckUi(deckIndex)
+  void syncMagicLoopDuration(projectDocument, expectedSession)
+  setStatus('connected', `DECK ${deckIndex + 1}: PROJECT ${removedEntity.toUpperCase()} REMOVED — LOCAL DECK CLEARED`)
+}
+
+function watchDeckProjectEntities(
+  deckIndex: 0 | 1,
+  projectDocument: SyncedDocument,
+  region: NexusEntity<'audioRegion'>,
+  track: NexusEntity<'audioTrack'>,
+  expectedSession: number,
+) {
   const deck = decks[deckIndex]
   deck.regionSubscriptions.push(
     projectDocument.events.onUpdate(region.fields.region.fields.durationTicks, () => {
@@ -542,8 +656,11 @@ function watchDeckRegionDuration(deckIndex: 0 | 1, projectDocument: SyncedDocume
     }),
     projectDocument.events.onRemove(region, () => {
       if (deck.regionEntity?.id !== region.id) return
-      clearDeckProjectEntities(deck)
-      void syncMagicLoopDuration(projectDocument, expectedSession)
+      handleExternalDeckEntityRemoval(deckIndex, projectDocument, expectedSession, 'region')
+    }),
+    projectDocument.events.onRemove(track, () => {
+      if (deck.trackEntity?.id !== track.id) return
+      handleExternalDeckEntityRemoval(deckIndex, projectDocument, expectedSession, 'track')
     }),
   )
 }
@@ -590,9 +707,22 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   deck.trackEntity = inserted.track
   deck.audioDeviceEntity = inserted.audioDevice
   deck.mixerChannelEntity = inserted.mixerChannel
+  deck.sampleEntity = inserted.sample
+  deck.automationCollectionEntity = inserted.automationCollection
+  deck.cableEntity = inserted.cable
   if (deckNum <= 2) {
-    watchDeckRegionDuration((deckNum - 1) as 0 | 1, projectDocument, inserted.region, expectedSession)
-    await syncMagicLoopDuration(projectDocument, expectedSession)
+    watchDeckProjectEntities(
+      (deckNum - 1) as 0 | 1,
+      projectDocument,
+      inserted.region,
+      inserted.track,
+      expectedSession,
+    )
+    try {
+      await syncMagicLoopDuration(projectDocument, expectedSession)
+    } catch (error) {
+      console.warn('[NEXUS] magic loop resize after source insertion:', error)
+    }
   }
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
   applyCurrentDeckEq((deckNum - 1) as WaveformDeckIndex)
@@ -628,6 +758,82 @@ async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false
   } catch (e: unknown) {
     setStatus('error', `UPLOAD ERROR: ${e instanceof Error ? e.message : String(e)}`)
     throw e
+  }
+}
+
+async function removeDeckProjectGraph(deckIndex: 0 | 1, expectedSession: number) {
+  const deck = decks[deckIndex]
+  const operation = deckOperationStates[deckIndex]
+  const projectDocument = nexus
+  if (!projectDocument || !projectConnected || expectedSession !== tempoSessionId) {
+    throw new Error('Project is not connected')
+  }
+
+  const regionId = deck.regionEntity?.id
+  const trackId = deck.trackEntity?.id
+  const audioDeviceId = deck.audioDeviceEntity?.id
+  const mixerChannelId = deck.mixerChannelEntity?.id
+  const cableId = deck.cableEntity?.id
+  const storedSampleId = deck.sampleEntity?.id
+  const storedAutomationCollectionId = deck.automationCollectionEntity?.id
+  if (!regionId && !trackId && !audioDeviceId && !mixerChannelId) {
+    throw new Error('The synchronized project graph is no longer available')
+  }
+
+  operation.suppressProjectRemovalSync = true
+  try {
+    await projectDocument.modify((t) => {
+      const region = regionId
+        ? t.entities.ofTypes('audioRegion').getEntity(regionId)
+        : undefined
+      const sampleId = region?.fields.sample.value.entityId ?? storedSampleId
+      const automationCollectionId = region?.fields.playbackAutomationCollection.value.entityId
+        ?? storedAutomationCollectionId
+      const track = trackId
+        ? t.entities.ofTypes('audioTrack').getEntity(trackId)
+        : undefined
+      const resolvedAudioDeviceId = track?.fields.player.value.entityId ?? audioDeviceId
+      const audioDevice = resolvedAudioDeviceId
+        ? t.entities.ofTypes('audioDevice').getEntity(resolvedAudioDeviceId)
+        : undefined
+
+      if (audioDevice) {
+        t.removeWithDependencies(audioDevice)
+      } else if (track) {
+        t.removeWithDependencies(track)
+      } else if (region) {
+        t.remove(region)
+      }
+
+      const mixerChannel = mixerChannelId
+        ? t.entities.ofTypes('mixerChannel').getEntity(mixerChannelId)
+        : undefined
+      if (mixerChannel) t.removeWithDependencies(mixerChannel)
+
+      const cable = cableId
+        ? t.entities.ofTypes('desktopAudioCable').getEntity(cableId)
+        : undefined
+      if (cable) t.remove(cable)
+
+      const sample = sampleId
+        ? t.entities.ofTypes('sample').getEntity(sampleId)
+        : undefined
+      if (sample) t.removeWithDependencies(sample)
+
+      const automationCollection = automationCollectionId
+        ? t.entities.ofTypes('automationCollection').getEntity(automationCollectionId)
+        : undefined
+      if (automationCollection) t.removeWithDependencies(automationCollection)
+    })
+    clearDeckProjectEntities(deck)
+  } finally {
+    operation.suppressProjectRemovalSync = false
+  }
+
+  try {
+    await syncMagicLoopDuration(projectDocument, expectedSession)
+  } catch (error) {
+    console.warn('[NEXUS] magic loop resize after deck removal:', error)
   }
 }
 
@@ -716,24 +922,89 @@ function deckStop(deck: DeckState) {
   source?.stop()
   redrawDeckWaveformByState(deck)
 }
-async function loadAudioFile(deckIndex: 0 | 1, file: File) {
-  const deck = decks[deckIndex]; ensureCtx(deck)
-  try {
-    const buf = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
-    deckStop(deck); clearDeckProjectEntities(deck); deck.audioBuffer = buf; deck.fileName = file.name
-    drawWaveform(`waveform-${deckIndex + 1}`, buf)
-    await uploadToNexus(deckIndex + 1, file)
-  } catch (e: unknown) { setStatus('error', `LOAD ERROR: ${e instanceof Error ? e.message : String(e)}`) }
+async function loadAudioFile(deckIndex: 0 | 1, file: File, expectedSession: number) {
+  const deck = decks[deckIndex]
+  const operation = deckOperationStates[deckIndex]
+  const replacing = isSourceDeckSynchronized(deckIndex)
+  operation.activeKind = replacing ? 'replacing' : 'loading'
+  updateSourceDeckUi(deckIndex)
+  ensureCtx(deck)
+
+  setStatus('connecting', `DECK ${deckIndex + 1}: ${replacing ? 'PREPARING REPLACEMENT' : 'DECODING AUDIO'}…`)
+  const buffer = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
+  if (expectedSession !== tempoSessionId) throw new Error('Project connection changed during audio decoding')
+
+  if (replacing) {
+    setStatus('connecting', `DECK ${deckIndex + 1}: REMOVING OLD PROJECT TRACK BEFORE REPLACEMENT…`)
+    await removeDeckProjectGraph(deckIndex, expectedSession)
+    clearSourceDeckLocalMedia(deckIndex)
+    updateSourceDeckUi(deckIndex)
+  }
+
+  const inserted = await uploadToNexus(deckIndex + 1, file, false, expectedSession)
+  if (!inserted) {
+    updateSourceDeckUi(deckIndex)
+    return
+  }
+  if (expectedSession !== tempoSessionId) throw new Error('Project connection changed after insertion')
+
+  deck.audioBuffer = buffer
+  deck.fileName = file.name
+  updateSourceDeckUi(deckIndex)
 }
 
 function queueDeckLoad(deckIndex: 0 | 1, file: File) {
+  const operation = deckOperationStates[deckIndex]
   const expectedSession = tempoSessionId
+  operation.pendingCount += 1
+  updateSourceDeckUi(deckIndex)
+  deckLoadQueue = deckLoadQueue
+    .then(async () => {
+      if (expectedSession !== tempoSessionId) return
+      await loadAudioFile(deckIndex, file, expectedSession)
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      setStatus('error', `DECK ${deckIndex + 1}: LOAD OR REPLACEMENT FAILED — ${message}`)
+    })
+    .finally(() => {
+      operation.pendingCount = Math.max(0, operation.pendingCount - 1)
+      if (operation.pendingCount === 0) operation.activeKind = null
+      updateSourceDeckUi(deckIndex)
+    })
+}
+
+async function unloadSourceDeck(deckIndex: 0 | 1) {
+  if (!isSourceDeckSynchronized(deckIndex)) return
+  const expectedSession = tempoSessionId
+  setStatus('connecting', `DECK ${deckIndex + 1}: UNLOADING — REMOVING PROJECT TRACK GRAPH…`)
+  await removeDeckProjectGraph(deckIndex, expectedSession)
+  clearSourceDeckLocalMedia(deckIndex)
+  updateSourceDeckUi(deckIndex)
+  setStatus('connected', `DECK ${deckIndex + 1}: UNLOADED — PROJECT GRAPH REMOVED ✓`)
+}
+
+function queueDeckUnload(deckIndex: 0 | 1) {
+  const operation = deckOperationStates[deckIndex]
+  if (operation.pendingCount > 0 || !isSourceDeckSynchronized(deckIndex)) return
+  const expectedSession = tempoSessionId
+  operation.pendingCount += 1
+  operation.activeKind = 'unloading'
+  updateSourceDeckUi(deckIndex)
   deckLoadQueue = deckLoadQueue
     .then(() => {
       if (expectedSession !== tempoSessionId) return
-      return loadAudioFile(deckIndex, file)
+      return unloadSourceDeck(deckIndex)
     })
-    .catch((error: unknown) => setStatus('error', `LOAD ERROR: ${error instanceof Error ? error.message : String(error)}`))
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      setStatus('error', `DECK ${deckIndex + 1}: UNLOAD FAILED — ${message}`)
+    })
+    .finally(() => {
+      operation.pendingCount = Math.max(0, operation.pendingCount - 1)
+      if (operation.pendingCount === 0) operation.activeKind = null
+      updateSourceDeckUi(deckIndex)
+    })
 }
 
 // ── WAVEFORM ──────────────────────────────────────────────────────────────────
@@ -1370,7 +1641,6 @@ async function generateMagicAudio() {
 // ── DROP ZONES ────────────────────────────────────────────────────────────────
 function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
   const zone = document.getElementById(zoneId)!
-  const label = document.getElementById(`drop${deckIndex + 1}-filename`)!
   zone.addEventListener('dragenter', (e) => { e.preventDefault(); e.stopPropagation(); zone.classList.add('drag-over') })
   zone.addEventListener('dragover',  (e) => { e.preventDefault(); e.stopPropagation(); zone.classList.add('drag-over') })
   zone.addEventListener('dragleave', (e) => { e.stopPropagation(); if (!zone.contains(e.relatedTarget as Node)) zone.classList.remove('drag-over') })
@@ -1379,9 +1649,14 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
     const file = e.dataTransfer?.files?.[0]
     if (!file) return
     if (!file.name.match(/\.(mp3|wav)$/i)) { setStatus('error', 'ONLY MP3 / WAV FILES ACCEPTED'); return }
-    zone.classList.add('loaded'); label.textContent = file.name
     queueDeckLoad(deckIndex, file)
   })
+}
+
+function setupUnloadButton(deckIndex: 0 | 1) {
+  el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`).onclick = () => {
+    queueDeckUnload(deckIndex)
+  }
 }
 
 // ── TRANSPORT ─────────────────────────────────────────────────────────────────
@@ -1462,6 +1737,10 @@ function initApp() {
 
   setupDropZone('drop-1', 0)
   setupDropZone('drop-2', 1)
+  setupUnloadButton(0)
+  setupUnloadButton(1)
+  updateSourceDeckUi(0)
+  updateSourceDeckUi(1)
   wireTransport('d1', 0)
   wireTransport('d2', 1)
   wireTransport('d3', 2)
