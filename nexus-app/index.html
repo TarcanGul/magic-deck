@@ -69,7 +69,6 @@
               </div>
               <canvas class="waveform" id="waveform-1" width="600" height="80"></canvas>
             </div>
-            <button class="deck-unload is-hidden" id="deck1-unload" type="button" aria-label="Unload Deck A">UNLOAD</button>
           </div>
           <div class="transport">
             <button class="t-btn" id="d1-play">▶</button>
@@ -103,8 +102,11 @@
             </div>
             <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
               <div class="bpm-dialogue-header">
+                <div class="bpm-dialogue-header-actions">
+                  <button class="deck-unload is-hidden" id="deck1-unload" type="button" aria-label="Unload Deck A">UNLOAD</button>
+                  <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+                </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
-                <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
               </div>
               <div class="bpm-dialogue-form is-hidden" id="deck1-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
@@ -148,7 +150,6 @@
               </div>
               <canvas class="waveform" id="waveform-2" width="600" height="80"></canvas>
             </div>
-            <button class="deck-unload is-hidden" id="deck2-unload" type="button" aria-label="Unload Deck B">UNLOAD</button>
           </div>
           <div class="transport">
             <button class="t-btn" id="d2-play">▶</button>
@@ -182,8 +183,11 @@
             </div>
             <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
               <div class="bpm-dialogue-header">
+                <div class="bpm-dialogue-header-actions">
+                  <button class="deck-unload is-hidden" id="deck2-unload" type="button" aria-label="Unload Deck B">UNLOAD</button>
+                  <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+                </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
-                <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
               </div>
               <div class="bpm-dialogue-form is-hidden" id="deck2-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>

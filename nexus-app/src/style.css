@@ -170,10 +170,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 
 /* ============================  DROP ZONE  ============================ */
 .deck-media-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 88px;
-  gap: 10px;
-  align-items: stretch;
+  width: 100%;
 }
 .deck-media-main {
   min-width: 0;
@@ -197,30 +194,6 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .drop-icon { font-size: 16px; color: var(--red); }
 .drop-text { font-family: var(--font-data); font-size: 11px; letter-spacing: 2px; color: var(--grey-text); }
 .drop-filename { font-family: var(--font-live); font-size: 12px; color: var(--white); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.deck-unload {
-  border: 1px solid var(--red);
-  border-radius: 4px;
-  background: linear-gradient(180deg, rgba(55,0,0,0.8), rgba(12,0,0,0.9));
-  color: var(--red);
-  font-family: var(--font-header);
-  font-size: 13px;
-  letter-spacing: 2px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.deck-unload:hover:not(:disabled), .deck-unload:focus-visible {
-  background: var(--red);
-  color: var(--white);
-  box-shadow: 0 0 12px var(--red-glow);
-  outline: none;
-}
-.deck-unload:disabled {
-  border-color: var(--grey-light);
-  color: var(--grey-text);
-  cursor: wait;
-  opacity: 0.65;
-}
-
 /* ============================  WAVEFORM  ============================ */
 .waveform {
   width: 100%; height: 80px; display: block;
@@ -281,7 +254,13 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   justify-content: center;
   gap: 7px;
 }
-.bpm-dialogue-header { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.bpm-dialogue-header { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.bpm-dialogue-header-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
 .bpm-dialogue-title { font-family: var(--font-header); color: var(--red); font-size: 15px; letter-spacing: 2px; }
 .bpm-dialogue-title-idle { color: var(--grey-text); font-family: var(--font-data); font-size: 10px; line-height: 1.5; flex: 1; }
 .bpm-dialogue-form, .bpm-report-form { display: flex; flex-direction: column; gap: 7px; }
@@ -292,9 +271,8 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .bpm-dialogue-input { min-width: 90px; flex: 1 1 100px; background: var(--black); border: 1px solid var(--grey-light); color: var(--white); font-family: var(--font-data); padding: 7px 8px; outline: none; border-radius: 3px; }
 .bpm-dialogue-input:focus { border-color: var(--red); box-shadow: 0 0 8px var(--red-glow2); }
 .bpm-dialogue-button { flex: 0 0 auto; padding: 7px 10px; }
-.bpm-report-trigger {
+.bpm-report-trigger, .deck-unload {
   flex: 0 0 auto;
-  margin-left: auto;
   padding: 5px 7px;
   border: 1px solid var(--grey-light);
   background: rgba(0,0,0,0.45);
@@ -304,15 +282,23 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   letter-spacing: 0.7px;
   cursor: pointer;
 }
-.bpm-report-trigger:hover, .bpm-report-trigger:focus-visible { border-color: var(--red); color: var(--white); outline: none; }
-.bpm-report-trigger:disabled { cursor: wait; opacity: 0.5; }
+.deck-unload { border-color: var(--red); color: var(--red); }
+.bpm-report-trigger:hover, .bpm-report-trigger:focus-visible,
+.deck-unload:hover:not(:disabled), .deck-unload:focus-visible {
+  border-color: var(--red);
+  color: var(--white);
+  outline: none;
+}
+.deck-unload:hover:not(:disabled) {
+  background: var(--red);
+  box-shadow: 0 0 12px var(--red-glow);
+}
+.bpm-report-trigger:disabled, .deck-unload:disabled { cursor: wait; opacity: 0.5; }
 
 @media (max-width: 560px) {
-  .deck-media-layout { grid-template-columns: 1fr; }
-  .deck-unload { min-height: 38px; }
   .controls-row { gap: 10px; }
   .bpm-dialogue { flex-basis: 100%; width: 100%; }
-  .bpm-dialogue-header { align-items: flex-start; }
+  .bpm-dialogue-header-actions { flex-wrap: wrap; }
   .bpm-report-actions { flex-wrap: wrap; }
   .bpm-report-actions .bpm-dialogue-input { flex-basis: 100%; }
   .eq-section { min-width: 0; gap: 6px; }
