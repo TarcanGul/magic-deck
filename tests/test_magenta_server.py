@@ -21,11 +21,14 @@ from magenta_server import (
     build_beat_time_map,
     build_conditioning,
     build_mrt_style_prompt,
+    build_percussion_conditioning,
     correct_generation_timing,
     detect_key,
     detect_bpm,
     detect_bpm_from_file,
     embed_musiccoca_styles,
+    embed_musiccoca_text_style,
+    find_percussion_instrument,
     frames_per_beat_for_bpm,
     generate,
     generate_conditioned_chunks,
@@ -36,7 +39,10 @@ from magenta_server import (
     onset_alignment_improves,
     pitch_classes_for_key,
     post_process_generation,
+    quiet_percussion_slots,
+    replace_confident_grid_anchors,
     resolve_duration_seconds,
+    resolve_sampling_parameters,
     resolve_stem_role,
     timing_response_headers,
     validate_sampling_parameters,
@@ -233,6 +239,24 @@ class MagentaServerHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shape \\(2, embedding_dim\\)"):
             embed_musiccoca_styles(FakeMusicCoCa(), object(), "tech house")
 
+    def test_text_only_musiccoca_embedding_excludes_audio_prompt(self):
+        class FakeMusicCoCa:
+            def __init__(self):
+                self.calls = []
+
+            def embed(self, prompts, **kwargs):
+                self.calls.append((prompts, kwargs))
+                return np.array([[5.0, 12.0]], dtype=np.float32)
+
+        style_model = FakeMusicCoCa()
+        style = embed_musiccoca_text_style(style_model, "solo isolated conga")
+
+        self.assertEqual(
+            style_model.calls,
+            [(["solo isolated conga"], {"use_mapper": False})],
+        )
+        np.testing.assert_array_equal(style, np.array([5.0, 12.0], dtype=np.float32))
+
     def test_build_mrt_style_prompt_includes_bpm_prompt_and_key(self):
         detected_key = DetectedKey(
             root_pitch_class=9,
@@ -312,6 +336,25 @@ class MagentaServerHelperTests(unittest.TestCase):
         self.assertNotIn("major", prompt)
         self.assertNotIn("minor", prompt)
 
+    def test_percussion_prompt_is_isolated_rhythmic_and_keyless(self):
+        detected_key = DetectedKey(9, "minor", 0.0, 1.0, 1.0)
+
+        prompt = build_mrt_style_prompt(
+            "afro house style groovy conga beats",
+            123.0,
+            detected_key,
+            "percussion",
+            "conga",
+        )
+
+        self.assertEqual(
+            prompt,
+            "123 bpm solo isolated conga hand-percussion stem, single instrument, "
+            "dry unaccompanied performance, afro house style groovy conga rhythms, "
+            "strict straight eighth-note grid",
+        )
+        self.assertNotIn("A minor", prompt)
+
     def test_sampling_parameters_accept_supported_boundaries(self):
         self.assertEqual(
             validate_sampling_parameters(0.0, 1, -1.0, 7.0),
@@ -344,6 +387,20 @@ class MagentaServerHelperTests(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.status_code, 400)
                 self.assertIn(field, raised.exception.detail)
+
+    def test_percussion_sampling_defaults_are_deterministic_and_overridable(self):
+        self.assertEqual(
+            resolve_sampling_parameters(None, None, None, None, percussion=True),
+            (0.0, 40, 7.0, 7.0),
+        )
+        self.assertEqual(
+            resolve_sampling_parameters(0.75, 17, 4.2, 6.0, percussion=True),
+            (0.75, 17, 4.2, 6.0),
+        )
+        self.assertEqual(
+            resolve_sampling_parameters(None, None, None, None, percussion=False),
+            (0.2, 40, 3.0, 7.0),
+        )
 
     def test_generate_rejects_sampling_parameters_before_loading_runtime(self):
         upload = UploadFile(filename="reference.wav", file=io.BytesIO(b"audio"))
@@ -479,6 +536,47 @@ class MagentaServerHelperTests(unittest.TestCase):
                 self.assertEqual(sum(schedule), int(np.floor(total_beats * frames_per_beat + 0.5)))
                 for beat, boundary in enumerate(boundaries):
                     self.assertLessEqual(abs(boundary - (beat * frames_per_beat)), 0.5)
+
+    def test_percussion_half_beat_schedule_has_32_positive_stateful_calls(self):
+        class FakeMrt:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return object(), f"state-{len(self.calls)}"
+
+        bpm = 123
+        total_eighths = 32
+        schedule = model_frame_schedule(bpm, total_eighths, steps_per_beat=2)
+        conditioning = [([0] * 128, [index % 2]) for index in range(total_eighths)]
+        fake_mrt = FakeMrt()
+
+        generate_conditioned_chunks(
+            fake_mrt,
+            np.ones(4, dtype=np.float32),
+            conditioning,
+            schedule,
+            temperature=0.0,
+            top_k=40,
+            cfg_notes=7.0,
+            cfg_drums=7.0,
+        )
+
+        self.assertEqual(len(fake_mrt.calls), 32)
+        self.assertTrue(all(frames > 0 for frames in schedule))
+        self.assertEqual(
+            sum(schedule),
+            int(math.floor((16 * 25.0 * 60.0 / bpm) + 0.5)),
+        )
+        self.assertAlmostEqual(16 * 60.0 / bpm, 7.804878048780488)
+        self.assertIsNone(fake_mrt.calls[0]["state"])
+        self.assertEqual(fake_mrt.calls[-1]["state"], "state-31")
+        for call in fake_mrt.calls:
+            self.assertEqual(call["temperature"], 0.0)
+            self.assertEqual(call["top_k"], 40)
+            self.assertEqual(call["cfg_notes"], 7.0)
+            self.assertEqual(call["cfg_drums"], 7.0)
 
     def test_beat_time_maps_cover_exact_source_and_target_lengths(self):
         for bpm in (80, 120, 124, 128, 160):
@@ -747,6 +845,109 @@ class MagentaServerHelperTests(unittest.TestCase):
             )
         )
 
+    def test_eighth_grid_anchor_replacement_uses_strongest_attack_per_slot(self):
+        sample_rate = 8_000
+        bpm = 120
+        total_samples = 64_000
+        base_map = build_beat_time_map(
+            model_frame_boundaries(bpm, 32, steps_per_beat=2),
+            total_samples,
+            total_samples,
+        )
+
+        with patch(
+            "magenta_server._confident_onset_samples",
+            return_value=(
+                np.array([2_100, 2_200, 4_150], dtype=np.int64),
+                np.array([0.5, 1.0, 0.8], dtype=np.float32),
+            ),
+        ):
+            replaced = replace_confident_grid_anchors(
+                np.zeros((total_samples, 1), dtype=np.float32),
+                sample_rate,
+                bpm,
+                base_map,
+                steps_per_beat=2,
+            )
+
+        self.assertEqual(replaced[0], base_map[0])
+        self.assertEqual(replaced[-1], base_map[-1])
+        self.assertEqual(replaced[1], (2_200, 2_000))
+        self.assertEqual(replaced[2], (4_150, 4_000))
+        self.assertTrue(
+            all(
+                source_end > source_start and target_end > target_start
+                for (source_start, target_start), (source_end, target_end)
+                in zip(replaced, replaced[1:])
+            )
+        )
+
+    def test_eighth_grid_warp_is_retained_only_when_alignment_improves(self):
+        samples = np.zeros((31_000, 1), dtype=np.float32)
+        base_output = np.ones((32_000, 1), dtype=np.float32)
+        eighth_output = np.full((32_000, 1), 2.0, dtype=np.float32)
+        boundaries = model_frame_boundaries(120, 32, steps_per_beat=2)
+        base_map = build_beat_time_map(boundaries, len(samples), 32_000)
+        eighth_map = list(base_map)
+        eighth_map[1] = (eighth_map[1][0] + 10, eighth_map[1][1])
+        baseline = OnsetAlignment(18.0, 35.0, 0, 1.0)
+        better = OnsetAlignment(10.0, 25.0, 0, 1.0)
+
+        with (
+            patch(
+                "magenta_server._run_rubberband_time_map",
+                side_effect=[base_output, eighth_output],
+            ),
+            patch(
+                "magenta_server.replace_confident_grid_anchors",
+                return_value=eighth_map,
+            ),
+            patch(
+                "magenta_server._phase_correct_and_measure",
+                side_effect=[
+                    (base_output, 0.0, baseline),
+                    (eighth_output, 0.0, better),
+                ],
+            ),
+        ):
+            correction = correct_generation_timing(
+                samples,
+                4_000,
+                120,
+                8.0,
+                boundaries,
+                rubberband_executable="/usr/bin/rubberband",
+                quantize_transients=True,
+                grid_steps_per_beat=2,
+                replace_grid_anchors=True,
+                max_median_ms=15.0,
+                max_p95_ms=30.0,
+            )
+
+        self.assertEqual(correction.correction_type, "rubberband_eighth_map")
+        np.testing.assert_array_equal(correction.samples, eighth_output)
+
+    def test_eighth_grid_alignment_reports_percussion_target_accuracy(self):
+        sample_rate = 8_000
+        grid_samples = 2_000
+        attacks = np.arange(0, 32 * grid_samples, grid_samples) + 80
+        with patch(
+            "magenta_server._confident_onset_samples",
+            return_value=(
+                attacks.astype(np.int64),
+                np.ones(len(attacks), dtype=np.float32),
+            ),
+        ):
+            alignment = analyze_onset_alignment(
+                np.zeros((32 * grid_samples, 1), dtype=np.float32),
+                sample_rate,
+                120,
+                steps_per_beat=2,
+            )
+
+        self.assertAlmostEqual(alignment.median_ms, 10.0)
+        self.assertAlmostEqual(alignment.p95_ms, 10.0)
+
     def test_subdivision_alignment_must_improve_before_replacement(self):
         baseline = OnsetAlignment(18.0, 35.0, 0, 1.0)
         worse = OnsetAlignment(12.0, 45.0, 0, 1.0)
@@ -812,6 +1013,8 @@ class MagentaServerHelperTests(unittest.TestCase):
             residual_p95_ms=26.0,
             timing_status="fallback",
             warning="Rubber Band unavailable.",
+            timing_grid="1/8",
+            resolved_instrument="conga",
         )
 
         headers = timing_response_headers(diagnostics)
@@ -819,6 +1022,8 @@ class MagentaServerHelperTests(unittest.TestCase):
         self.assertEqual(headers["X-Magenta-Timing-Status"], "fallback")
         self.assertEqual(headers["X-Magenta-Timing-Warning"], "Rubber Band unavailable.")
         self.assertEqual(headers["X-Magenta-Alignment-Ms"], "12.35")
+        self.assertEqual(diagnostics.timing_grid, "1/8")
+        self.assertEqual(diagnostics.resolved_instrument, "conga")
 
     def test_full_scale_normalization_amplifies_quiet_signal(self):
         samples = np.array([[0.05], [-0.25], [0.10]], dtype=np.float32)
@@ -957,6 +1162,26 @@ class MagentaServerHelperTests(unittest.TestCase):
 
         self.assertLessEqual(float(np.ptp(bar_rms_db(processed, 4))), 4.5)
 
+    def test_percussion_post_processing_bypasses_spectral_ducking(self):
+        mono = np.linspace(-0.5, 0.5, 400, dtype=np.float32)
+        samples = np.column_stack([mono, mono * 0.5])
+
+        with patch("magenta_server.apply_spectral_ducking") as ducking:
+            processed = post_process_generation(
+                samples,
+                sample_rate=100,
+                reference=np.ones_like(samples),
+                duration_seconds=4.0,
+                avoid_clash=True,
+                duration_bars=4,
+                stem_role="percussion",
+            )
+
+        ducking.assert_not_called()
+        self.assertEqual(processed.shape, (400, 2))
+        self.assertAlmostEqual(float(np.max(np.abs(processed))), 1.0)
+        np.testing.assert_allclose(processed[:, 1], processed[:, 0] * 0.5)
+
     def test_pitch_classes_for_c_major_chroma(self):
         chroma = np.zeros(12, dtype=np.float32)
         chroma[[0, 2, 4, 5, 7, 9, 11]] = 1.0
@@ -992,6 +1217,105 @@ class MagentaServerHelperTests(unittest.TestCase):
         beat_energy = np.full(16, 0.5, dtype=np.float32)
 
         self.assertEqual(resolve_stem_role("auto", spectral, onset_density, beat_energy), "bass")
+
+    def test_auto_routes_all_supported_hand_percussion_terms(self):
+        spectral = {"low": 0.05, "mid": 0.85, "high": 0.9}
+        onset_density = np.full(16, 0.8, dtype=np.float32)
+        beat_energy = np.full(16, 0.5, dtype=np.float32)
+        keywords = (
+            "conga",
+            "bongo",
+            "djembe",
+            "timbale",
+            "shaker",
+            "tambourine",
+            "cowbell",
+            "clave",
+            "agogo",
+            "maraca",
+            "cabasa",
+            "guiro",
+            "woodblock",
+            "hand drum",
+            "hand percussion",
+        )
+
+        for keyword in keywords:
+            with self.subTest(keyword=keyword):
+                self.assertEqual(
+                    resolve_stem_role(
+                        "auto",
+                        spectral,
+                        onset_density,
+                        beat_energy,
+                        f"afro house {keyword} beat",
+                    ),
+                    "percussion",
+                )
+
+    def test_percussion_instrument_uses_earliest_prompt_match(self):
+        self.assertEqual(
+            find_percussion_instrument("shaker groove followed by conga fills"),
+            "shaker",
+        )
+        self.assertEqual(
+            find_percussion_instrument("conga groove with early shaker accents"),
+            "conga",
+        )
+
+    def test_explicit_role_overrides_percussion_prompt_routing(self):
+        spectral = {"low": 0.5, "mid": 0.5, "high": 0.5}
+        activity = np.zeros(16, dtype=np.float32)
+
+        self.assertEqual(
+            resolve_stem_role(
+                "texture",
+                spectral,
+                activity,
+                activity,
+                "isolated conga beat",
+            ),
+            "texture",
+        )
+
+    def test_quiet_percussion_slots_use_offbeat_first_tie_breaking(self):
+        selected = quiet_percussion_slots(
+            np.zeros(32, dtype=np.float32),
+            np.zeros(32, dtype=np.float32),
+            total_bars=4,
+        )
+
+        for bar in range(4):
+            bar_start = bar * 8
+            self.assertEqual(
+                {slot - bar_start for slot in selected if bar_start <= slot < bar_start + 8},
+                {1, 3, 5, 7},
+            )
+
+    def test_percussion_conditioning_selects_four_quiet_eighths_per_bar(self):
+        energy = np.tile(
+            np.array([0.8, 0.1, 0.7, 0.2, 0.6, 0.3, 0.5, 0.4], dtype=np.float32),
+            4,
+        )
+        onset = np.zeros(32, dtype=np.float32)
+        analysis = {
+            "total_beats": 16,
+            "beat_energy": np.zeros(16, dtype=np.float32),
+            "onset_density": np.zeros(16, dtype=np.float32),
+            "eighth_energy": energy,
+            "eighth_onset_density": onset,
+        }
+
+        conditioning = build_percussion_conditioning(analysis)
+
+        self.assertEqual(len(conditioning), 32)
+        self.assertTrue(all(notes == [0] * 128 for notes, _ in conditioning))
+        for bar in range(4):
+            bar_drums = [
+                drums[0]
+                for _, drums in conditioning[bar * 8:(bar + 1) * 8]
+            ]
+            self.assertEqual(bar_drums, [0, 1, 0, 1, 0, 1, 0, 1])
 
     def test_build_conditioning_creates_four_bar_bass_phrase(self):
         chroma = np.zeros(12, dtype=np.float32)

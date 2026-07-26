@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -64,6 +65,29 @@ EQ_BANDS = {
     "high": (4_000.0, 16_000.0),
 }
 STEM_ROLES = {"melody", "bass", "drums", "texture"}
+PERCUSSION_ROLE = "percussion"
+PERCUSSION_GRID_STEPS_PER_BEAT = 2
+PERCUSSION_GRID_LABEL = "1/8"
+DEFAULT_GRID_STEPS_PER_BEAT = 4
+DEFAULT_GRID_LABEL = "1/16"
+PERCUSSION_INSTRUMENT_PATTERNS = (
+    ("conga", r"\bcongas?\b"),
+    ("bongo", r"\bbongos?\b"),
+    ("djembe", r"\bdjembes?\b"),
+    ("timbale", r"\btimbales?\b"),
+    ("shaker", r"\bshakers?\b"),
+    ("tambourine", r"\btambourines?\b"),
+    ("cowbell", r"\bcowbells?\b"),
+    ("clave", r"\bclaves?\b"),
+    ("agogo", r"\bagogos?\b"),
+    ("maraca", r"\bmaracas?\b"),
+    ("cabasa", r"\bcabasas?\b"),
+    ("guiro", r"\bguiros?\b"),
+    ("woodblock", r"\bwoodblocks?\b"),
+    ("hand drum", r"\bhand[\s-]+drums?\b"),
+    ("hand percussion", r"\bhand[\s-]+percussion\b"),
+)
+PERCUSSION_SLOT_TIE_PRIORITY = (1, 3, 5, 7, 0, 4, 2, 6)
 ROLE_NOTE_RANGES = {
     "bass": range(36, 53),
     "texture": range(60, 85),
@@ -83,6 +107,8 @@ ONSET_HOP_LENGTH = 256
 MAX_PHASE_SHIFT_SECONDS = 0.08
 MAX_MEDIAN_ALIGNMENT_MS = 20.0
 MAX_P95_ALIGNMENT_MS = 40.0
+PERCUSSION_MAX_MEDIAN_ALIGNMENT_MS = 15.0
+PERCUSSION_MAX_P95_ALIGNMENT_MS = 30.0
 BAR_LEVEL_TOLERANCE_DB = 1.5
 MAX_BAR_LEVEL_ADJUSTMENT_DB = 9.0
 BAR_LEVEL_TRANSITION_SECONDS = 0.12
@@ -166,6 +192,8 @@ class TimingDiagnostics:
     residual_p95_ms: float | None
     timing_status: str
     warning: str | None
+    timing_grid: str = DEFAULT_GRID_LABEL
+    resolved_instrument: str | None = None
 
 
 def get_magenta_runtime() -> tuple[Any, Any, Any]:
@@ -295,6 +323,33 @@ def validate_sampling_parameters(
     return temperature, top_k, cfg_notes, cfg_drums
 
 
+def resolve_sampling_parameters(
+    temperature: float | None,
+    top_k: int | None,
+    cfg_notes: float | None,
+    cfg_drums: float | None,
+    percussion: bool,
+) -> tuple[float, int, float, float]:
+    resolved_temperature = (
+        temperature
+        if temperature is not None
+        else (0.0 if percussion else 0.2)
+    )
+    resolved_top_k = top_k if top_k is not None else 40
+    resolved_cfg_notes = (
+        cfg_notes
+        if cfg_notes is not None
+        else (7.0 if percussion else 3.0)
+    )
+    resolved_cfg_drums = cfg_drums if cfg_drums is not None else 7.0
+    return validate_sampling_parameters(
+        resolved_temperature,
+        resolved_top_k,
+        resolved_cfg_notes,
+        resolved_cfg_drums,
+    )
+
+
 def resolve_duration_seconds(duration_bars: int | None, bpm: float | None) -> float:
     bpm = validate_generation_bpm(bpm, required=True)
     if duration_bars is None:
@@ -318,8 +373,37 @@ def format_bpm_for_style_prompt(bpm: float) -> str:
     return f"{bpm:.1f}"
 
 
-def build_mrt_style_prompt(prompt: str, bpm: float, detected_key: DetectedKey, stem_role: str | None = None) -> str:
+def find_percussion_instrument(prompt: str) -> str | None:
+    matches: list[tuple[int, int, str]] = []
+    for pattern_index, (instrument, pattern) in enumerate(PERCUSSION_INSTRUMENT_PATTERNS):
+        match = re.search(pattern, prompt, flags=re.IGNORECASE)
+        if match:
+            matches.append((match.start(), pattern_index, instrument))
+    return min(matches)[2] if matches else None
+
+
+def replace_beat_wording(prompt: str) -> str:
+    prompt = re.sub(r"\bbeats\b", "rhythms", prompt, flags=re.IGNORECASE)
+    return re.sub(r"\bbeat\b", "rhythm", prompt, flags=re.IGNORECASE)
+
+
+def build_mrt_style_prompt(
+    prompt: str,
+    bpm: float,
+    detected_key: DetectedKey,
+    stem_role: str | None = None,
+    percussion_instrument: str | None = None,
+) -> str:
     clean_prompt = prompt.strip()
+    if stem_role == PERCUSSION_ROLE:
+        instrument = percussion_instrument or find_percussion_instrument(clean_prompt) or "hand percussion"
+        rhythmic_prompt = replace_beat_wording(clean_prompt)
+        return (
+            f"{format_bpm_for_style_prompt(bpm)} bpm solo isolated {instrument} "
+            "hand-percussion stem, single instrument, dry unaccompanied performance, "
+            f"{rhythmic_prompt}, strict straight eighth-note grid"
+        )
+
     stem_prefix = ""
     if stem_role:
         role_name = {
@@ -359,6 +443,20 @@ def embed_musiccoca_styles(style_model: Any, audio_prompt: Any, text_prompt: str
     return styles[0], styles[1]
 
 
+def embed_musiccoca_text_style(style_model: Any, text_prompt: str) -> np.ndarray:
+    """Embed only a constrained text prompt, excluding reference-audio style."""
+    styles = np.asarray(
+        style_model.embed([text_prompt], use_mapper=False),
+        dtype=np.float32,
+    )
+    if styles.ndim != 2 or styles.shape[0] != 1:
+        raise ValueError(
+            "MusicCoCa must return one text embedding "
+            f"with shape (1, embedding_dim); got {styles.shape}."
+        )
+    return styles[0]
+
+
 def blend_style_vectors(audio_style: Any, text_style: Any) -> np.ndarray:
     styles = np.stack([as_style_vector(audio_style), as_style_vector(text_style)])
     weights = np.array([AUDIO_STYLE_WEIGHT, TEXT_STYLE_WEIGHT], dtype=np.float32)
@@ -387,23 +485,33 @@ def frames_per_beat_for_bpm(bpm: float) -> int:
     return max(1, int(round(MRT_FRAMES_PER_SECOND * seconds_per_beat)))
 
 
-def model_frame_boundaries(bpm: float, total_beats: int) -> list[int]:
+def model_frame_boundaries(
+    bpm: float,
+    total_steps: int,
+    steps_per_beat: int = 1,
+) -> list[int]:
     validated_bpm = validate_generation_bpm(bpm, required=True)
-    if total_beats <= 0:
-        raise ValueError("total_beats must be greater than 0")
+    if total_steps <= 0:
+        raise ValueError("total_steps must be greater than 0")
+    if steps_per_beat <= 0:
+        raise ValueError("steps_per_beat must be greater than 0")
 
-    frames_per_beat = MRT_FRAMES_PER_SECOND * 60.0 / validated_bpm
+    frames_per_step = MRT_FRAMES_PER_SECOND * 60.0 / (validated_bpm * steps_per_beat)
     boundaries = [
-        int(math.floor((beat * frames_per_beat) + 0.5))
-        for beat in range(total_beats + 1)
+        int(math.floor((step * frames_per_step) + 0.5))
+        for step in range(total_steps + 1)
     ]
     if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
         raise ValueError("BPM produces a zero-length Magenta frame chunk")
     return boundaries
 
 
-def model_frame_schedule(bpm: float, total_beats: int) -> list[int]:
-    boundaries = model_frame_boundaries(bpm, total_beats)
+def model_frame_schedule(
+    bpm: float,
+    total_steps: int,
+    steps_per_beat: int = 1,
+) -> list[int]:
+    boundaries = model_frame_boundaries(bpm, total_steps, steps_per_beat)
     return [end - start for start, end in zip(boundaries, boundaries[1:])]
 
 
@@ -614,31 +722,46 @@ def align_reference_capture(
     )
 
 
-def beat_grid_features(mono: np.ndarray, sample_rate: int, bpm: float, total_beats: int) -> tuple[np.ndarray, np.ndarray]:
-    seconds_per_beat = 60.0 / bpm
-    energies = np.zeros(total_beats, dtype=np.float32)
+def grid_features(
+    mono: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    total_steps: int,
+    steps_per_beat: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    seconds_per_step = 60.0 / (bpm * steps_per_beat)
+    energies = np.zeros(total_steps, dtype=np.float32)
 
-    for beat in range(total_beats):
-        start = int(round(beat * seconds_per_beat * sample_rate))
-        end = int(round((beat + 1) * seconds_per_beat * sample_rate))
+    for step in range(total_steps):
+        start = int(round(step * seconds_per_step * sample_rate))
+        end = int(round((step + 1) * seconds_per_step * sample_rate))
         segment = mono[start:end]
         if segment.size:
-            energies[beat] = float(np.sqrt(np.mean(np.square(segment))))
+            energies[step] = float(np.sqrt(np.mean(np.square(segment))))
 
     try:
         onset_env = librosa.onset.onset_strength(y=mono, sr=sample_rate, hop_length=512)
         onset_times = librosa.frames_to_time(np.arange(len(onset_env)), sr=sample_rate, hop_length=512)
-        onset_density = np.zeros(total_beats, dtype=np.float32)
-        for beat in range(total_beats):
-            start_time = beat * seconds_per_beat
-            end_time = (beat + 1) * seconds_per_beat
+        onset_density = np.zeros(total_steps, dtype=np.float32)
+        for step in range(total_steps):
+            start_time = step * seconds_per_step
+            end_time = (step + 1) * seconds_per_step
             mask = (onset_times >= start_time) & (onset_times < end_time)
             if np.any(mask):
-                onset_density[beat] = float(np.mean(onset_env[mask]))
+                onset_density[step] = float(np.mean(onset_env[mask]))
     except Exception:
-        onset_density = np.zeros(total_beats, dtype=np.float32)
+        onset_density = np.zeros(total_steps, dtype=np.float32)
 
     return normalize_vector(energies), normalize_vector(onset_density)
+
+
+def beat_grid_features(
+    mono: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    total_beats: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    return grid_features(mono, sample_rate, bpm, total_beats, steps_per_beat=1)
 
 
 def pitch_class_energy(mono: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -730,6 +853,14 @@ def analyze_reference(
     tiled = trim_or_tile(samples, target_samples)
     mono = np.mean(tiled, axis=1)
     beat_energy, onset_density = beat_grid_features(mono, sample_rate, bpm, total_beats)
+    total_eighths = total_beats * PERCUSSION_GRID_STEPS_PER_BEAT
+    eighth_energy, eighth_onset_density = grid_features(
+        mono,
+        sample_rate,
+        bpm,
+        total_eighths,
+        PERCUSSION_GRID_STEPS_PER_BEAT,
+    )
     chroma = pitch_class_energy(mono, sample_rate)
     detected_key = detect_key(chroma)
 
@@ -739,6 +870,9 @@ def analyze_reference(
         "total_beats": total_beats,
         "beat_energy": beat_energy,
         "onset_density": onset_density,
+        "total_eighths": total_eighths,
+        "eighth_energy": eighth_energy,
+        "eighth_onset_density": eighth_onset_density,
         "pitch_classes": chroma,
         "detected_key": detected_key,
         "spectral": spectral_occupancy(mono, sample_rate),
@@ -750,10 +884,13 @@ def resolve_stem_role(
     spectral: dict[str, float],
     onset_density: np.ndarray,
     beat_energy: np.ndarray | None = None,
+    prompt: str = "",
 ) -> str:
     role = stem_role.lower().strip()
     if role in STEM_ROLES:
         return role
+    if role == "auto" and find_percussion_instrument(prompt):
+        return PERCUSSION_ROLE
 
     onset = np.clip(np.asarray(onset_density, dtype=np.float32), 0.0, 1.0)
     energy = np.clip(
@@ -866,7 +1003,67 @@ def strongest_reference_pitch_class(
     return detected_key.root_pitch_class
 
 
+def quiet_percussion_slots(
+    eighth_energy: np.ndarray,
+    eighth_onset_density: np.ndarray,
+    total_bars: int,
+) -> set[int]:
+    energy = np.clip(np.asarray(eighth_energy, dtype=np.float32), 0.0, 1.0)
+    onset = np.clip(np.asarray(eighth_onset_density, dtype=np.float32), 0.0, 1.0)
+    total_slots = total_bars * BEATS_PER_BAR * PERCUSSION_GRID_STEPS_PER_BEAT
+    if len(energy) != total_slots or len(onset) != total_slots:
+        raise ValueError("percussion analysis must contain eight slots per bar")
+
+    tie_priority = {
+        slot: priority
+        for priority, slot in enumerate(PERCUSSION_SLOT_TIE_PRIORITY)
+    }
+    selected: set[int] = set()
+    slots_per_bar = BEATS_PER_BAR * PERCUSSION_GRID_STEPS_PER_BEAT
+    for bar in range(total_bars):
+        bar_start = bar * slots_per_bar
+        ranked = sorted(
+            range(slots_per_bar),
+            key=lambda slot: (
+                float(energy[bar_start + slot] + onset[bar_start + slot]),
+                tie_priority[slot],
+            ),
+        )
+        selected.update(bar_start + slot for slot in ranked[:4])
+    return selected
+
+
+def build_percussion_conditioning(
+    analysis: dict[str, Any],
+) -> list[tuple[list[int], list[int]]]:
+    total_beats = int(analysis["total_beats"])
+    total_bars = max(1, math.ceil(total_beats / BEATS_PER_BAR))
+    total_slots = total_beats * PERCUSSION_GRID_STEPS_PER_BEAT
+    eighth_energy = np.asarray(
+        analysis.get(
+            "eighth_energy",
+            np.repeat(analysis["beat_energy"], PERCUSSION_GRID_STEPS_PER_BEAT),
+        ),
+        dtype=np.float32,
+    )[:total_slots]
+    eighth_onset = np.asarray(
+        analysis.get(
+            "eighth_onset_density",
+            np.repeat(analysis["onset_density"], PERCUSSION_GRID_STEPS_PER_BEAT),
+        ),
+        dtype=np.float32,
+    )[:total_slots]
+    selected = quiet_percussion_slots(eighth_energy, eighth_onset, total_bars)
+    return [
+        ([0] * 128, [1 if slot in selected else 0])
+        for slot in range(total_slots)
+    ]
+
+
 def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[list[int], list[int]]]:
+    if stem_role == PERCUSSION_ROLE:
+        return build_percussion_conditioning(analysis)
+
     role = resolve_stem_role(stem_role, analysis["spectral"], analysis["onset_density"], analysis["beat_energy"])
     beat_energy = analysis["beat_energy"]
     onset_density = analysis["onset_density"]
@@ -1076,6 +1273,7 @@ def analyze_onset_alignment(
     samples: np.ndarray,
     sample_rate: int,
     bpm: float,
+    steps_per_beat: int = DEFAULT_GRID_STEPS_PER_BEAT,
 ) -> OnsetAlignment:
     onset_samples, strengths = _confident_onset_samples(samples, sample_rate)
     if onset_samples.size == 0:
@@ -1086,17 +1284,17 @@ def analyze_onset_alignment(
             phase_confidence=0.0,
         )
 
-    sixteenth_samples = sample_rate * 60.0 / (bpm * 4.0)
+    grid_samples = sample_rate * 60.0 / (bpm * steps_per_beat)
     signed_errors = (
-        (onset_samples + (sixteenth_samples / 2.0)) % sixteenth_samples
-    ) - (sixteenth_samples / 2.0)
+        (onset_samples + (grid_samples / 2.0)) % grid_samples
+    ) - (grid_samples / 2.0)
     absolute_errors_ms = np.abs(signed_errors) * 1000.0 / sample_rate
-    angles = signed_errors * (2.0 * math.pi / sixteenth_samples)
+    angles = signed_errors * (2.0 * math.pi / grid_samples)
     weights = strengths / max(float(np.sum(strengths)), 1e-8)
     mean_vector = np.sum(weights * np.exp(1j * angles))
     phase_confidence = float(np.abs(mean_vector))
     phase_error_samples = (
-        float(np.angle(mean_vector)) * sixteenth_samples / (2.0 * math.pi)
+        float(np.angle(mean_vector)) * grid_samples / (2.0 * math.pi)
         if phase_confidence > 1e-8
         else 0.0
     )
@@ -1124,12 +1322,16 @@ def apply_circular_phase_shift(samples: np.ndarray, shift_samples: int) -> np.nd
     return np.roll(samples, bounded_shift, axis=0)
 
 
-def residual_alignment_exceeds_threshold(alignment: OnsetAlignment) -> bool:
+def residual_alignment_exceeds_threshold(
+    alignment: OnsetAlignment,
+    max_median_ms: float = MAX_MEDIAN_ALIGNMENT_MS,
+    max_p95_ms: float = MAX_P95_ALIGNMENT_MS,
+) -> bool:
     if alignment.median_ms is None or alignment.p95_ms is None:
         return False
     return (
-        alignment.median_ms > MAX_MEDIAN_ALIGNMENT_MS
-        or alignment.p95_ms > MAX_P95_ALIGNMENT_MS
+        alignment.median_ms > max_median_ms
+        or alignment.p95_ms > max_p95_ms
     )
 
 
@@ -1138,6 +1340,7 @@ def add_confident_subdivision_anchors(
     sample_rate: int,
     bpm: float,
     base_time_map: list[tuple[int, int]],
+    steps_per_beat: int = DEFAULT_GRID_STEPS_PER_BEAT,
 ) -> list[tuple[int, int]]:
     onset_samples, strengths = _confident_onset_samples(samples, sample_rate)
     if onset_samples.size == 0:
@@ -1145,18 +1348,18 @@ def add_confident_subdivision_anchors(
 
     source_points = np.array([point[0] for point in base_time_map], dtype=np.float64)
     target_points = np.array([point[1] for point in base_time_map], dtype=np.float64)
-    sixteenth_samples = sample_rate * 60.0 / (bpm * 4.0)
+    grid_samples = sample_rate * 60.0 / (bpm * steps_per_beat)
     candidate_anchors: list[tuple[int, int]] = []
     strong_threshold = float(np.quantile(strengths, 0.35))
     maximum_anchor_error = min(
-        0.45 * sixteenth_samples,
+        0.45 * grid_samples,
         MAX_PHASE_SHIFT_SECONDS * sample_rate,
     )
     for onset_sample, strength in zip(onset_samples, strengths):
         if strength < strong_threshold:
             continue
         mapped_target = float(np.interp(onset_sample, source_points, target_points))
-        quantized_target = int(round(mapped_target / sixteenth_samples) * sixteenth_samples)
+        quantized_target = int(round(mapped_target / grid_samples) * grid_samples)
         if abs(mapped_target - quantized_target) <= maximum_anchor_error:
             candidate_anchors.append((int(onset_sample), quantized_target))
 
@@ -1178,38 +1381,88 @@ def add_confident_subdivision_anchors(
     return dense_map
 
 
+def replace_confident_grid_anchors(
+    samples: np.ndarray,
+    sample_rate: int,
+    bpm: float,
+    base_time_map: list[tuple[int, int]],
+    steps_per_beat: int,
+) -> list[tuple[int, int]]:
+    """Replace each grid slot's source anchor with its strongest nearby attack."""
+    onset_samples, strengths = _confident_onset_samples(samples, sample_rate)
+    if onset_samples.size == 0 or len(base_time_map) < 3:
+        return base_time_map
+
+    source_points = np.array([point[0] for point in base_time_map], dtype=np.float64)
+    target_points = np.array([point[1] for point in base_time_map], dtype=np.float64)
+    grid_samples = sample_rate * 60.0 / (bpm * steps_per_beat)
+    maximum_anchor_error = min(
+        0.45 * grid_samples,
+        MAX_PHASE_SHIFT_SECONDS * sample_rate,
+    )
+    strongest_by_slot: dict[int, tuple[int, float]] = {}
+    for onset_sample, strength in zip(onset_samples, strengths):
+        mapped_target = float(np.interp(onset_sample, source_points, target_points))
+        slot = int(round(mapped_target / grid_samples))
+        if slot <= 0 or slot >= len(base_time_map) - 1:
+            continue
+        slot_target = float(base_time_map[slot][1])
+        if abs(mapped_target - slot_target) > maximum_anchor_error:
+            continue
+        previous = strongest_by_slot.get(slot)
+        if previous is None or float(strength) > previous[1]:
+            strongest_by_slot[slot] = (int(onset_sample), float(strength))
+
+    replaced = list(base_time_map)
+    for slot in sorted(strongest_by_slot):
+        source_sample = strongest_by_slot[slot][0]
+        if replaced[slot - 1][0] < source_sample < replaced[slot + 1][0]:
+            replaced[slot] = (source_sample, replaced[slot][1])
+    return replaced
+
+
 def onset_alignment_improves(
     candidate: OnsetAlignment,
     baseline: OnsetAlignment,
 ) -> bool:
-    candidate_values = (candidate.p95_ms, candidate.median_ms)
-    baseline_values = (baseline.p95_ms, baseline.median_ms)
-    if candidate_values[0] is None and candidate_values[1] is None:
+    candidate_values = (candidate.median_ms, candidate.p95_ms)
+    baseline_values = (baseline.median_ms, baseline.p95_ms)
+    if all(value is None for value in candidate_values):
         return False
-    if baseline_values[0] is None and baseline_values[1] is None:
+    if all(value is None for value in baseline_values):
         return True
 
-    candidate_error = tuple(
-        value if value is not None else math.inf
-        for value in candidate_values
+    candidate_error = np.array(
+        [
+            value if value is not None else math.inf
+            for value in candidate_values
+        ],
+        dtype=np.float64,
     )
-    baseline_error = tuple(
-        value if value is not None else math.inf
-        for value in baseline_values
+    baseline_error = np.array(
+        [
+            value if value is not None else math.inf
+            for value in baseline_values
+        ],
+        dtype=np.float64,
     )
-    return candidate_error < baseline_error
+    return bool(
+        np.all(candidate_error <= baseline_error)
+        and np.any(candidate_error < baseline_error)
+    )
 
 
 def _phase_correct_and_measure(
     samples: np.ndarray,
     sample_rate: int,
     bpm: float,
+    steps_per_beat: int = DEFAULT_GRID_STEPS_PER_BEAT,
 ) -> tuple[np.ndarray, float, OnsetAlignment]:
-    initial_alignment = analyze_onset_alignment(samples, sample_rate, bpm)
+    initial_alignment = analyze_onset_alignment(samples, sample_rate, bpm, steps_per_beat)
     shifted = apply_circular_phase_shift(samples, initial_alignment.phase_shift_samples)
     phase_shift_ms = initial_alignment.phase_shift_samples * 1000.0 / sample_rate
     final_alignment = (
-        analyze_onset_alignment(shifted, sample_rate, bpm)
+        analyze_onset_alignment(shifted, sample_rate, bpm, steps_per_beat)
         if initial_alignment.phase_shift_samples
         else initial_alignment
     )
@@ -1224,6 +1477,10 @@ def correct_generation_timing(
     frame_boundaries: list[int],
     rubberband_executable: str | None = None,
     quantize_transients: bool = False,
+    grid_steps_per_beat: int = DEFAULT_GRID_STEPS_PER_BEAT,
+    replace_grid_anchors: bool = False,
+    max_median_ms: float = MAX_MEDIAN_ALIGNMENT_MS,
+    max_p95_ms: float = MAX_P95_ALIGNMENT_MS,
 ) -> TimingCorrection:
     target_samples = int(round(duration_seconds * sample_rate))
     beat_time_map = build_beat_time_map(frame_boundaries, len(samples), target_samples)
@@ -1247,16 +1504,31 @@ def correct_generation_timing(
                 corrected,
                 sample_rate,
                 bpm,
+                grid_steps_per_beat,
             )
             correction_type = "rubberband_beat_map"
-            if quantize_transients or residual_alignment_exceeds_threshold(alignment):
-                dense_time_map = add_confident_subdivision_anchors(
-                    samples,
-                    sample_rate,
-                    bpm,
-                    beat_time_map,
-                )
-                if len(dense_time_map) > len(beat_time_map):
+            if quantize_transients or residual_alignment_exceeds_threshold(
+                alignment,
+                max_median_ms,
+                max_p95_ms,
+            ):
+                if replace_grid_anchors:
+                    dense_time_map = replace_confident_grid_anchors(
+                        samples,
+                        sample_rate,
+                        bpm,
+                        beat_time_map,
+                        grid_steps_per_beat,
+                    )
+                else:
+                    dense_time_map = add_confident_subdivision_anchors(
+                        samples,
+                        sample_rate,
+                        bpm,
+                        beat_time_map,
+                        grid_steps_per_beat,
+                    )
+                if dense_time_map != beat_time_map:
                     dense = _run_rubberband_time_map(
                         samples,
                         sample_rate,
@@ -1268,12 +1540,17 @@ def correct_generation_timing(
                         dense,
                         sample_rate,
                         bpm,
+                        grid_steps_per_beat,
                     )
                     if onset_alignment_improves(dense_alignment, alignment):
                         corrected = dense
                         phase_shift_ms = dense_phase_shift_ms
                         alignment = dense_alignment
-                        correction_type = "rubberband_subdivision_map"
+                        correction_type = (
+                            "rubberband_eighth_map"
+                            if replace_grid_anchors and grid_steps_per_beat == 2
+                            else "rubberband_subdivision_map"
+                        )
             return TimingCorrection(
                 samples=exact_length(corrected, target_samples),
                 correction_type=correction_type,
@@ -1293,6 +1570,7 @@ def correct_generation_timing(
         corrected,
         sample_rate,
         bpm,
+        grid_steps_per_beat,
     )
     return TimingCorrection(
         samples=exact_length(corrected, target_samples),
@@ -1438,10 +1716,11 @@ def post_process_generation(
     duration_seconds: float,
     avoid_clash: bool,
     duration_bars: int | None = None,
+    stem_role: str | None = None,
 ) -> np.ndarray:
     target_samples = int(round(duration_seconds * sample_rate))
     output = exact_length(samples, target_samples)
-    if avoid_clash:
+    if avoid_clash and stem_role != PERCUSSION_ROLE:
         output = apply_spectral_ducking(output, trim_or_tile(reference, target_samples), sample_rate)
     if duration_bars is not None:
         output = level_bar_dynamics(output, sample_rate, duration_bars)
@@ -1522,10 +1801,10 @@ async def generate(
     bpm: float | None = Form(None, description="Project tempo in beats per minute"),
     stem_role: str = Form("auto", description="Complementary stem role: auto, melody, bass, drums, or texture"),
     avoid_clash: bool = Form(True, description="Apply spectral anti-clash processing"),
-    temperature: float = Form(0.2, description="MRT sampling temperature"),
-    top_k: int = Form(40, description="MRT top-k sampling threshold"),
-    cfg_notes: float = Form(3.0, description="MRT notes classifier-free guidance"),
-    cfg_drums: float = Form(7.0, description="MRT drums classifier-free guidance"),
+    temperature: float | None = Form(None, description="MRT sampling temperature"),
+    top_k: int | None = Form(None, description="MRT top-k sampling threshold"),
+    cfg_notes: float | None = Form(None, description="MRT notes classifier-free guidance"),
+    cfg_drums: float | None = Form(None, description="MRT drums classifier-free guidance"),
 ):
     """
     Generate music blending an uploaded audio file with a text prompt.
@@ -1535,11 +1814,15 @@ async def generate(
     # --- Resolve and validate duration ---
     generation_bpm = validate_generation_bpm(bpm, required=True)
     duration_seconds = resolve_duration_seconds(duration_bars, bpm)
-    temperature, top_k, cfg_notes, cfg_drums = validate_sampling_parameters(
+    requested_role = stem_role.lower().strip()
+    percussion_instrument = find_percussion_instrument(prompt)
+    prompt_routes_to_percussion = requested_role == "auto" and percussion_instrument is not None
+    temperature, top_k, cfg_notes, cfg_drums = resolve_sampling_parameters(
         temperature,
         top_k,
         cfg_notes,
         cfg_drums,
+        prompt_routes_to_percussion,
     )
 
     try:
@@ -1569,19 +1852,6 @@ async def generate(
             generation_bpm,
             int(duration_bars),
         )
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as aligned_file:
-            aligned_path = aligned_file.name
-        sf.write(
-            aligned_path,
-            capture_alignment.samples,
-            MAGENTA_SAMPLE_RATE,
-            subtype="FLOAT",
-        )
-        try:
-            my_audio = audio.Waveform.from_file(aligned_path)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not prepare aligned audio: {e}")
-
         analysis = analyze_reference(
             capture_alignment.samples,
             MAGENTA_SAMPLE_RATE,
@@ -1594,6 +1864,7 @@ async def generate(
             analysis["spectral"],
             analysis["onset_density"],
             analysis["beat_energy"],
+            prompt,
         )
         conditioning = build_conditioning(analysis, resolved_stem_role)
         detected_key: DetectedKey = analysis["detected_key"]
@@ -1607,19 +1878,58 @@ async def generate(
             f"confidence={detected_key.confidence:.3f}, "
             f"scale_pcs={scale_pitch_classes})"
         )
-        print(f"Resolved stem role: {resolved_stem_role}")
+        resolved_instrument = (
+            percussion_instrument
+            if resolved_stem_role == PERCUSSION_ROLE
+            else None
+        )
+        print(
+            f"Resolved stem role: {resolved_stem_role}; "
+            f"instrument: {resolved_instrument or 'n/a'}"
+        )
 
-        # --- Blend styles ---
-        mrt_style_prompt = build_mrt_style_prompt(prompt, generation_bpm, detected_key, resolved_stem_role)
+        # --- Condition style ---
+        mrt_style_prompt = build_mrt_style_prompt(
+            prompt,
+            generation_bpm,
+            detected_key,
+            resolved_stem_role,
+            resolved_instrument,
+        )
         print(f"MRT style prompt: {mrt_style_prompt}")
-        audio_style, text_style = embed_musiccoca_styles(style_model, my_audio, mrt_style_prompt)
-        log_style_embedding_norms(audio_style, text_style)
-        blended_style = blend_style_vectors(audio_style, text_style)
+        if resolved_stem_role == PERCUSSION_ROLE:
+            generation_style = embed_musiccoca_text_style(style_model, mrt_style_prompt)
+            print(
+                "MusicCoCa text-only embedding norm: "
+                f"{float(np.linalg.norm(generation_style)):.3f}"
+            )
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as aligned_file:
+                aligned_path = aligned_file.name
+            sf.write(
+                aligned_path,
+                capture_alignment.samples,
+                MAGENTA_SAMPLE_RATE,
+                subtype="FLOAT",
+            )
+            try:
+                my_audio = audio.Waveform.from_file(aligned_path)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Could not prepare aligned audio: {e}")
+            audio_style, text_style = embed_musiccoca_styles(style_model, my_audio, mrt_style_prompt)
+            log_style_embedding_norms(audio_style, text_style)
+            generation_style = blend_style_vectors(audio_style, text_style)
 
-        # --- Generate beat-grid chunks ---
+        # --- Generate grid-aligned chunks ---
+        steps_per_beat = (
+            PERCUSSION_GRID_STEPS_PER_BEAT
+            if resolved_stem_role == PERCUSSION_ROLE
+            else 1
+        )
         frame_boundaries = model_frame_boundaries(
             generation_bpm,
             len(conditioning),
+            steps_per_beat,
         )
         frame_schedule = [
             end - start
@@ -1627,7 +1937,7 @@ async def generate(
         ]
         chunks = generate_conditioned_chunks(
             mrt,
-            blended_style,
+            generation_style,
             conditioning,
             frame_schedule,
             temperature,
@@ -1645,7 +1955,23 @@ async def generate(
             generation_bpm,
             duration_seconds,
             frame_boundaries,
-            quantize_transients=resolved_stem_role in {"drums", "melody"},
+            quantize_transients=resolved_stem_role in {"drums", "melody", PERCUSSION_ROLE},
+            grid_steps_per_beat=(
+                PERCUSSION_GRID_STEPS_PER_BEAT
+                if resolved_stem_role == PERCUSSION_ROLE
+                else DEFAULT_GRID_STEPS_PER_BEAT
+            ),
+            replace_grid_anchors=resolved_stem_role == PERCUSSION_ROLE,
+            max_median_ms=(
+                PERCUSSION_MAX_MEDIAN_ALIGNMENT_MS
+                if resolved_stem_role == PERCUSSION_ROLE
+                else MAX_MEDIAN_ALIGNMENT_MS
+            ),
+            max_p95_ms=(
+                PERCUSSION_MAX_P95_ALIGNMENT_MS
+                if resolved_stem_role == PERCUSSION_ROLE
+                else MAX_P95_ALIGNMENT_MS
+            ),
         )
         processed = post_process_generation(
             timing_correction.samples,
@@ -1654,9 +1980,24 @@ async def generate(
             duration_seconds,
             avoid_clash,
             duration_bars,
+            resolved_stem_role,
         )
         residual_warning = None
-        if residual_alignment_exceeds_threshold(timing_correction.alignment):
+        max_median_ms = (
+            PERCUSSION_MAX_MEDIAN_ALIGNMENT_MS
+            if resolved_stem_role == PERCUSSION_ROLE
+            else MAX_MEDIAN_ALIGNMENT_MS
+        )
+        max_p95_ms = (
+            PERCUSSION_MAX_P95_ALIGNMENT_MS
+            if resolved_stem_role == PERCUSSION_ROLE
+            else MAX_P95_ALIGNMENT_MS
+        )
+        if residual_alignment_exceeds_threshold(
+            timing_correction.alignment,
+            max_median_ms,
+            max_p95_ms,
+        ):
             residual_warning = "Residual onset alignment remains above the timing target."
         warning = combine_timing_warnings(
             capture_alignment.warning,
@@ -1682,6 +2023,12 @@ async def generate(
             residual_p95_ms=timing_correction.alignment.p95_ms,
             timing_status=timing_status,
             warning=warning,
+            timing_grid=(
+                PERCUSSION_GRID_LABEL
+                if resolved_stem_role == PERCUSSION_ROLE
+                else DEFAULT_GRID_LABEL
+            ),
+            resolved_instrument=resolved_instrument,
         )
         logger.info(
             "Magenta timing diagnostics: %s",
