@@ -26,6 +26,7 @@ interface DeckState {
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
 type EqBand = 'hi' | 'mid' | 'low'
+type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -126,6 +127,9 @@ const btnGenerate = el<HTMLButtonElement>('btn-generate')
 const magicDot = el<HTMLSpanElement>('magic-dot')
 const magicStatusLabel = el<HTMLSpanElement>('magic-status-label')
 const magicPrompt = el<HTMLInputElement>('magic-prompt')
+const magicStemRoleInputs = Array.from(
+  document.querySelectorAll<HTMLInputElement>('input[name="magic-stem-role"]'),
+)
 const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -1289,6 +1293,20 @@ function describeMagentaError(error: unknown) {
 }
 
 // ── MAGENTA ───────────────────────────────────────────────────────────────────
+function selectedMagicStemRole(): StemRole {
+  const selected = magicStemRoleInputs.find((input) => input.checked)?.value
+  if (selected === 'drums' || selected === 'bass' || selected === 'melody' || selected === 'texture') {
+    return selected
+  }
+  return 'auto'
+}
+
+function setMagicStemRoleDisabled(disabled: boolean) {
+  magicStemRoleInputs.forEach((input) => {
+    input.disabled = disabled
+  })
+}
+
 async function generateMagicAudio() {
   const promptText = magicPrompt.value.trim()
   if (!promptText) { setMagicStatus('error', 'PROMPT REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
@@ -1303,7 +1321,10 @@ async function generateMagicAudio() {
     return
   }
 
-  setMagicStatus('generating', 'PREPARING AUDIO CAPTURE'); btnGenerate.disabled = true
+  const stemRole = selectedMagicStemRole()
+  setMagicStatus('generating', 'PREPARING AUDIO CAPTURE')
+  btnGenerate.disabled = true
+  setMagicStemRoleDisabled(true)
   try {
     await ensureLiveAudioCapture()
     const reference = await captureReferenceAudio(generationBpm)
@@ -1312,7 +1333,7 @@ async function generateMagicAudio() {
     form.append('prompt', promptText)
     form.append('duration_bars', String(MAGIC_DURATION_BARS))
     form.append('bpm', String(generationBpm))
-    form.append('stem_role', 'auto')
+    form.append('stem_role', stemRole)
     form.append('avoid_clash', 'true')
 
     setMagicStatus('generating', `MAGENTA ← ${reference.sourceLabel}`)
@@ -1364,7 +1385,10 @@ async function generateMagicAudio() {
     setMagicStatus('error', message.toUpperCase().slice(0, 48))
     setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
   }
-  finally { btnGenerate.disabled = false }
+  finally {
+    btnGenerate.disabled = false
+    setMagicStemRoleDisabled(false)
+  }
 }
 
 // ── DROP ZONES ────────────────────────────────────────────────────────────────

@@ -194,6 +194,32 @@
             <label class="magic-config-label">PROMPT</label>
             <input type="text" id="magic-prompt" class="magic-input magic-prompt" value="dark trap 808s" />
           </div>
+          <div class="magic-config-row magic-role-row">
+            <span class="magic-config-label">STEM ROLE</span>
+            <div class="magic-role-options" role="radiogroup" aria-label="Generated stem role">
+              <label class="magic-toggle" for="magic-role-auto">
+                <input type="radio" id="magic-role-auto" name="magic-stem-role" value="auto" class="magic-toggle-input" checked />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>AUTO</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-drums">
+                <input type="radio" id="magic-role-drums" name="magic-stem-role" value="drums" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>DRUMS</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-bass">
+                <input type="radio" id="magic-role-bass" name="magic-stem-role" value="bass" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>BASS</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-melody">
+                <input type="radio" id="magic-role-melody" name="magic-stem-role" value="melody" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>MELODY</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-texture">
+                <input type="radio" id="magic-role-texture" name="magic-stem-role" value="texture" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>TEXTURE</span>
+              </label>
+            </div>
+            <span class="magic-toggle-hint">SELECT ONE ROLE</span>
+          </div>
           <div class="magic-duration-label">DURATION: 4 BARS</div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE FROM LIVE AUDIO</button>
           <div class="magic-playback-row">
