@@ -285,13 +285,13 @@ class MagentaServerHelperTests(unittest.TestCase):
                     expected_seconds,
                 )
 
-    def test_blend_style_vectors_uses_text_style_only(self):
+    def test_blend_style_vectors_uses_25_75_weighting(self):
         blended = blend_style_vectors(
             np.array([[2.0, 0.0]], dtype=np.float32),
             np.array([0.0, 6.0], dtype=np.float32),
         )
 
-        np.testing.assert_allclose(blended, np.array([0.0, 6.0], dtype=np.float32))
+        np.testing.assert_allclose(blended, np.array([0.5, 4.5], dtype=np.float32))
 
     def test_frames_per_beat_changes_inversely_with_bpm(self):
         frames_at_80 = frames_per_beat_for_bpm(80)

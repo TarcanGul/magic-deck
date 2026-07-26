@@ -48,8 +48,8 @@ MRT_FRAMES_PER_SECOND = 25.0
 BEATS_PER_BAR = 4
 MIN_GENERATION_BPM = 40.0
 MAX_GENERATION_BPM = 240.0
-AUDIO_STYLE_WEIGHT = 0.0
-TEXT_STYLE_WEIGHT = 1.0
+AUDIO_STYLE_WEIGHT = 0.25
+TEXT_STYLE_WEIGHT = 0.75
 PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 MAJOR_SCALE = np.array([0, 2, 4, 5, 7, 9, 11], dtype=np.int16)
 MINOR_SCALE = np.array([0, 2, 3, 5, 7, 8, 10], dtype=np.int16)
@@ -1421,14 +1421,15 @@ async def generate(
         for (notes, drums), frames in zip(conditioning, frame_schedule):
             chunk, state = mrt.generate(
                 style=blended_style,
+                drums=[0],
                 notes=notes,
-                drums=drums,
-                cfg_notes=cfg_notes,
-                cfg_drums=cfg_drums,
-                temperature=temperature,
                 top_k=top_k,
                 state=state,
                 frames=frames,
+                temperature=1.1,
+                cfg_musiccoca=7.0,
+                cfg_notes=2.0,
+                cfg_drums=7.0
             )
             chunks.append(chunk)
 
