@@ -66,8 +66,8 @@ EQ_BANDS = {
 }
 STEM_ROLES = {"melody", "bass", "drums", "texture"}
 PERCUSSION_ROLE = "percussion"
-PERCUSSION_GRID_STEPS_PER_BEAT = 2
-PERCUSSION_GRID_LABEL = "1/8"
+PERCUSSION_GRID_STEPS_PER_BEAT = 1
+PERCUSSION_GRID_LABEL = "1/4"
 DEFAULT_GRID_STEPS_PER_BEAT = 4
 DEFAULT_GRID_LABEL = "1/16"
 PERCUSSION_INSTRUMENT_PATTERNS = (
@@ -87,7 +87,7 @@ PERCUSSION_INSTRUMENT_PATTERNS = (
     ("hand drum", r"\bhand[\s-]+drums?\b"),
     ("hand percussion", r"\bhand[\s-]+percussion\b"),
 )
-PERCUSSION_SLOT_TIE_PRIORITY = (1, 3, 5, 7, 0, 4, 2, 6)
+PERCUSSION_SLOT_TIE_PRIORITY = (1, 3, 0, 2)
 ROLE_NOTE_RANGES = {
     "bass": range(36, 53),
     "texture": range(60, 85),
@@ -333,7 +333,7 @@ def resolve_sampling_parameters(
     resolved_temperature = (
         temperature
         if temperature is not None
-        else (0.0 if percussion else 0.2)
+        else (0.1 if percussion else 0.2)
     )
     resolved_top_k = top_k if top_k is not None else 40
     resolved_cfg_notes = (
@@ -401,7 +401,7 @@ def build_mrt_style_prompt(
         return (
             f"{format_bpm_for_style_prompt(bpm)} bpm solo isolated {instrument} "
             "hand-percussion stem, single instrument, dry unaccompanied performance, "
-            f"{rhythmic_prompt}, strict straight eighth-note grid"
+            f"{rhythmic_prompt}, strict straight quarter-note grid"
         )
 
     stem_prefix = ""
@@ -853,12 +853,12 @@ def analyze_reference(
     tiled = trim_or_tile(samples, target_samples)
     mono = np.mean(tiled, axis=1)
     beat_energy, onset_density = beat_grid_features(mono, sample_rate, bpm, total_beats)
-    total_eighths = total_beats * PERCUSSION_GRID_STEPS_PER_BEAT
-    eighth_energy, eighth_onset_density = grid_features(
+    total_percussion_steps = total_beats * PERCUSSION_GRID_STEPS_PER_BEAT
+    percussion_grid_energy, percussion_grid_onset_density = grid_features(
         mono,
         sample_rate,
         bpm,
-        total_eighths,
+        total_percussion_steps,
         PERCUSSION_GRID_STEPS_PER_BEAT,
     )
     chroma = pitch_class_energy(mono, sample_rate)
@@ -870,9 +870,9 @@ def analyze_reference(
         "total_beats": total_beats,
         "beat_energy": beat_energy,
         "onset_density": onset_density,
-        "total_eighths": total_eighths,
-        "eighth_energy": eighth_energy,
-        "eighth_onset_density": eighth_onset_density,
+        "total_percussion_steps": total_percussion_steps,
+        "percussion_grid_energy": percussion_grid_energy,
+        "percussion_grid_onset_density": percussion_grid_onset_density,
         "pitch_classes": chroma,
         "detected_key": detected_key,
         "spectral": spectral_occupancy(mono, sample_rate),
@@ -1004,15 +1004,15 @@ def strongest_reference_pitch_class(
 
 
 def quiet_percussion_slots(
-    eighth_energy: np.ndarray,
-    eighth_onset_density: np.ndarray,
+    grid_energy: np.ndarray,
+    grid_onset_density: np.ndarray,
     total_bars: int,
 ) -> set[int]:
-    energy = np.clip(np.asarray(eighth_energy, dtype=np.float32), 0.0, 1.0)
-    onset = np.clip(np.asarray(eighth_onset_density, dtype=np.float32), 0.0, 1.0)
+    energy = np.clip(np.asarray(grid_energy, dtype=np.float32), 0.0, 1.0)
+    onset = np.clip(np.asarray(grid_onset_density, dtype=np.float32), 0.0, 1.0)
     total_slots = total_bars * BEATS_PER_BAR * PERCUSSION_GRID_STEPS_PER_BEAT
     if len(energy) != total_slots or len(onset) != total_slots:
-        raise ValueError("percussion analysis must contain eight slots per bar")
+        raise ValueError("percussion analysis must contain four slots per bar")
 
     tie_priority = {
         slot: priority
@@ -1039,21 +1039,21 @@ def build_percussion_conditioning(
     total_beats = int(analysis["total_beats"])
     total_bars = max(1, math.ceil(total_beats / BEATS_PER_BAR))
     total_slots = total_beats * PERCUSSION_GRID_STEPS_PER_BEAT
-    eighth_energy = np.asarray(
+    grid_energy = np.asarray(
         analysis.get(
-            "eighth_energy",
+            "percussion_grid_energy",
             np.repeat(analysis["beat_energy"], PERCUSSION_GRID_STEPS_PER_BEAT),
         ),
         dtype=np.float32,
     )[:total_slots]
-    eighth_onset = np.asarray(
+    grid_onset = np.asarray(
         analysis.get(
-            "eighth_onset_density",
+            "percussion_grid_onset_density",
             np.repeat(analysis["onset_density"], PERCUSSION_GRID_STEPS_PER_BEAT),
         ),
         dtype=np.float32,
     )[:total_slots]
-    selected = quiet_percussion_slots(eighth_energy, eighth_onset, total_bars)
+    selected = quiet_percussion_slots(grid_energy, grid_onset, total_bars)
     return [
         ([0] * 128, [1 if slot in selected else 0])
         for slot in range(total_slots)
@@ -1547,8 +1547,8 @@ def correct_generation_timing(
                         phase_shift_ms = dense_phase_shift_ms
                         alignment = dense_alignment
                         correction_type = (
-                            "rubberband_eighth_map"
-                            if replace_grid_anchors and grid_steps_per_beat == 2
+                            "rubberband_quarter_map"
+                            if replace_grid_anchors and grid_steps_per_beat == 1
                             else "rubberband_subdivision_map"
                         )
             return TimingCorrection(
