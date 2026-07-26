@@ -48,6 +48,11 @@ MRT_FRAMES_PER_SECOND = 25.0
 BEATS_PER_BAR = 4
 MIN_GENERATION_BPM = 40.0
 MAX_GENERATION_BPM = 240.0
+MIN_SAMPLING_TEMPERATURE = 0.0
+MAX_SAMPLING_TEMPERATURE = 2.0
+MIN_CFG_SCALE = -1.0
+MAX_CFG_SCALE = 7.0
+MIN_KEY_MODE_CONFIDENCE = 0.08
 AUDIO_STYLE_WEIGHT = 0.25
 TEXT_STYLE_WEIGHT = 0.75
 PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -256,6 +261,37 @@ def validate_generation_bpm(bpm: float | None, required: bool = True) -> float |
     return bpm
 
 
+def validate_sampling_parameters(
+    temperature: float,
+    top_k: int,
+    cfg_notes: float,
+    cfg_drums: float,
+) -> tuple[float, int, float, float]:
+    if not math.isfinite(temperature):
+        raise HTTPException(status_code=400, detail="temperature must be a finite number.")
+    if temperature < MIN_SAMPLING_TEMPERATURE or temperature > MAX_SAMPLING_TEMPERATURE:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"temperature must be between {MIN_SAMPLING_TEMPERATURE:g} "
+                f"and {MAX_SAMPLING_TEMPERATURE:g}."
+            ),
+        )
+    if top_k <= 0:
+        raise HTTPException(status_code=400, detail="top_k must be greater than 0.")
+
+    for name, value in (("cfg_notes", cfg_notes), ("cfg_drums", cfg_drums)):
+        if not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"{name} must be a finite number.")
+        if value < MIN_CFG_SCALE or value > MAX_CFG_SCALE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be between {MIN_CFG_SCALE:g} and {MAX_CFG_SCALE:g}.",
+            )
+
+    return temperature, top_k, cfg_notes, cfg_drums
+
+
 def resolve_duration_seconds(duration_bars: int | None, bpm: float | None) -> float:
     bpm = validate_generation_bpm(bpm, required=True)
     if duration_bars is None:
@@ -283,15 +319,20 @@ def build_mrt_style_prompt(prompt: str, bpm: float, detected_key: DetectedKey, s
     clean_prompt = prompt.strip()
     stem_prefix = ""
     if stem_role:
-        role_name = "drum" if stem_role == "drums" else stem_role
+        role_name = {
+            "drums": "drum",
+            "melody": "solo monophonic synthesizer melody",
+        }.get(stem_role, stem_role)
         stem_prefix = f"{role_name} stem, "
     grid_prompt = ""
     if stem_role == "drums":
         grid_prompt = ", tightly quantized to a straight 4/4 project grid"
-    return (
-        f"{format_bpm_for_style_prompt(bpm)} bpm {stem_prefix}{clean_prompt}"
-        f"{grid_prompt} in {detected_key.name}"
+    key_prompt = (
+        f" in {detected_key.name}"
+        if detected_key.confidence >= MIN_KEY_MODE_CONFIDENCE
+        else f", centered on {PITCH_CLASS_NAMES[detected_key.root_pitch_class]}"
     )
+    return f"{format_bpm_for_style_prompt(bpm)} bpm {stem_prefix}{clean_prompt}{grid_prompt}{key_prompt}"
 
 
 def as_style_vector(style: Any) -> np.ndarray:
@@ -808,6 +849,20 @@ def add_texture_chord(notes: list[int], root_pc: int, scale_pcs: list[int], midi
             previous_note = note
 
 
+def strongest_reference_pitch_class(
+    detected_key: DetectedKey,
+    chroma: np.ndarray,
+) -> int:
+    values = np.asarray(chroma, dtype=np.float32)
+    if (
+        detected_key.confidence < MIN_KEY_MODE_CONFIDENCE
+        and values.size == 12
+        and float(np.max(values)) > 1e-8
+    ):
+        return int(np.argmax(values))
+    return detected_key.root_pitch_class
+
+
 def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[list[int], list[int]]]:
     role = resolve_stem_role(stem_role, analysis["spectral"], analysis["onset_density"], analysis["beat_energy"])
     beat_energy = analysis["beat_energy"]
@@ -820,9 +875,14 @@ def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[l
     threshold = conditioning_threshold(fill_scores, role)
     conditioning: list[tuple[list[int], list[int]]] = []
     held_note: int | None = None
+    motif_root_pc = strongest_reference_pitch_class(
+        analysis["detected_key"],
+        analysis["pitch_classes"],
+    )
+    motif_pitch_classes = (motif_root_pc, (motif_root_pc + 7) % 12)
 
     for beat in range(total_beats):
-        notes = [-1] * 128
+        notes = [0] * 128
         drums = [0]
         beat_in_bar = beat % BEATS_PER_BAR
         is_downbeat = beat_in_bar == 0
@@ -832,6 +892,16 @@ def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[l
             sparse_beat = onset_density[beat] < 0.68
             trigger_drum = is_downbeat or ((should_fill or beat_in_bar == 2) and sparse_beat)
             drums = [1 if trigger_drum else 0]
+        elif role == "melody":
+            bar = beat // BEATS_PER_BAR
+            note = choose_midi_note(
+                motif_pitch_classes[bar % len(motif_pitch_classes)],
+                midi_range,
+            )
+            if beat_in_bar == 0:
+                notes[note] = 2
+            elif beat_in_bar == 1:
+                notes[note] = 1
         else:
             should_anchor = is_downbeat and (role in {"bass", "texture"} or fill_scores[beat] > 0.20)
             if should_fill or should_anchor:
@@ -846,12 +916,40 @@ def build_conditioning(analysis: dict[str, Any], stem_role: str) -> list[tuple[l
             else:
                 held_note = None
 
-            if is_downbeat and onset_density[beat] < 0.35 and fill_scores[beat] > 0.55:
-                drums = [1]
-
         conditioning.append((notes, drums))
 
     return conditioning
+
+
+def generate_conditioned_chunks(
+    mrt_runtime: Any,
+    style: np.ndarray,
+    conditioning: list[tuple[list[int], list[int]]],
+    frame_schedule: list[int],
+    temperature: float = 0.2,
+    top_k: int = 40,
+    cfg_notes: float = 3.0,
+    cfg_drums: float = 7.0,
+) -> list[Any]:
+    if len(conditioning) != len(frame_schedule):
+        raise ValueError("conditioning and frame_schedule must have the same length")
+
+    chunks: list[Any] = []
+    state = None
+    for (notes, drums), frames in zip(conditioning, frame_schedule):
+        chunk, state = mrt_runtime.generate(
+            style=style,
+            drums=drums,
+            notes=notes,
+            top_k=top_k,
+            state=state,
+            frames=frames,
+            temperature=temperature,
+            cfg_notes=cfg_notes,
+            cfg_drums=cfg_drums,
+        )
+        chunks.append(chunk)
+    return chunks
 
 
 def waveform_to_samples(waveform: Any) -> tuple[np.ndarray, int]:
@@ -1046,7 +1144,7 @@ def add_confident_subdivision_anchors(
     target_points = np.array([point[1] for point in base_time_map], dtype=np.float64)
     sixteenth_samples = sample_rate * 60.0 / (bpm * 4.0)
     candidate_anchors: list[tuple[int, int]] = []
-    strong_threshold = float(np.quantile(strengths, 0.65))
+    strong_threshold = float(np.quantile(strengths, 0.35))
     maximum_anchor_error = min(
         0.45 * sixteenth_samples,
         MAX_PHASE_SHIFT_SECONDS * sample_rate,
@@ -1075,6 +1173,28 @@ def add_confident_subdivision_anchors(
                 dense_map.append(anchor)
         dense_map.append(right_anchor)
     return dense_map
+
+
+def onset_alignment_improves(
+    candidate: OnsetAlignment,
+    baseline: OnsetAlignment,
+) -> bool:
+    candidate_values = (candidate.p95_ms, candidate.median_ms)
+    baseline_values = (baseline.p95_ms, baseline.median_ms)
+    if candidate_values[0] is None and candidate_values[1] is None:
+        return False
+    if baseline_values[0] is None and baseline_values[1] is None:
+        return True
+
+    candidate_error = tuple(
+        value if value is not None else math.inf
+        for value in candidate_values
+    )
+    baseline_error = tuple(
+        value if value is not None else math.inf
+        for value in baseline_values
+    )
+    return candidate_error < baseline_error
 
 
 def _phase_correct_and_measure(
@@ -1146,15 +1266,7 @@ def correct_generation_timing(
                         sample_rate,
                         bpm,
                     )
-                    current_error = (
-                        alignment.p95_ms if alignment.p95_ms is not None else math.inf
-                    )
-                    dense_error = (
-                        dense_alignment.p95_ms
-                        if dense_alignment.p95_ms is not None
-                        else math.inf
-                    )
-                    if dense_error < current_error:
+                    if onset_alignment_improves(dense_alignment, alignment):
                         corrected = dense
                         phase_shift_ms = dense_phase_shift_ms
                         alignment = dense_alignment
@@ -1320,8 +1432,8 @@ async def generate(
     avoid_clash: bool = Form(True, description="Apply spectral anti-clash processing"),
     temperature: float = Form(0.2, description="MRT sampling temperature"),
     top_k: int = Form(40, description="MRT top-k sampling threshold"),
-    cfg_notes: float = Form(1.0, description="MRT notes classifier-free guidance"),
-    cfg_drums: float = Form(1.0, description="MRT drums classifier-free guidance"),
+    cfg_notes: float = Form(3.0, description="MRT notes classifier-free guidance"),
+    cfg_drums: float = Form(7.0, description="MRT drums classifier-free guidance"),
 ):
     """
     Generate music blending an uploaded audio file with a text prompt.
@@ -1331,8 +1443,12 @@ async def generate(
     # --- Resolve and validate duration ---
     generation_bpm = validate_generation_bpm(bpm, required=True)
     duration_seconds = resolve_duration_seconds(duration_bars, bpm)
-    if top_k <= 0:
-        raise HTTPException(status_code=400, detail="top_k must be greater than 0.")
+    temperature, top_k, cfg_notes, cfg_drums = validate_sampling_parameters(
+        temperature,
+        top_k,
+        cfg_notes,
+        cfg_drums,
+    )
 
     try:
         audio, style_model, mrt = get_magenta_runtime()
@@ -1409,8 +1525,6 @@ async def generate(
         blended_style = blend_style_vectors(audio_style, text_style)
 
         # --- Generate beat-grid chunks ---
-        chunks = []
-        state = None
         frame_boundaries = model_frame_boundaries(
             generation_bpm,
             len(conditioning),
@@ -1419,20 +1533,16 @@ async def generate(
             end - start
             for start, end in zip(frame_boundaries, frame_boundaries[1:])
         ]
-        for (notes, drums), frames in zip(conditioning, frame_schedule):
-            chunk, state = mrt.generate(
-                style=blended_style,
-                drums=[0],
-                notes=notes,
-                top_k=top_k,
-                state=state,
-                frames=frames,
-                temperature=1.1,
-                cfg_musiccoca=7.0,
-                cfg_notes=2.0,
-                cfg_drums=7.0
-            )
-            chunks.append(chunk)
+        chunks = generate_conditioned_chunks(
+            mrt,
+            blended_style,
+            conditioning,
+            frame_schedule,
+            temperature,
+            top_k,
+            cfg_notes,
+            cfg_drums,
+        )
 
         # --- Concatenate & return as WAV bytes ---
         output_waveform = audio.concatenate(chunks)
@@ -1443,7 +1553,7 @@ async def generate(
             generation_bpm,
             duration_seconds,
             frame_boundaries,
-            quantize_transients=resolved_stem_role == "drums",
+            quantize_transients=resolved_stem_role in {"drums", "melody"},
         )
         processed = post_process_generation(
             timing_correction.samples,
