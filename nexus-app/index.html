@@ -58,14 +58,19 @@
           <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
         </div>
         <div class="deck-body">
-          <div class="drop-zone" id="drop-1">
-            <div class="drop-inner">
-              <div class="drop-icon">▼</div>
-              <div class="drop-text">DROP MP3 / WAV</div>
-              <div class="drop-filename" id="drop1-filename"></div>
+          <div class="deck-media-layout">
+            <div class="deck-media-main">
+              <div class="drop-zone" id="drop-1">
+                <div class="drop-inner">
+                  <div class="drop-icon">▼</div>
+                  <div class="drop-text">DROP MP3 / WAV</div>
+                  <div class="drop-filename" id="drop1-filename"></div>
+                </div>
+              </div>
+              <canvas class="waveform" id="waveform-1" width="600" height="80"></canvas>
             </div>
+            <button class="deck-unload is-hidden" id="deck1-unload" type="button" aria-label="Unload Deck A">UNLOAD</button>
           </div>
-          <canvas class="waveform" id="waveform-1" width="600" height="80"></canvas>
           <div class="transport">
             <button class="t-btn" id="d1-play">▶</button>
             <button class="t-btn" id="d1-pause">⏸</button>
@@ -97,7 +102,10 @@
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
             </div>
             <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
-              <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
+              <div class="bpm-dialogue-header">
+                <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
+                <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+              </div>
               <div class="bpm-dialogue-form is-hidden" id="deck1-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
@@ -106,6 +114,15 @@
                   <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-skip">SKIP</button>
                 </div>
                 <div class="bpm-dialogue-error" id="deck1-bpm-error"></div>
+              </div>
+              <div class="bpm-report-form is-hidden" id="deck1-bpm-report-form">
+                <div class="bpm-dialogue-hint">CORRECT SOURCE BPM (40–240)</div>
+                <div class="bpm-report-actions">
+                  <input type="number" id="deck1-bpm-report-input" class="bpm-dialogue-input" min="40" max="240" step="1" placeholder="BPM" inputmode="numeric" aria-label="Correct Deck A source BPM">
+                  <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-report-apply" type="button">APPLY</button>
+                  <button class="btn-danger bpm-dialogue-button" id="deck1-bpm-report-cancel" type="button">CANCEL</button>
+                </div>
+                <div class="bpm-dialogue-error" id="deck1-bpm-report-error"></div>
               </div>
             </div>
           </div>
@@ -120,14 +137,19 @@
           <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
         </div>
         <div class="deck-body">
-          <div class="drop-zone" id="drop-2">
-            <div class="drop-inner">
-              <div class="drop-icon">▼</div>
-              <div class="drop-text">DROP MP3 / WAV</div>
-              <div class="drop-filename" id="drop2-filename"></div>
+          <div class="deck-media-layout">
+            <div class="deck-media-main">
+              <div class="drop-zone" id="drop-2">
+                <div class="drop-inner">
+                  <div class="drop-icon">▼</div>
+                  <div class="drop-text">DROP MP3 / WAV</div>
+                  <div class="drop-filename" id="drop2-filename"></div>
+                </div>
+              </div>
+              <canvas class="waveform" id="waveform-2" width="600" height="80"></canvas>
             </div>
+            <button class="deck-unload is-hidden" id="deck2-unload" type="button" aria-label="Unload Deck B">UNLOAD</button>
           </div>
-          <canvas class="waveform" id="waveform-2" width="600" height="80"></canvas>
           <div class="transport">
             <button class="t-btn" id="d2-play">▶</button>
             <button class="t-btn" id="d2-pause">⏸</button>
@@ -159,7 +181,10 @@
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
             </div>
             <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
-              <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
+              <div class="bpm-dialogue-header">
+                <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
+                <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+              </div>
               <div class="bpm-dialogue-form is-hidden" id="deck2-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
@@ -168,6 +193,15 @@
                   <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-skip">SKIP</button>
                 </div>
                 <div class="bpm-dialogue-error" id="deck2-bpm-error"></div>
+              </div>
+              <div class="bpm-report-form is-hidden" id="deck2-bpm-report-form">
+                <div class="bpm-dialogue-hint">CORRECT SOURCE BPM (40–240)</div>
+                <div class="bpm-report-actions">
+                  <input type="number" id="deck2-bpm-report-input" class="bpm-dialogue-input" min="40" max="240" step="1" placeholder="BPM" inputmode="numeric" aria-label="Correct Deck B source BPM">
+                  <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-report-apply" type="button">APPLY</button>
+                  <button class="btn-danger bpm-dialogue-button" id="deck2-bpm-report-cancel" type="button">CANCEL</button>
+                </div>
+                <div class="bpm-dialogue-error" id="deck2-bpm-report-error"></div>
               </div>
             </div>
           </div>
