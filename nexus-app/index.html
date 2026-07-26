@@ -102,7 +102,10 @@
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
             </div>
             <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
-              <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
+              <div class="bpm-dialogue-header">
+                <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
+                <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+              </div>
               <div class="bpm-dialogue-form is-hidden" id="deck1-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
@@ -111,6 +114,15 @@
                   <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-skip">SKIP</button>
                 </div>
                 <div class="bpm-dialogue-error" id="deck1-bpm-error"></div>
+              </div>
+              <div class="bpm-report-form is-hidden" id="deck1-bpm-report-form">
+                <div class="bpm-dialogue-hint">CORRECT SOURCE BPM (40–240)</div>
+                <div class="bpm-report-actions">
+                  <input type="number" id="deck1-bpm-report-input" class="bpm-dialogue-input" min="40" max="240" step="1" placeholder="BPM" inputmode="numeric" aria-label="Correct Deck A source BPM">
+                  <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-report-apply" type="button">APPLY</button>
+                  <button class="btn-danger bpm-dialogue-button" id="deck1-bpm-report-cancel" type="button">CANCEL</button>
+                </div>
+                <div class="bpm-dialogue-error" id="deck1-bpm-report-error"></div>
               </div>
             </div>
           </div>
@@ -169,7 +181,10 @@
               <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
             </div>
             <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
-              <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
+              <div class="bpm-dialogue-header">
+                <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
+                <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+              </div>
               <div class="bpm-dialogue-form is-hidden" id="deck2-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
@@ -178,6 +193,15 @@
                   <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-skip">SKIP</button>
                 </div>
                 <div class="bpm-dialogue-error" id="deck2-bpm-error"></div>
+              </div>
+              <div class="bpm-report-form is-hidden" id="deck2-bpm-report-form">
+                <div class="bpm-dialogue-hint">CORRECT SOURCE BPM (40–240)</div>
+                <div class="bpm-report-actions">
+                  <input type="number" id="deck2-bpm-report-input" class="bpm-dialogue-input" min="40" max="240" step="1" placeholder="BPM" inputmode="numeric" aria-label="Correct Deck B source BPM">
+                  <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-report-apply" type="button">APPLY</button>
+                  <button class="btn-danger bpm-dialogue-button" id="deck2-bpm-report-cancel" type="button">CANCEL</button>
+                </div>
+                <div class="bpm-dialogue-error" id="deck2-bpm-report-error"></div>
               </div>
             </div>
           </div>
@@ -203,6 +227,32 @@
           <div class="magic-config-row">
             <label class="magic-config-label">PROMPT</label>
             <input type="text" id="magic-prompt" class="magic-input magic-prompt" value="dark trap 808s" />
+          </div>
+          <div class="magic-config-row magic-role-row">
+            <span class="magic-config-label">STEM ROLE</span>
+            <div class="magic-role-options" role="radiogroup" aria-label="Generated stem role">
+              <label class="magic-toggle" for="magic-role-auto">
+                <input type="radio" id="magic-role-auto" name="magic-stem-role" value="auto" class="magic-toggle-input" checked />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>AUTO</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-drums">
+                <input type="radio" id="magic-role-drums" name="magic-stem-role" value="drums" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>DRUMS</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-bass">
+                <input type="radio" id="magic-role-bass" name="magic-stem-role" value="bass" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>BASS</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-melody">
+                <input type="radio" id="magic-role-melody" name="magic-stem-role" value="melody" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>MELODY</span>
+              </label>
+              <label class="magic-toggle" for="magic-role-texture">
+                <input type="radio" id="magic-role-texture" name="magic-stem-role" value="texture" class="magic-toggle-input" />
+                <span class="magic-toggle-box" aria-hidden="true"></span><span>TEXTURE</span>
+              </label>
+            </div>
+            <span class="magic-toggle-hint">SELECT ONE ROLE</span>
           </div>
           <div class="magic-duration-label">DURATION: 4 BARS</div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE FROM LIVE AUDIO</button>
