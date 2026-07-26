@@ -1,5 +1,6 @@
 import asyncio
 import io
+import math
 import shutil
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from magenta_server import (
     add_confident_subdivision_anchors,
     align_reference_capture,
     analyze_onset_alignment,
+    bar_rms_db,
     blend_style_vectors,
     build_beat_time_map,
     build_conditioning,
@@ -27,6 +29,7 @@ from magenta_server import (
     frames_per_beat_for_bpm,
     generate,
     generate_conditioned_chunks,
+    level_bar_dynamics,
     model_frame_boundaries,
     model_frame_schedule,
     normalize_to_full_scale,
@@ -855,6 +858,67 @@ class MagentaServerHelperTests(unittest.TestCase):
         np.testing.assert_array_equal(normalized, samples)
         self.assertTrue(np.all(np.isfinite(normalized)))
 
+    def test_bar_leveling_reduces_large_loudness_difference(self):
+        sample_rate = 1_000
+        bar_samples = 2_000
+        phase = np.arange(bar_samples, dtype=np.float32) / sample_rate
+        tone = np.sin(2.0 * np.pi * 20.0 * phase)
+        samples = np.concatenate(
+            [tone * amplitude for amplitude in (0.10, 0.11, 0.03, 0.35)]
+        )[:, np.newaxis]
+
+        before = bar_rms_db(samples, 4)
+        leveled = level_bar_dynamics(samples, sample_rate, 4)
+        after = bar_rms_db(leveled, 4)
+
+        self.assertGreater(float(np.ptp(before)), 15.0)
+        self.assertLessEqual(float(np.ptp(after)), 4.5)
+        self.assertEqual(leveled.shape, samples.shape)
+
+    def test_bar_leveling_leaves_modest_dynamics_unchanged(self):
+        samples = np.concatenate(
+            [
+                np.full((100, 1), amplitude, dtype=np.float32)
+                for amplitude in (0.10, 0.11, 0.09, 0.10)
+            ]
+        )
+
+        leveled = level_bar_dynamics(samples, 100, 4)
+
+        np.testing.assert_array_equal(leveled, samples)
+
+    def test_bar_leveling_bounds_gain_and_preserves_stereo_balance(self):
+        quiet = np.full(1_000, 0.001, dtype=np.float32)
+        normal = np.full(1_000, 0.1, dtype=np.float32)
+        mono = np.concatenate([quiet, normal, normal, normal])
+        samples = np.column_stack([mono, mono * 0.5])
+
+        leveled = level_bar_dynamics(
+            samples,
+            sample_rate=1_000,
+            total_bars=4,
+            tolerance_db=0.0,
+            max_adjustment_db=9.0,
+            transition_seconds=0.0,
+        )
+
+        measured_gain = float(leveled[500, 0] / samples[500, 0])
+        self.assertAlmostEqual(20.0 * math.log10(measured_gain), 9.0, places=4)
+        np.testing.assert_allclose(leveled[:, 1], leveled[:, 0] * 0.5)
+
+    def test_bar_leveling_does_not_amplify_silent_bar(self):
+        samples = np.concatenate(
+            [
+                np.zeros((100, 1), dtype=np.float32),
+                np.full((300, 1), 0.1, dtype=np.float32),
+            ]
+        )
+
+        leveled = level_bar_dynamics(samples, 100, 4)
+
+        np.testing.assert_array_equal(leveled[:100], samples[:100])
+        self.assertTrue(np.all(np.isfinite(leveled)))
+
     def test_post_processing_returns_exact_duration_at_full_scale(self):
         samples = np.array(
             [[0.1], [0.2], [-0.4], [0.3], [0.1], [-0.2]],
@@ -873,6 +937,25 @@ class MagentaServerHelperTests(unittest.TestCase):
 
         self.assertEqual(processed.shape, (10, 1))
         self.assertAlmostEqual(float(np.max(np.abs(processed))), 1.0)
+
+    def test_post_processing_applies_bar_leveling_when_duration_is_known(self):
+        samples = np.concatenate(
+            [
+                np.full((100, 1), amplitude, dtype=np.float32)
+                for amplitude in (0.10, 0.10, 0.09, 0.35)
+            ]
+        )
+
+        processed = post_process_generation(
+            samples,
+            sample_rate=100,
+            reference=np.zeros_like(samples),
+            duration_seconds=4.0,
+            avoid_clash=False,
+            duration_bars=4,
+        )
+
+        self.assertLessEqual(float(np.ptp(bar_rms_db(processed, 4))), 4.5)
 
     def test_pitch_classes_for_c_major_chroma(self):
         chroma = np.zeros(12, dtype=np.float32)

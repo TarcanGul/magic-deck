@@ -83,6 +83,9 @@ ONSET_HOP_LENGTH = 256
 MAX_PHASE_SHIFT_SECONDS = 0.08
 MAX_MEDIAN_ALIGNMENT_MS = 20.0
 MAX_P95_ALIGNMENT_MS = 40.0
+BAR_LEVEL_TOLERANCE_DB = 1.5
+MAX_BAR_LEVEL_ADJUSTMENT_DB = 9.0
+BAR_LEVEL_TRANSITION_SECONDS = 0.12
 TIMING_HEADER_NAMES = (
     "X-Magenta-Timing-Status",
     "X-Magenta-Timing-Warning",
@@ -1320,6 +1323,92 @@ def smooth_loop_boundary(samples: np.ndarray, sample_rate: int, fade_seconds: fl
     return output
 
 
+def bar_rms_db(samples: np.ndarray, total_bars: int) -> np.ndarray:
+    if total_bars <= 0:
+        raise ValueError("total_bars must be greater than zero")
+
+    boundaries = np.linspace(0, len(samples), total_bars + 1, dtype=np.int64)
+    levels = np.full(total_bars, -math.inf, dtype=np.float64)
+    for bar, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        segment = samples[start:end]
+        if segment.size:
+            rms = float(np.sqrt(np.mean(np.square(segment, dtype=np.float64))))
+            if rms > 1e-8:
+                levels[bar] = 20.0 * math.log10(rms)
+    return levels
+
+
+def level_bar_dynamics(
+    samples: np.ndarray,
+    sample_rate: int,
+    total_bars: int,
+    tolerance_db: float = BAR_LEVEL_TOLERANCE_DB,
+    max_adjustment_db: float = MAX_BAR_LEVEL_ADJUSTMENT_DB,
+    transition_seconds: float = BAR_LEVEL_TRANSITION_SECONDS,
+) -> np.ndarray:
+    if total_bars <= 1 or len(samples) == 0:
+        return samples.astype(np.float32, copy=True)
+    if tolerance_db < 0 or max_adjustment_db < 0 or transition_seconds < 0:
+        raise ValueError("Bar leveling settings must not be negative")
+
+    levels_db = bar_rms_db(samples, total_bars)
+    finite_levels = levels_db[np.isfinite(levels_db)]
+    if finite_levels.size < 2:
+        return samples.astype(np.float32, copy=True)
+
+    loudest_db = float(np.max(finite_levels))
+    usable_mask = np.isfinite(levels_db) & (levels_db >= loudest_db - 40.0)
+    usable_levels = levels_db[usable_mask]
+    if usable_levels.size < 2:
+        return samples.astype(np.float32, copy=True)
+
+    target_db = float(np.median(usable_levels))
+    lower_db = target_db - tolerance_db
+    upper_db = target_db + tolerance_db
+    adjustments_db = np.zeros(total_bars, dtype=np.float64)
+    for bar, level_db in enumerate(levels_db):
+        if not usable_mask[bar]:
+            continue
+        if level_db < lower_db:
+            adjustments_db[bar] = min(lower_db - level_db, max_adjustment_db)
+        elif level_db > upper_db:
+            adjustments_db[bar] = max(upper_db - level_db, -max_adjustment_db)
+
+    if np.allclose(adjustments_db, 0.0):
+        return samples.astype(np.float32, copy=True)
+
+    gains = np.power(10.0, adjustments_db / 20.0)
+    boundaries = np.linspace(0, len(samples), total_bars + 1, dtype=np.int64)
+    envelope = np.ones(len(samples), dtype=np.float64)
+    for bar, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        envelope[start:end] = gains[bar]
+
+    transition_samples = max(0, int(round(transition_seconds * sample_rate)))
+    for boundary_index, bar_boundary in enumerate(boundaries[1:-1], start=1):
+        half_transition = min(
+            transition_samples // 2,
+            int(bar_boundary - boundaries[boundary_index - 1]),
+            int(boundaries[boundary_index + 1] - bar_boundary),
+        )
+        if half_transition <= 0:
+            continue
+        start = int(bar_boundary - half_transition)
+        end = int(bar_boundary + half_transition)
+        phase = np.linspace(0.0, 1.0, end - start, endpoint=False)
+        blend = 0.5 - (0.5 * np.cos(np.pi * phase))
+        left_gain = gains[boundary_index - 1]
+        right_gain = gains[boundary_index]
+        envelope[start:end] = left_gain + ((right_gain - left_gain) * blend)
+
+    logger.info(
+        "Magenta bar leveling: levels_db=%s target_db=%.2f adjustments_db=%s",
+        [round(float(level), 2) if math.isfinite(level) else None for level in levels_db],
+        target_db,
+        [round(float(adjustment), 2) for adjustment in adjustments_db],
+    )
+    return (samples * envelope[:, np.newaxis]).astype(np.float32)
+
+
 def apply_spectral_ducking(samples: np.ndarray, reference: np.ndarray, sample_rate: int) -> np.ndarray:
     ref_mono = np.mean(reference, axis=1)
     ref_mag = np.mean(np.abs(librosa.stft(ref_mono, n_fft=2048, hop_length=512)), axis=1)
@@ -1348,12 +1437,15 @@ def post_process_generation(
     reference: np.ndarray,
     duration_seconds: float,
     avoid_clash: bool,
+    duration_bars: int | None = None,
 ) -> np.ndarray:
     target_samples = int(round(duration_seconds * sample_rate))
     output = exact_length(samples, target_samples)
-    output = smooth_loop_boundary(output, sample_rate)
     if avoid_clash:
         output = apply_spectral_ducking(output, trim_or_tile(reference, target_samples), sample_rate)
+    if duration_bars is not None:
+        output = level_bar_dynamics(output, sample_rate, duration_bars)
+    output = smooth_loop_boundary(output, sample_rate)
     return normalize_to_full_scale(exact_length(output, target_samples))
 
 
@@ -1561,6 +1653,7 @@ async def generate(
             analysis["reference"],
             duration_seconds,
             avoid_clash,
+            duration_bars,
         )
         residual_warning = None
         if residual_alignment_exceeds_threshold(timing_correction.alignment):
