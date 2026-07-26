@@ -411,6 +411,40 @@ class MagentaServerHelperTests(unittest.TestCase):
         self.assertIsNone(correction.fallback_warning)
         run_rubberband.assert_called_once()
 
+    def test_drum_timing_attempts_subdivision_warp_without_residual_error(self):
+        samples = np.zeros((31_000, 1), dtype=np.float32)
+        boundaries = model_frame_boundaries(120, 16)
+        base_map = build_beat_time_map(boundaries, len(samples), 32_000)
+        dense_map = [
+            base_map[0],
+            (base_map[1][0] // 2, base_map[1][1] // 2),
+            *base_map[1:],
+        ]
+
+        with (
+            patch(
+                "magenta_server._run_rubberband_time_map",
+                return_value=np.zeros((32_000, 1), dtype=np.float32),
+            ) as run_rubberband,
+            patch(
+                "magenta_server.add_confident_subdivision_anchors",
+                return_value=dense_map,
+            ) as add_anchors,
+        ):
+            correct_generation_timing(
+                samples,
+                4_000,
+                120,
+                8.0,
+                boundaries,
+                rubberband_executable="/usr/bin/rubberband",
+                quantize_transients=True,
+            )
+
+        add_anchors.assert_called_once()
+        self.assertEqual(run_rubberband.call_count, 2)
+        self.assertEqual(run_rubberband.call_args_list[1].args[3], dense_map)
+
     def test_rubberband_correction_is_exact_at_requested_tempos(self):
         sample_rate = 2_000
 

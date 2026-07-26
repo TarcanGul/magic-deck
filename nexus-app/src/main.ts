@@ -65,6 +65,10 @@ interface BpmResolution {
   bpm: number
   source: 'audiotool' | 'aubio' | 'manual' | 'project'
 }
+interface SampleTiming {
+  bpm: number
+  musicDurationTicks?: number
+}
 interface AubioBpmResult {
   bpm: number | null
   confidence: number
@@ -478,9 +482,9 @@ function knobValueToEqDb(value: number) {
   return Math.max(-18, Math.min(18, (value - 0.5) * 36))
 }
 
-async function uploadSample(file: File, displayName: string) {
+async function uploadSample(file: File, displayName: string, bpm?: number) {
   if (!at) throw new Error('Not logged in')
-  const upload = await at.samples.upload({ file, displayName, kind: 'loop' })
+  const upload = await at.samples.upload({ file, displayName, kind: 'loop', bpm })
   if (upload instanceof Error) throw upload
 
   const uploaded = await upload.uploaded
@@ -552,12 +556,20 @@ function watchDeckRegionDuration(deckIndex: 0 | 1, projectDocument: SyncedDocume
   )
 }
 
-async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, displayName: string, forceMagicLoop: boolean, resolution?: BpmResolution, expectedSession = tempoSessionId) {
+async function insertSampleIntoProject(
+  deckNum: number,
+  sample: SampleMeta,
+  displayName: string,
+  forceMagicLoop: boolean,
+  resolution?: BpmResolution,
+  expectedSession = tempoSessionId,
+  timing?: SampleTiming,
+) {
   if (!nexus) throw new Error('Project not connected')
   const projectDocument = nexus
   const deck = decks[deckNum - 1]
   const sampleBpm = normalizeBpm(sample.bpm)
-  const bpm = normalizeBpm(resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
+  const bpm = normalizeBpm(timing?.bpm ?? resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
   if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
   const establishesMaster = deckNum <= 2 && !tempoMasterEstablished
 
@@ -568,14 +580,18 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
       t.update(config.fields.tempoBpm, bpm)
     }
     const region = t.insertSample(sample, {
-      sample: { bpm },
+      sample: timing?.musicDurationTicks === undefined
+        ? { bpm }
+        : { musicDurationTicks: timing.musicDurationTicks },
       region: forceMagicLoop
         ? { positionTicks: 0, durationTicks: getMagicLoopDurationTicks(t) }
         : { positionTicks: 0 },
       loop: forceMagicLoop ? true : undefined,
       displayName,
     })
-    if (deckNum <= 2 && !establishesMaster) t.update(region.fields.timestretchMode, 2)
+    if (forceMagicLoop || (deckNum <= 2 && !establishesMaster)) {
+      t.update(region.fields.timestretchMode, 2)
+    }
     const entities = resolveInsertedProjectEntities(region, t)
     return { region, ...entities }
   })
@@ -604,12 +620,18 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   return inserted
 }
 
-async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false, expectedSession = tempoSessionId) {
+async function uploadToNexus(
+  deckNum: number,
+  file: File,
+  forceMagicLoop = false,
+  expectedSession = tempoSessionId,
+  timing?: SampleTiming,
+) {
   if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
   setStatus('connected', `UPLOADING ${file.name}…`)
   try {
     const displayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
-    const sample = await uploadSample(file, displayName)
+    const sample = await uploadSample(file, displayName, timing?.bpm)
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during upload')
     const resolution = deckNum <= 2 ? await resolveSampleBpm(sample, file, deckNum, expectedSession) : undefined
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during BPM selection')
@@ -624,7 +646,15 @@ async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false
     }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
     const selectingMaster = deckNum <= 2 && !tempoMasterEstablished
-    await insertSampleIntoProject(deckNum, sample, displayName, forceMagicLoop, resolution ?? undefined, expectedSession)
+    await insertSampleIntoProject(
+      deckNum,
+      sample,
+      displayName,
+      forceMagicLoop,
+      resolution ?? undefined,
+      expectedSession,
+      timing,
+    )
     setStatus('connected', selectingMaster
       ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — PROJECT SYNCED ✓`
       : `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
@@ -1365,7 +1395,10 @@ async function generateMagicAudio() {
     applyDeckPreviewGain(magicDeck)
     drawWaveform('magic-waveform', generatedBuffer)
     syncTransportUi('d3', magicDeck)
-    await uploadToNexus(3, generatedFile, true)
+    await uploadToNexus(3, generatedFile, true, tempoSessionId, {
+      bpm: generationBpm,
+      musicDurationTicks: Ticks.Bars(MAGIC_DURATION_BARS),
+    })
 
     if (timingWarning || timingStatus !== 'aligned') {
       const warning = timingWarning || `Timing status: ${timingStatus}`

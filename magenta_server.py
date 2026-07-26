@@ -1100,6 +1100,7 @@ def correct_generation_timing(
     duration_seconds: float,
     frame_boundaries: list[int],
     rubberband_executable: str | None = None,
+    quantize_transients: bool = False,
 ) -> TimingCorrection:
     target_samples = int(round(duration_seconds * sample_rate))
     beat_time_map = build_beat_time_map(frame_boundaries, len(samples), target_samples)
@@ -1125,7 +1126,7 @@ def correct_generation_timing(
                 bpm,
             )
             correction_type = "rubberband_beat_map"
-            if residual_alignment_exceeds_threshold(alignment):
+            if quantize_transients or residual_alignment_exceeds_threshold(alignment):
                 dense_time_map = add_confident_subdivision_anchors(
                     samples,
                     sample_rate,
@@ -1442,6 +1443,7 @@ async def generate(
             generation_bpm,
             duration_seconds,
             frame_boundaries,
+            quantize_transients=resolved_stem_role == "drums",
         )
         processed = post_process_generation(
             timing_correction.samples,
