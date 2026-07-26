@@ -1,5 +1,5 @@
 import { audiotool } from '@audiotool/nexus'
-import { Ticks } from '@audiotool/nexus/utils'
+import { secondsToTicks, Ticks } from '@audiotool/nexus/utils'
 import type { AuthenticatedClient, SyncedDocument } from '@audiotool/nexus'
 import type { SampleMeta } from '@audiotool/nexus/api'
 import type { NexusEntity, SafeTransactionBuilder } from '@audiotool/nexus/document'
@@ -18,14 +18,17 @@ interface DeckState {
   startedAt: number; looping: boolean; fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
   volume: number; gainTrim: number
-  sampleBpm: number | null; regionEntity: NexusEntity<'audioRegion'> | null
+  sampleBpm: number | null; sampleMeta: SampleMeta | null
+  regionEntity: NexusEntity<'audioRegion'> | null
   trackEntity: NexusEntity<'audioTrack'> | null; audioDeviceEntity: NexusEntity<'audioDevice'> | null
   mixerChannelEntity: NexusEntity<'mixerChannel'> | null
+  automationCollectionEntity: NexusEntity<'automationCollection'> | null
   regionSubscriptions: Terminable[]
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
 type EqBand = 'hi' | 'mid' | 'low'
+type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -64,10 +67,29 @@ interface BpmResolution {
   bpm: number
   source: 'audiotool' | 'aubio' | 'manual' | 'project'
 }
+interface SampleTiming {
+  bpm: number
+  musicDurationTicks?: number
+}
 interface AubioBpmResult {
   bpm: number | null
   confidence: number
   reliable: boolean
+}
+interface ManualBpmReportState {
+  editing: boolean
+  pending: boolean
+  requestId: number
+}
+interface NativeTimingResult {
+  durationTicks: number
+  replacementRegion: NexusEntity<'audioRegion'> | null
+}
+interface SourceTimingReplacement {
+  deckIndex: 0 | 1
+  previousRegionId: string
+  region: NexusEntity<'audioRegion'>
+  automationCollection: NexusEntity<'automationCollection'>
 }
 
 const MAGIC_DURATION_BARS = 4
@@ -83,9 +105,11 @@ const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
+let projectConnected = false
 let currentProjectBpm: number | null = null
 let tempoMasterEstablished = false
 let deckLoadQueue: Promise<void> = Promise.resolve()
+let sourceTimingQueue: Promise<void> = Promise.resolve()
 let tempoSessionId = 0
 let waveformAnimationFrame: number | null = null
 let liveAudioStream: MediaStream | null = null
@@ -98,11 +122,16 @@ let liveAudioShareRequest: Promise<void> | null = null
 let liveAudioSessionId = 0
 let liveAudioRecordingId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
+const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
+  { editing: false, pending: false, requestId: 0 },
+  { editing: false, pending: false, requestId: 0 },
+]
+const guardedRegionRemovalIds = new Set<string>()
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, sampleMeta: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, automationCollectionEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, sampleMeta: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, automationCollectionEntity: null, regionSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, sampleMeta: null, regionEntity: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, automationCollectionEntity: null, regionSubscriptions: [] },
 ]
 const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; startY: number; startVal: number }> = new Map()
 
@@ -126,6 +155,9 @@ const btnGenerate = el<HTMLButtonElement>('btn-generate')
 const magicDot = el<HTMLSpanElement>('magic-dot')
 const magicStatusLabel = el<HTMLSpanElement>('magic-status-label')
 const magicPrompt = el<HTMLInputElement>('magic-prompt')
+const magicStemRoleInputs = Array.from(
+  document.querySelectorAll<HTMLInputElement>('input[name="magic-stem-role"]'),
+)
 const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -192,6 +224,7 @@ async function disconnectAll() {
   resetTempoMasterSession()
   await stopLiveAudioCapture()
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
+  projectConnected = false
   if (at) { try { at.logout() } catch (_) {}; at = null }
   decks.forEach(clearDeckProjectEntities)
   statusUser.textContent = ''
@@ -275,20 +308,35 @@ async function connectProject() {
   resetTempoMasterSession()
   try {
     nexus = await at.open(projectUrl)
-    nexus.connected.subscribe((c) => setStatus(c ? 'connected' : 'error', c ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…'))
+    nexus.connected.subscribe((connected) => {
+      projectConnected = connected
+      if (connected) {
+        updateManualBpmReportUi(0)
+        updateManualBpmReportUi(1)
+      } else {
+        resetManualBpmReport(0)
+        resetManualBpmReport(1)
+      }
+      setStatus(connected ? 'connected' : 'error', connected ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…')
+    })
     loadBPM()
     await nexus.start()
+    projectConnected = true
+    updateManualBpmReportUi(0)
+    updateManualBpmReportUi(1)
     setStatus('connected', 'SYNCED ↔ PROJECT ACTIVE')
     localStorage.setItem('nexus_project_url', projectUrl)
   } catch (e: unknown) {
     setStatus('error', `PROJECT ERROR: ${e instanceof Error ? e.message : String(e)}`)
     nexus = null
+    projectConnected = false
     btnConnect.disabled = false
   }
 }
 
 function resetTempoMasterSession() {
   tempoSessionId += 1
+  projectConnected = false
   tempoMasterEstablished = false
   currentProjectBpm = null
   deckLoadQueue = Promise.resolve()
@@ -297,6 +345,8 @@ function resetTempoMasterSession() {
     pendingBpmResolutions[deckIndex] = null
     resetBpmDialogue(deckIndex)
   })
+  resetManualBpmReport(0)
+  resetManualBpmReport(1)
 }
 
 // ── NEXUS ─────────────────────────────────────────────────────────────────────
@@ -314,12 +364,64 @@ function updateDeckBpmLabel(deckIndex: WaveformDeckIndex) {
   const bpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
   el(`deck${deckIndex + 1}-bpm`).textContent = bpm === null ? '—' : String(bpm)
 }
+
+function serializeSourceTiming<T>(task: () => Promise<T>): Promise<T> {
+  const queued = sourceTimingQueue.then(task, task)
+  sourceTimingQueue = queued.then(() => undefined, () => undefined)
+  return queued
+}
+
+function reportSourceTimingError(message: string) {
+  decks.slice(0, 2).forEach((deck, deckIndex) => {
+    if (deck.regionEntity) {
+      getManualBpmReportElements(deckIndex as 0 | 1).error.textContent =
+        `TEMPO REMAP FAILED: ${message.toUpperCase()}`
+    }
+  })
+  setStatus('error', `SOURCE TEMPO REMAP FAILED — ${message}`)
+}
+
+function scheduleProjectTempoRemap(
+  projectDocument: SyncedDocument,
+  projectBpm: number,
+  expectedSession: number,
+) {
+  void serializeSourceTiming(async () => {
+    if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
+    try {
+      const applied = await remapLoadedSourceRegions(
+        projectDocument,
+        projectBpm,
+        expectedSession,
+      )
+      if (!applied) return
+      if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
+      updateDeckBpmLabels(projectBpm)
+    } catch (error) {
+      if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
+      const message = error instanceof Error ? error.message : String(error)
+      reportSourceTimingError(message)
+    }
+  })
+}
+
 function loadBPM() {
-  if (!nexus) return
-  nexus.events.onCreate('config', (cfg) => {
-    nexus!.events.onUpdate(cfg.fields.tempoBpm, (bpm) => {
+  const projectDocument = nexus
+  const expectedSession = tempoSessionId
+  if (!projectDocument) return
+  projectDocument.events.onCreate('config', (cfg) => {
+    projectDocument.events.onUpdate(cfg.fields.tempoBpm, (bpm) => {
+      if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
       const nextBpm = Number(bpm)
-      updateDeckBpmLabels(Number.isFinite(nextBpm) ? nextBpm : null)
+      if (
+        !Number.isFinite(nextBpm)
+        || nextBpm < MIN_SUPPORTED_BPM
+        || nextBpm > MAX_SUPPORTED_BPM
+      ) {
+        reportSourceTimingError('Project BPM is outside the supported range')
+        return
+      }
+      scheduleProjectTempoRemap(projectDocument, nextBpm, expectedSession)
     }, true)
   })
 }
@@ -328,10 +430,16 @@ function clearDeckProjectEntities(deck: DeckState) {
   deck.regionSubscriptions.forEach((subscription) => subscription.terminate())
   deck.regionSubscriptions = []
   deck.sampleBpm = null
+  deck.sampleMeta = null
   deck.regionEntity = null
   deck.trackEntity = null
   deck.audioDeviceEntity = null
   deck.mixerChannelEntity = null
+  deck.automationCollectionEntity = null
+  const deckIndex = decks.indexOf(deck)
+  if (deckIndex === 0 || deckIndex === 1) {
+    resetManualBpmReport(deckIndex)
+  }
 }
 
 function normalizeBpm(value: number | null | undefined): number | null {
@@ -345,6 +453,456 @@ function isSupportedBpm(value: number | null | undefined): value is number {
     && Number.isFinite(value)
     && value >= MIN_SUPPORTED_BPM
     && value <= MAX_SUPPORTED_BPM
+}
+
+function getManualBpmReportElements(deckIndex: 0 | 1) {
+  const prefix = `deck${deckIndex + 1}-bpm-report`
+  return {
+    trigger: el<HTMLButtonElement>(`${prefix}-trigger`),
+    form: el<HTMLDivElement>(`${prefix}-form`),
+    input: el<HTMLInputElement>(`${prefix}-input`),
+    apply: el<HTMLButtonElement>(`${prefix}-apply`),
+    cancel: el<HTMLButtonElement>(`${prefix}-cancel`),
+    error: el<HTMLDivElement>(`${prefix}-error`),
+  }
+}
+
+function canReportManualBpm(deckIndex: 0 | 1) {
+  return projectConnected
+    && nexus !== null
+    && decks[deckIndex].regionEntity !== null
+    && decks[deckIndex].audioBuffer !== null
+}
+
+function updateManualBpmReportUi(deckIndex: 0 | 1) {
+  const state = manualBpmReportStates[deckIndex]
+  const controls = getManualBpmReportElements(deckIndex)
+  const available = canReportManualBpm(deckIndex)
+  controls.trigger.classList.toggle('is-hidden', !available || state.editing)
+  controls.form.classList.toggle('is-hidden', !available || !state.editing)
+  controls.trigger.disabled = state.pending
+  controls.input.disabled = state.pending
+  controls.apply.disabled = state.pending
+  controls.cancel.disabled = state.pending
+}
+
+function resetManualBpmReport(deckIndex: 0 | 1) {
+  const state = manualBpmReportStates[deckIndex]
+  state.requestId += 1
+  state.editing = false
+  state.pending = false
+  const controls = getManualBpmReportElements(deckIndex)
+  controls.error.textContent = ''
+  updateManualBpmReportUi(deckIndex)
+}
+
+function loadedSourceDeckCount(t: SafeTransactionBuilder) {
+  return decks.slice(0, 2).reduce((count, deck) => {
+    if (!deck.regionEntity) return count
+    const region = t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
+    return region ? count + 1 : count
+  }, 0)
+}
+
+function getExpectedPlaybackTerminalEvent(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+) {
+  const collectionId = region.fields.playbackAutomationCollection.value.entityId
+  const collection = t.entities.ofTypes('automationCollection').getEntity(collectionId)
+  if (!collection) return null
+  const regionUsers = t.entities
+    .ofTypes('audioRegion')
+    .get()
+    .filter((candidate) =>
+      candidate.fields.playbackAutomationCollection.value.entityId === collectionId,
+    )
+  if (regionUsers.length !== 1 || regionUsers[0].id !== region.id) return null
+  const events = t.entities
+    .ofTypes('automationEvent')
+    .get()
+    .filter((event) => event.fields.collection.value.entityId === collectionId)
+  if (events.length !== 2) return null
+
+  const startEvents = events.filter((event) =>
+    event.fields.positionTicks.value === 0
+    && event.fields.value.value === 0
+    && event.fields.interpolation.value === 2,
+  )
+  const terminalEvents = events.filter((event) =>
+    event.fields.positionTicks.value > 0
+    && event.fields.value.value === 1,
+  )
+  if (startEvents.length !== 1 || terminalEvents.length !== 1) return null
+  return terminalEvents[0]
+}
+
+function replaceSourceRegionWithNativeTiming(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+  durationTicks: number,
+  guardedIds: string[],
+) {
+  const oldCollectionId = region.fields.playbackAutomationCollection.value.entityId
+  const oldCollection = t.entities.ofTypes('automationCollection').getEntity(oldCollectionId)
+  const oldEvents = t.entities
+    .ofTypes('automationEvent')
+    .get()
+    .filter((event) => event.fields.collection.value.entityId === oldCollectionId)
+  const oldCollectionRegionUsers = t.entities
+    .ofTypes('audioRegion')
+    .get()
+    .filter((candidate) =>
+      candidate.fields.playbackAutomationCollection.value.entityId === oldCollectionId,
+    )
+
+  const automationCollection = t.create('automationCollection', {})
+  t.create('automationEvent', {
+    collection: automationCollection.location,
+    positionTicks: 0,
+    value: 0,
+    interpolation: 2,
+  })
+  t.create('automationEvent', {
+    collection: automationCollection.location,
+    positionTicks: durationTicks,
+    value: 1,
+  })
+  const replacementRegion = t.create('audioRegion', {
+    track: region.fields.track.value,
+    playbackAutomationCollection: automationCollection.location,
+    sample: region.fields.sample.value,
+    region: {
+      positionTicks: region.fields.region.fields.positionTicks.value,
+      durationTicks,
+      collectionOffsetTicks: region.fields.region.fields.collectionOffsetTicks.value,
+      loopOffsetTicks: region.fields.region.fields.loopOffsetTicks.value,
+      loopDurationTicks: durationTicks,
+      isEnabled: region.fields.region.fields.isEnabled.value,
+      colorIndex: region.fields.region.fields.colorIndex.value,
+      displayName: region.fields.region.fields.displayName.value,
+    },
+    gain: region.fields.gain.value,
+    fadeInDurationTicks: region.fields.fadeInDurationTicks.value,
+    fadeInSlope: region.fields.fadeInSlope.value,
+    fadeOutDurationTicks: region.fields.fadeOutDurationTicks.value,
+    fadeOutSlope: region.fields.fadeOutSlope.value,
+    timestretchMode: 1,
+    pitchShiftSemitones: region.fields.pitchShiftSemitones.value,
+  })
+
+  guardedRegionRemovalIds.add(region.id)
+  guardedIds.push(region.id)
+  t.remove(region)
+  if (
+    oldCollection
+    && oldCollectionRegionUsers.length === 1
+    && oldCollectionRegionUsers[0].id === region.id
+  ) {
+    oldEvents.forEach((event) => t.remove(event))
+    t.remove(oldCollection)
+  }
+  return { region: replacementRegion, automationCollection }
+}
+
+function applyNativeSourceTiming(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+  sampleDurationSeconds: number,
+  projectBpm: number,
+  guardedIds: string[],
+): NativeTimingResult {
+  const durationTicks = secondsToTicks(sampleDurationSeconds, projectBpm)
+  if (!Number.isFinite(durationTicks) || durationTicks <= 0) {
+    throw new Error('The source duration could not be converted to project ticks')
+  }
+
+  const terminalEvent = getExpectedPlaybackTerminalEvent(t, region)
+  if (!terminalEvent) {
+    const replacement = replaceSourceRegionWithNativeTiming(
+      t,
+      region,
+      durationTicks,
+      guardedIds,
+    )
+    return { durationTicks, replacementRegion: replacement.region }
+  }
+
+  t.update(region.fields.region.fields.durationTicks, durationTicks)
+  t.update(region.fields.region.fields.loopDurationTicks, durationTicks)
+  t.update(terminalEvent.fields.positionTicks, durationTicks)
+  t.update(region.fields.timestretchMode, 1)
+  return { durationTicks, replacementRegion: null }
+}
+
+function rebindSourceTimingReplacements(
+  replacements: SourceTimingReplacement[],
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  replacements.forEach((replacement) => {
+    const deck = decks[replacement.deckIndex]
+    if (
+      deck.regionEntity?.id !== replacement.previousRegionId
+      || !deck.trackEntity
+    ) return
+    deck.regionSubscriptions.forEach((subscription) => subscription.terminate())
+    deck.regionSubscriptions = []
+    deck.regionEntity = replacement.region
+    deck.automationCollectionEntity = replacement.automationCollection
+    watchDeckProjectEntities(
+      replacement.deckIndex,
+      projectDocument,
+      replacement.region,
+      expectedSession,
+    )
+    updateDeckBpmLabel(replacement.deckIndex)
+    updateManualBpmReportUi(replacement.deckIndex)
+  })
+}
+
+function updateMagicLoopDurationInTransaction(
+  t: SafeTransactionBuilder,
+  durationOverrides?: ReadonlyMap<string, number>,
+) {
+  const magicRegionId = decks[2].regionEntity?.id
+  if (!magicRegionId) return
+  const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
+  if (!magicRegion) return
+  const durationTicks = getMagicLoopDurationTicks(t, durationOverrides)
+  if (magicRegion.fields.region.fields.durationTicks.value !== durationTicks) {
+    t.update(magicRegion.fields.region.fields.durationTicks, durationTicks)
+  }
+}
+
+async function remapLoadedSourceRegions(
+  projectDocument: SyncedDocument,
+  projectBpm: number,
+  expectedSession: number,
+) {
+  const sources = decks.slice(0, 2).flatMap((deck, deckIndex) =>
+    deck.regionEntity && deck.sampleMeta
+      ? [{
+          deckIndex: deckIndex as 0 | 1,
+          regionId: deck.regionEntity.id,
+          sampleDurationSeconds: deck.sampleMeta.durationSeconds,
+        }]
+      : [],
+  )
+  const guardedIds: string[] = []
+  try {
+    const transactionResult = await projectDocument.modify((t) => {
+      const config = t.entities.ofTypes('config').get()[0]
+      const currentTempo = Number(config?.fields.tempoBpm.value)
+      if (!Number.isFinite(currentTempo) || Math.abs(currentTempo - projectBpm) > 0.0001) {
+        return { applied: false, replacements: [] as SourceTimingReplacement[] }
+      }
+      const nextReplacements: SourceTimingReplacement[] = []
+      const durationOverrides = new Map<string, number>()
+      sources.forEach((source) => {
+        const region = t.entities.ofTypes('audioRegion').getEntity(source.regionId)
+        if (!region) throw new Error(`Deck ${source.deckIndex + 1} project region was not found`)
+        const result = applyNativeSourceTiming(
+          t,
+          region,
+          source.sampleDurationSeconds,
+          projectBpm,
+          guardedIds,
+        )
+        durationOverrides.set(source.regionId, result.durationTicks)
+        if (result.replacementRegion) {
+          const automationCollection = t.entities
+            .ofTypes('automationCollection')
+            .getEntity(result.replacementRegion.fields.playbackAutomationCollection.value.entityId)
+          if (!automationCollection) throw new Error('Replacement automation collection was not found')
+          nextReplacements.push({
+            deckIndex: source.deckIndex,
+            previousRegionId: source.regionId,
+            region: result.replacementRegion,
+            automationCollection,
+          })
+        }
+      })
+      updateMagicLoopDurationInTransaction(t, durationOverrides)
+      return { applied: true, replacements: nextReplacements }
+    })
+    if (!transactionResult.applied) return false
+    if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
+      throw new Error('The project connection changed during the tempo remap')
+    }
+    rebindSourceTimingReplacements(
+      transactionResult.replacements,
+      projectDocument,
+      expectedSession,
+    )
+    return true
+  } finally {
+    guardedIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
+  }
+}
+
+async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
+  return serializeSourceTiming(async () => {
+    const deck = decks[deckIndex]
+    const projectDocument = nexus
+    const regionId = deck.regionEntity?.id
+    const sampleDurationSeconds = deck.sampleMeta?.durationSeconds
+    const expectedSession = tempoSessionId
+    if (!projectDocument || !projectConnected || !regionId || !sampleDurationSeconds) {
+      throw new Error('The project region or uploaded sample is no longer available')
+    }
+
+    const guardedIds: string[] = []
+    try {
+      const transactionResult = await projectDocument.modify((t) => {
+        const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+        if (!region) throw new Error('The project region is no longer available')
+        const sourceDeckCount = loadedSourceDeckCount(t)
+        if (sourceDeckCount < 1) throw new Error('No loaded source region was found')
+        const projectTempoUpdated = sourceDeckCount === 1
+        const config = t.entities.ofTypes('config').get()[0]
+        if (!config) throw new Error('Project tempo configuration was not found')
+        const effectiveProjectBpm = projectTempoUpdated
+          ? correctedBpm
+          : Number(config.fields.tempoBpm.value)
+        if (
+          !Number.isFinite(effectiveProjectBpm)
+          || effectiveProjectBpm < MIN_SUPPORTED_BPM
+          || effectiveProjectBpm > MAX_SUPPORTED_BPM
+        ) {
+          throw new Error('Project tempo is outside the supported range')
+        }
+        if (projectTempoUpdated) {
+          t.update(config.fields.tempoBpm, correctedBpm)
+        }
+
+        const timingResult = applyNativeSourceTiming(
+          t,
+          region,
+          sampleDurationSeconds,
+          effectiveProjectBpm,
+          guardedIds,
+        )
+        const replacements: SourceTimingReplacement[] = []
+        if (timingResult.replacementRegion) {
+          const automationCollection = t.entities
+            .ofTypes('automationCollection')
+            .getEntity(timingResult.replacementRegion.fields.playbackAutomationCollection.value.entityId)
+          if (!automationCollection) throw new Error('Replacement automation collection was not found')
+          replacements.push({
+            deckIndex,
+            previousRegionId: regionId,
+            region: timingResult.replacementRegion,
+            automationCollection,
+          })
+        }
+        updateMagicLoopDurationInTransaction(
+          t,
+          new Map([[regionId, timingResult.durationTicks]]),
+        )
+        return { projectTempoUpdated, replacements }
+      })
+
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+        || deck.regionEntity?.id !== regionId
+      ) {
+        throw new Error('The project connection or region changed during the BPM update')
+      }
+
+      rebindSourceTimingReplacements(
+        transactionResult.replacements,
+        projectDocument,
+        expectedSession,
+      )
+      deck.sampleBpm = correctedBpm
+      deck.baseBpm = correctedBpm
+      if (transactionResult.projectTempoUpdated) {
+        updateDeckBpmLabels(correctedBpm)
+      } else {
+        updateDeckBpmLabel(deckIndex)
+      }
+      return transactionResult.projectTempoUpdated
+    } finally {
+      guardedIds.forEach((guardedId) => guardedRegionRemovalIds.delete(guardedId))
+    }
+  })
+}
+
+function setupManualBpmReport(deckIndex: 0 | 1) {
+  const state = manualBpmReportStates[deckIndex]
+  const controls = getManualBpmReportElements(deckIndex)
+  const deckNum = deckIndex + 1
+
+  controls.trigger.onclick = () => {
+    const bpm = normalizeBpm(decks[deckIndex].sampleBpm ?? decks[deckIndex].baseBpm)
+    if (!canReportManualBpm(deckIndex) || !isSupportedBpm(bpm)) {
+      setStatus('error', `DECK ${deckNum}: SOURCE BPM CANNOT BE REPORTED WITHOUT AN ACTIVE PROJECT REGION`)
+      updateManualBpmReportUi(deckIndex)
+      return
+    }
+    state.editing = true
+    controls.input.value = String(bpm)
+    controls.error.textContent = ''
+    updateManualBpmReportUi(deckIndex)
+    controls.input.focus()
+    controls.input.select()
+  }
+
+  controls.cancel.onclick = () => resetManualBpmReport(deckIndex)
+  controls.input.oninput = () => { controls.error.textContent = '' }
+
+  const submit = async () => {
+    if (state.pending) return
+    const enteredBpm = Number(controls.input.value)
+    const bpm = Number.isInteger(enteredBpm) ? enteredBpm : null
+    if (!isSupportedBpm(bpm)) {
+      controls.error.textContent =
+        `BPM MUST BE A WHOLE NUMBER BETWEEN ${MIN_SUPPORTED_BPM} AND ${MAX_SUPPORTED_BPM}`
+      controls.input.focus()
+      return
+    }
+
+    const requestId = state.requestId + 1
+    state.requestId = requestId
+    state.pending = true
+    controls.error.textContent = ''
+    updateManualBpmReportUi(deckIndex)
+    setStatus('connecting', `DECK ${deckNum}: APPLYING CORRECTED SOURCE BPM ${bpm}…`)
+
+    try {
+      const projectTempoUpdated = await applyManualSourceBpm(deckIndex, bpm)
+      if (state.requestId !== requestId) return
+      state.editing = false
+      setStatus('connected', projectTempoUpdated
+        ? `DECK ${deckNum}: SOURCE BPM CORRECTED TO ${bpm} — PROJECT TEMPO UPDATED, NATIVE SPEED PRESERVED ✓`
+        : `DECK ${deckNum}: SOURCE BPM CORRECTED TO ${bpm} — NATIVE SPEED PRESERVED ✓`)
+    } catch (error) {
+      if (state.requestId !== requestId) return
+      const message = error instanceof Error ? error.message : String(error)
+      controls.error.textContent = `UPDATE FAILED: ${message.toUpperCase()}`
+      setStatus('error', `DECK ${deckNum}: BPM UPDATE FAILED — ${message}`)
+    } finally {
+      if (state.requestId === requestId) {
+        state.pending = false
+        updateManualBpmReportUi(deckIndex)
+      }
+    }
+  }
+
+  controls.apply.onclick = () => { void submit() }
+  controls.input.onkeydown = (event: KeyboardEvent) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      void submit()
+    } else if (event.key === 'Escape' && !state.pending) {
+      event.preventDefault()
+      resetManualBpmReport(deckIndex)
+    }
+  }
+  resetManualBpmReport(deckIndex)
 }
 
 function resetBpmDialogue(deckIndex: number) {
@@ -474,9 +1032,9 @@ function knobValueToEqDb(value: number) {
   return Math.max(-18, Math.min(18, (value - 0.5) * 36))
 }
 
-async function uploadSample(file: File, displayName: string) {
+async function uploadSample(file: File, displayName: string, bpm?: number) {
   if (!at) throw new Error('Not logged in')
-  const upload = await at.samples.upload({ file, displayName, kind: 'loop' })
+  const upload = await at.samples.upload({ file, displayName, kind: 'loop', bpm })
   if (upload instanceof Error) throw upload
 
   const uploaded = await upload.uploaded
@@ -492,6 +1050,11 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   const track = t.entities.ofTypes('audioTrack').getEntity(trackId)
   if (!track) throw new Error('Inserted audio track was not found')
 
+  const automationCollection = t.entities
+    .ofTypes('automationCollection')
+    .getEntity(region.fields.playbackAutomationCollection.value.entityId)
+  if (!automationCollection) throw new Error('Inserted automation collection was not found')
+
   const audioDeviceId = track.fields.player.value.entityId
   const audioDevice = t.entities.ofTypes('audioDevice').getEntity(audioDeviceId)
   if (!audioDevice) throw new Error('Inserted audio device was not found')
@@ -505,12 +1068,19 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   const mixerChannel = t.entities.ofTypes('mixerChannel').getEntity(cable.fields.toSocket.value.entityId)
   if (!mixerChannel) throw new Error('Inserted mixer channel was not found')
 
-  return { track, audioDevice, mixerChannel }
+  return { track, audioDevice, mixerChannel, automationCollection }
 }
 
-function getMagicLoopDurationTicks(t: SafeTransactionBuilder) {
+function getMagicLoopDurationTicks(
+  t: SafeTransactionBuilder,
+  durationOverrides?: ReadonlyMap<string, number>,
+) {
   return decks.slice(0, 2).reduce((durationTicks, deck) => {
     if (!deck.regionEntity) return durationTicks
+    const durationOverride = durationOverrides?.get(deck.regionEntity.id)
+    if (durationOverride !== undefined) {
+      return Math.max(durationTicks, durationOverride)
+    }
     const region = t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
     return region
       ? Math.max(durationTicks, region.fields.region.fields.durationTicks.value)
@@ -532,7 +1102,12 @@ async function syncMagicLoopDuration(projectDocument: SyncedDocument, expectedSe
   })
 }
 
-function watchDeckRegionDuration(deckIndex: 0 | 1, projectDocument: SyncedDocument, region: NexusEntity<'audioRegion'>, expectedSession: number) {
+function watchDeckProjectEntities(
+  deckIndex: 0 | 1,
+  projectDocument: SyncedDocument,
+  region: NexusEntity<'audioRegion'>,
+  expectedSession: number,
+) {
   const deck = decks[deckIndex]
   deck.regionSubscriptions.push(
     projectDocument.events.onUpdate(region.fields.region.fields.durationTicks, () => {
@@ -542,39 +1117,80 @@ function watchDeckRegionDuration(deckIndex: 0 | 1, projectDocument: SyncedDocume
     }),
     projectDocument.events.onRemove(region, () => {
       if (deck.regionEntity?.id !== region.id) return
+      if (guardedRegionRemovalIds.has(region.id)) return
+      const reportWasActive = manualBpmReportStates[deckIndex].editing
       clearDeckProjectEntities(deck)
       void syncMagicLoopDuration(projectDocument, expectedSession)
+      if (reportWasActive) {
+        setStatus('error', `DECK ${deckIndex + 1}: BPM REPORT CANCELLED — PROJECT REGION WAS REMOVED`)
+      }
     }),
   )
 }
 
-async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, displayName: string, forceMagicLoop: boolean, resolution?: BpmResolution, expectedSession = tempoSessionId) {
+async function insertSampleIntoProject(
+  deckNum: number,
+  sample: SampleMeta,
+  displayName: string,
+  forceMagicLoop: boolean,
+  resolution?: BpmResolution,
+  expectedSession = tempoSessionId,
+  timing?: SampleTiming,
+) {
   if (!nexus) throw new Error('Project not connected')
   const projectDocument = nexus
   const deck = decks[deckNum - 1]
   const sampleBpm = normalizeBpm(sample.bpm)
-  const bpm = normalizeBpm(resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
+  const bpm = normalizeBpm(timing?.bpm ?? resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
   if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
   const establishesMaster = deckNum <= 2 && !tempoMasterEstablished
 
-  const inserted = await projectDocument.modify((t) => {
-    if (establishesMaster) {
-      const config = t.entities.ofTypes('config').get()[0]
-      if (!config) throw new Error('Project tempo configuration was not found')
+  const insertTransaction = () => projectDocument.modify((t) => {
+    const config = t.entities.ofTypes('config').get()[0]
+    const isSourceDeck = deckNum <= 2
+    if (isSourceDeck && !config) throw new Error('Project tempo configuration was not found')
+    const effectiveProjectBpm = establishesMaster
+      ? bpm
+      : Number(config?.fields.tempoBpm.value ?? currentProjectBpm)
+    if (
+      isSourceDeck
+      && (
+        !Number.isFinite(effectiveProjectBpm)
+        || effectiveProjectBpm < MIN_SUPPORTED_BPM
+        || effectiveProjectBpm > MAX_SUPPORTED_BPM
+      )
+    ) {
+      throw new Error('Project tempo is outside the supported range')
+    }
+    if (establishesMaster && config) {
       t.update(config.fields.tempoBpm, bpm)
     }
+    const sourceDurationTicks = isSourceDeck
+      ? secondsToTicks(sample.durationSeconds, effectiveProjectBpm)
+      : undefined
     const region = t.insertSample(sample, {
-      sample: { bpm },
+      sample: isSourceDeck
+        ? { musicDurationTicks: sourceDurationTicks }
+        : timing?.musicDurationTicks === undefined
+          ? { bpm }
+          : { musicDurationTicks: timing.musicDurationTicks },
       region: forceMagicLoop
         ? { positionTicks: 0, durationTicks: getMagicLoopDurationTicks(t) }
         : { positionTicks: 0 },
       loop: forceMagicLoop ? true : undefined,
       displayName,
     })
-    if (deckNum <= 2 && !establishesMaster) t.update(region.fields.timestretchMode, 2)
+    if (isSourceDeck) {
+      t.update(region.fields.timestretchMode, 1)
+    } else if (forceMagicLoop) {
+      t.update(region.fields.timestretchMode, 2)
+    }
     const entities = resolveInsertedProjectEntities(region, t)
     return { region, ...entities }
   })
+  const inserted = deckNum <= 2
+    ? await serializeSourceTiming(insertTransaction)
+    : await insertTransaction()
   if (expectedSession !== tempoSessionId || nexus !== projectDocument) {
     throw new Error('Project connection changed during insertion')
   }
@@ -586,12 +1202,20 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
 
   deck.sampleBpm = bpm
   deck.baseBpm = bpm
+  deck.sampleMeta = deckNum <= 2 ? sample : null
   deck.regionEntity = inserted.region
   deck.trackEntity = inserted.track
   deck.audioDeviceEntity = inserted.audioDevice
   deck.mixerChannelEntity = inserted.mixerChannel
+  deck.automationCollectionEntity = inserted.automationCollection
   if (deckNum <= 2) {
-    watchDeckRegionDuration((deckNum - 1) as 0 | 1, projectDocument, inserted.region, expectedSession)
+    watchDeckProjectEntities(
+      (deckNum - 1) as 0 | 1,
+      projectDocument,
+      inserted.region,
+      expectedSession,
+    )
+    updateManualBpmReportUi((deckNum - 1) as 0 | 1)
     await syncMagicLoopDuration(projectDocument, expectedSession)
   }
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
@@ -600,12 +1224,18 @@ async function insertSampleIntoProject(deckNum: number, sample: SampleMeta, disp
   return inserted
 }
 
-async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false, expectedSession = tempoSessionId) {
+async function uploadToNexus(
+  deckNum: number,
+  file: File,
+  forceMagicLoop = false,
+  expectedSession = tempoSessionId,
+  timing?: SampleTiming,
+) {
   if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
   setStatus('connected', `UPLOADING ${file.name}…`)
   try {
     const displayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
-    const sample = await uploadSample(file, displayName)
+    const sample = await uploadSample(file, displayName, timing?.bpm)
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during upload')
     const resolution = deckNum <= 2 ? await resolveSampleBpm(sample, file, deckNum, expectedSession) : undefined
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during BPM selection')
@@ -620,10 +1250,22 @@ async function uploadToNexus(deckNum: number, file: File, forceMagicLoop = false
     }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
     const selectingMaster = deckNum <= 2 && !tempoMasterEstablished
-    await insertSampleIntoProject(deckNum, sample, displayName, forceMagicLoop, resolution ?? undefined, expectedSession)
-    setStatus('connected', selectingMaster
-      ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — PROJECT SYNCED ✓`
-      : `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
+    await insertSampleIntoProject(
+      deckNum,
+      sample,
+      displayName,
+      forceMagicLoop,
+      resolution ?? undefined,
+      expectedSession,
+      timing,
+    )
+    if (deckNum <= 2) {
+      setStatus('connected', selectingMaster
+        ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — NATIVE SPEED PRESERVED ✓`
+        : `DECK ${deckNum}: ${file.name} — NATIVE SPEED PRESERVED ✓`)
+    } else {
+      setStatus('connected', `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
+    }
     return true
   } catch (e: unknown) {
     setStatus('error', `UPLOAD ERROR: ${e instanceof Error ? e.message : String(e)}`)
@@ -719,11 +1361,13 @@ function deckStop(deck: DeckState) {
 async function loadAudioFile(deckIndex: 0 | 1, file: File) {
   const deck = decks[deckIndex]; ensureCtx(deck)
   try {
-    const buf = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
-    deckStop(deck); clearDeckProjectEntities(deck); deck.audioBuffer = buf; deck.fileName = file.name
-    drawWaveform(`waveform-${deckIndex + 1}`, buf)
+    const buffer = await deck.audioCtx!.decodeAudioData(await file.arrayBuffer())
+    deckStop(deck); clearDeckProjectEntities(deck); deck.audioBuffer = buffer; deck.fileName = file.name
+    drawWaveform(`waveform-${deckIndex + 1}`, buffer)
     await uploadToNexus(deckIndex + 1, file)
-  } catch (e: unknown) { setStatus('error', `LOAD ERROR: ${e instanceof Error ? e.message : String(e)}`) }
+  } catch (error: unknown) {
+    setStatus('error', `LOAD ERROR: ${error instanceof Error ? error.message : String(error)}`)
+  }
 }
 
 function queueDeckLoad(deckIndex: 0 | 1, file: File) {
@@ -1289,6 +1933,20 @@ function describeMagentaError(error: unknown) {
 }
 
 // ── MAGENTA ───────────────────────────────────────────────────────────────────
+function selectedMagicStemRole(): StemRole {
+  const selected = magicStemRoleInputs.find((input) => input.checked)?.value
+  if (selected === 'drums' || selected === 'bass' || selected === 'melody' || selected === 'texture') {
+    return selected
+  }
+  return 'auto'
+}
+
+function setMagicStemRoleDisabled(disabled: boolean) {
+  magicStemRoleInputs.forEach((input) => {
+    input.disabled = disabled
+  })
+}
+
 async function generateMagicAudio() {
   const promptText = magicPrompt.value.trim()
   if (!promptText) { setMagicStatus('error', 'PROMPT REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
@@ -1303,7 +1961,10 @@ async function generateMagicAudio() {
     return
   }
 
-  setMagicStatus('generating', 'PREPARING AUDIO CAPTURE'); btnGenerate.disabled = true
+  const stemRole = selectedMagicStemRole()
+  setMagicStatus('generating', 'PREPARING AUDIO CAPTURE')
+  btnGenerate.disabled = true
+  setMagicStemRoleDisabled(true)
   try {
     await ensureLiveAudioCapture()
     const reference = await captureReferenceAudio(generationBpm)
@@ -1312,7 +1973,7 @@ async function generateMagicAudio() {
     form.append('prompt', promptText)
     form.append('duration_bars', String(MAGIC_DURATION_BARS))
     form.append('bpm', String(generationBpm))
-    form.append('stem_role', 'auto')
+    form.append('stem_role', stemRole)
     form.append('avoid_clash', 'true')
 
     setMagicStatus('generating', `MAGENTA ← ${reference.sourceLabel}`)
@@ -1344,7 +2005,10 @@ async function generateMagicAudio() {
     applyDeckPreviewGain(magicDeck)
     drawWaveform('magic-waveform', generatedBuffer)
     syncTransportUi('d3', magicDeck)
-    await uploadToNexus(3, generatedFile, true)
+    await uploadToNexus(3, generatedFile, true, tempoSessionId, {
+      bpm: generationBpm,
+      musicDurationTicks: Ticks.Bars(MAGIC_DURATION_BARS),
+    })
 
     if (timingWarning || timingStatus !== 'aligned') {
       const warning = timingWarning || `Timing status: ${timingStatus}`
@@ -1364,7 +2028,10 @@ async function generateMagicAudio() {
     setMagicStatus('error', message.toUpperCase().slice(0, 48))
     setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
   }
-  finally { btnGenerate.disabled = false }
+  finally {
+    btnGenerate.disabled = false
+    setMagicStemRoleDisabled(false)
+  }
 }
 
 // ── DROP ZONES ────────────────────────────────────────────────────────────────
@@ -1453,6 +2120,8 @@ function initApp() {
   audioCaptureRow.style.display = 'none'
   resetBpmDialogue(0)
   resetBpmDialogue(1)
+  setupManualBpmReport(0)
+  setupManualBpmReport(1)
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
   btnOpenAudiotool.onclick = () => openAudiotoolProjectTab()
