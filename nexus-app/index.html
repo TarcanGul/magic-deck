@@ -64,10 +64,15 @@
                 <div class="drop-inner">
                   <div class="drop-icon">▼</div>
                   <div class="drop-text">DROP MP3 / WAV</div>
-                  <div class="drop-filename" id="drop1-filename"></div>
+                  <div class="drop-loaded-summary">
+                    <div class="drop-filename" id="drop1-filename"></div>
+                    <div class="drop-metadata">
+                      <span>BPM <strong id="drop1-bpm">—</strong></span>
+                      <span>DURATION <strong id="drop1-duration">—</strong></span>
+                    </div>
+                  </div>
                 </div>
               </div>
-              <canvas class="waveform" id="waveform-1" width="600" height="80"></canvas>
             </div>
           </div>
           <div class="transport">
@@ -145,10 +150,15 @@
                 <div class="drop-inner">
                   <div class="drop-icon">▼</div>
                   <div class="drop-text">DROP MP3 / WAV</div>
-                  <div class="drop-filename" id="drop2-filename"></div>
+                  <div class="drop-loaded-summary">
+                    <div class="drop-filename" id="drop2-filename"></div>
+                    <div class="drop-metadata">
+                      <span>BPM <strong id="drop2-bpm">—</strong></span>
+                      <span>DURATION <strong id="drop2-duration">—</strong></span>
+                    </div>
+                  </div>
                 </div>
               </div>
-              <canvas class="waveform" id="waveform-2" width="600" height="80"></canvas>
             </div>
           </div>
           <div class="transport">

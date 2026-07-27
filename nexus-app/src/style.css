@@ -180,7 +180,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 .drop-zone {
   border: 1px dashed var(--grey-light);
-  height: 52px;
+  min-height: 72px;
   display: flex; align-items: center; justify-content: center;
   cursor: pointer; transition: all 0.2s; position: relative;
   background: linear-gradient(180deg, rgba(0,0,0,0.6) 0%, var(--grey) 50%, rgba(0,0,0,0.6) 100%);
@@ -188,12 +188,22 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   border-radius: 4px;
 }
 .drop-zone.drag-over { border-color: var(--red); background: var(--red-glow2); box-shadow: inset 0 0 20px var(--red-glow2); }
-.drop-zone.loaded { border-color: var(--red); border-style: solid; }
+.drop-zone.loaded {
+  border-color: #28d17c;
+  border-style: solid;
+  background: linear-gradient(180deg, rgba(8, 56, 34, 0.72) 0%, rgba(4, 31, 19, 0.9) 100%);
+  box-shadow: inset 0 0 22px rgba(40, 209, 124, 0.16), 0 0 14px rgba(40, 209, 124, 0.18);
+}
 .drop-zone.pending { cursor: wait; opacity: 0.7; }
-.drop-inner { display: flex; align-items: center; gap: 12px; pointer-events: none; }
+.drop-inner { width: 100%; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 14px; pointer-events: none; }
 .drop-icon { font-size: 16px; color: var(--red); }
 .drop-text { font-family: var(--font-data); font-size: 11px; letter-spacing: 2px; color: var(--grey-text); }
-.drop-filename { font-family: var(--font-live); font-size: 12px; color: var(--white); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drop-loaded-summary { display: none; min-width: 0; flex: 1; }
+.drop-zone.loaded .drop-icon, .drop-zone.loaded .drop-text { display: none; }
+.drop-zone.loaded .drop-loaded-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.drop-filename { font-family: var(--font-live); font-size: 14px; color: var(--white); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drop-metadata { display: flex; flex: 0 0 auto; align-items: center; gap: 16px; font-family: var(--font-data); font-size: 9px; letter-spacing: 1px; color: #7fbf9f; }
+.drop-metadata strong { margin-left: 4px; font-family: var(--font-live); font-size: 12px; color: #62efa9; font-weight: normal; }
 /* ============================  WAVEFORM  ============================ */
 .waveform {
   width: 100%; height: 80px; display: block;
@@ -296,6 +306,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .bpm-report-trigger:disabled, .deck-unload:disabled { cursor: wait; opacity: 0.5; }
 
 @media (max-width: 560px) {
+  .drop-zone.loaded .drop-loaded-summary { align-items: flex-start; flex-direction: column; gap: 7px; }
   .controls-row { gap: 10px; }
   .bpm-dialogue { flex-basis: 100%; width: 100%; }
   .bpm-dialogue-header-actions { flex-wrap: wrap; }
