@@ -4,6 +4,17 @@ import type { AuthenticatedClient, SyncedDocument } from '@audiotool/nexus'
 import type { SampleMeta } from '@audiotool/nexus/api'
 import type { EntityQuery, NexusEntity, SafeTransactionBuilder } from '@audiotool/nexus/document'
 import type { Terminable } from '@audiotool/nexus/utils'
+import {
+  TRANSPORT_CHANNEL,
+  TRANSPORT_REQUEST_TIMEOUT_MS,
+  barToPositionTicks,
+  projectIdFromUrl,
+  validateTransportResponse,
+} from '../transport-extension/transport-utils.js'
+import type {
+  TransportRequest,
+  TransportResponse,
+} from '../transport-extension/transport-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -77,6 +88,14 @@ interface UploadToNexusOptions {
   timing?: SampleTiming
   replaceExistingMagic?: boolean
   sampleDescription?: string
+  placement?: DeckInsertionPlacement
+}
+interface DeckInsertionPlacement {
+  deckIndex: WaveformDeckIndex
+  bar: number
+  positionTicks: number
+  source: 'extension' | 'manual' | 'project-start'
+  capturedAt: number
 }
 interface AubioBpmResult {
   bpm: number | null
@@ -135,10 +154,12 @@ const DECK_PROJECT_NAMES = ['DECK 1', 'DECK 2', 'MAGIC DECK'] as const
 let at: AuthenticatedClient | null = null
 let nexus: SyncedDocument | null = null
 let projectConnected = false
+let currentProjectId: string | null = null
 let currentProjectBpm: number | null = null
 let tempoMasterEstablished = false
 let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
+let placementModalQueue: Promise<void> = Promise.resolve()
 let tempoSessionId = 0
 let waveformAnimationFrame: number | null = null
 let magicWaveformPeaks: number[] | null = null
@@ -206,6 +227,157 @@ function setStatus(state: 'idle' | 'connecting' | 'connected' | 'error', msg: st
 function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done' | 'warning', label: string) {
   magicDot.className = `status-dot-magic ${state}`
   magicStatusLabel.textContent = label
+}
+
+function placementDeckLabel(deckIndex: WaveformDeckIndex) {
+  if (deckIndex === 0) return 'Deck A'
+  if (deckIndex === 1) return 'Deck B'
+  return 'Magic Deck'
+}
+
+function requestExtensionTransportBar(
+  projectId: string,
+  deckIndex: WaveformDeckIndex,
+): Promise<{ bar: number; capturedAt: number } | null> {
+  const requestId = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const request: TransportRequest = {
+    channel: TRANSPORT_CHANNEL,
+    type: 'request',
+    requestId,
+    projectId,
+    deckIndex,
+  }
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (result: { bar: number; capturedAt: number } | null) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeoutId)
+      window.removeEventListener('message', onMessage)
+      resolve(result)
+    }
+    const onMessage = (event: MessageEvent<TransportResponse>) => {
+      if (event.source !== window || event.origin !== window.location.origin) return
+      const validation = validateTransportResponse(event.data, request)
+      if (!validation.ok) {
+        if (
+          event.data?.channel === TRANSPORT_CHANNEL
+          && event.data?.type === 'response'
+          && event.data?.requestId === requestId
+        ) finish(null)
+        return
+      }
+      finish({ bar: validation.bar, capturedAt: validation.capturedAt })
+    }
+    const timeoutId = window.setTimeout(() => finish(null), TRANSPORT_REQUEST_TIMEOUT_MS)
+    window.addEventListener('message', onMessage)
+    window.postMessage(request, window.location.origin)
+  })
+}
+
+function showPlacementModalNow(deckIndex: WaveformDeckIndex): Promise<number | null> {
+  return new Promise((resolve) => {
+    const overlay = el<HTMLDivElement>('placement-modal')
+    const title = el<HTMLHeadingElement>('placement-modal-title')
+    const copy = el<HTMLParagraphElement>('placement-modal-copy')
+    const input = el<HTMLInputElement>('placement-modal-input')
+    const error = el<HTMLDivElement>('placement-modal-error')
+    const confirm = el<HTMLButtonElement>('placement-modal-confirm')
+    const cancel = el<HTMLButtonElement>('placement-modal-cancel')
+    const label = placementDeckLabel(deckIndex)
+
+    title.textContent = `Choose ${label} Insertion Bar`
+    copy.textContent =
+      `The Audiotool transport could not be read automatically. Enter the whole-number bar currently displayed in Studio. ${label} will be placed at the beginning of that bar.`
+    input.value = '1'
+    error.textContent = ''
+    overlay.classList.remove('is-hidden')
+    input.focus()
+    input.select()
+
+    const close = (bar: number | null) => {
+      overlay.classList.add('is-hidden')
+      confirm.onclick = null
+      cancel.onclick = null
+      input.oninput = null
+      document.removeEventListener('keydown', onKey)
+      resolve(bar)
+    }
+    const submit = () => {
+      const bar = Number(input.value.trim())
+      if (!Number.isSafeInteger(bar) || bar < 1) {
+        error.textContent = 'ENTER A WHOLE-NUMBER BAR OF 1 OR GREATER'
+        input.focus()
+        input.select()
+        return
+      }
+      close(bar)
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close(null)
+      if (event.key === 'Enter' && event.target === input) {
+        event.preventDefault()
+        submit()
+      }
+    }
+
+    confirm.onclick = submit
+    cancel.onclick = () => close(null)
+    input.oninput = () => { error.textContent = '' }
+    document.addEventListener('keydown', onKey)
+  })
+}
+
+function showPlacementModal(deckIndex: WaveformDeckIndex) {
+  const queued = placementModalQueue.then(() => showPlacementModalNow(deckIndex))
+  placementModalQueue = queued.then(() => undefined, () => undefined)
+  return queued
+}
+
+function projectHasLoadedTimelineContent(projectDocument: SyncedDocument) {
+  return projectDocument.queryEntities
+    .ofTypes('audioRegion', 'noteRegion', 'patternRegion', 'automationRegion')
+    .get()
+    .length > 0
+}
+
+async function captureDeckInsertionPlacement(
+  deckIndex: WaveformDeckIndex,
+): Promise<DeckInsertionPlacement | null> {
+  const projectDocument = nexus
+  if (!projectConnected || !projectDocument) {
+    throw new Error('Connect an Audiotool project before loading audio')
+  }
+  if (!projectHasLoadedTimelineContent(projectDocument)) {
+    return {
+      deckIndex,
+      bar: 1,
+      positionTicks: Ticks.Bars(0),
+      source: 'project-start',
+      capturedAt: Date.now(),
+    }
+  }
+  const projectId = currentProjectId
+  const extensionCapture = projectId
+    ? await requestExtensionTransportBar(projectId, deckIndex)
+    : null
+  if (nexus !== projectDocument || !projectConnected) {
+    throw new Error('Project connection changed during placement capture')
+  }
+  const bar = extensionCapture?.bar ?? await showPlacementModal(deckIndex)
+  if (bar === null) return null
+  if (nexus !== projectDocument || !projectConnected) {
+    throw new Error('Project connection changed during manual placement')
+  }
+  return {
+    deckIndex,
+    bar,
+    positionTicks: barToPositionTicks(bar, Ticks.Bars(1)),
+    source: extensionCapture ? 'extension' : 'manual',
+    capturedAt: extensionCapture?.capturedAt ?? Date.now(),
+  }
 }
 
 // ── AUTH — based on the minimal example ──────────────────────────────────────
@@ -343,6 +515,8 @@ async function connectProject() {
   if (!at) { setStatus('error', 'NOT LOGGED IN'); return }
   const projectUrl = inputProjectUrl.value.trim()
   if (!projectUrl) { setStatus('error', 'PASTE AN AUDIOTOOL PROJECT URL ABOVE'); return }
+  const projectId = projectIdFromUrl(projectUrl)
+  if (!projectId) { setStatus('error', 'AUDIOTOOL PROJECT URL DOES NOT CONTAIN A PROJECT ID'); return }
   setStatus('connecting', 'OPENING PROJECT…')
   btnConnect.disabled = true
   resetTempoMasterSession()
@@ -355,6 +529,7 @@ async function connectProject() {
   clearDeckProjectEntities(decks[2])
   try {
     nexus = await at.open(projectUrl)
+    currentProjectId = projectId
     const projectDocument = nexus
     const expectedSession = tempoSessionId
     projectDocument.connected.subscribe((connected) => {
@@ -385,6 +560,7 @@ async function connectProject() {
     setStatus('error', `PROJECT ERROR: ${e instanceof Error ? e.message : String(e)}`)
     nexus = null
     projectConnected = false
+    currentProjectId = null
     btnConnect.disabled = false
   }
 }
@@ -392,6 +568,7 @@ async function connectProject() {
 function resetTempoMasterSession() {
   tempoSessionId += 1
   projectConnected = false
+  currentProjectId = null
   tempoMasterEstablished = false
   currentProjectBpm = null
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
@@ -1837,6 +2014,7 @@ async function insertSampleIntoProject(
   sample: SampleMeta,
   displayName: string,
   forceMagicLoop: boolean,
+  placement: DeckInsertionPlacement,
   resolution?: BpmResolution,
   expectedSession = tempoSessionId,
   timing?: SampleTiming,
@@ -1845,6 +2023,7 @@ async function insertSampleIntoProject(
   const projectDocument = nexus
   const deckIndex = (deckNum - 1) as WaveformDeckIndex
   const deck = decks[deckIndex]
+  if (placement.deckIndex !== deckIndex) throw new Error('Insertion placement belongs to another deck')
   const sampleBpm = normalizeBpm(sample.bpm)
   const bpm = normalizeBpm(timing?.bpm ?? resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
   if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
@@ -1890,8 +2069,8 @@ async function insertSampleIntoProject(
           ? { bpm }
           : { musicDurationTicks: timing.musicDurationTicks },
       region: forceMagicLoop
-        ? { positionTicks: 0, durationTicks: getMagicLoopDurationTicks(t) }
-        : { positionTicks: 0 },
+        ? { positionTicks: placement.positionTicks, durationTicks: getMagicLoopDurationTicks(t) }
+        : { positionTicks: placement.positionTicks },
       loop: forceMagicLoop ? true : undefined,
       attachTo: targetTrack,
       displayName,
@@ -1973,6 +2152,18 @@ async function uploadToNexus(
     } else if (resolution?.source === 'manual') {
       setStatus('connected', `DECK ${deckNum}: MANUAL BPM ${resolution.bpm} SELECTED`)
     }
+    const deckIndex = (deckNum - 1) as WaveformDeckIndex
+    const placement = options.placement ?? await captureDeckInsertionPlacement(deckIndex)
+    if (!placement) {
+      if (deckNum === 3) {
+        setMagicStatus('warning', 'PLACEMENT CANCELLED · PREVIOUS MAGIC DECK PRESERVED')
+      }
+      setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: PLACEMENT CANCELLED — SAMPLE NOT INSERTED`)
+      return false
+    }
+    if (expectedSession !== tempoSessionId || !nexus) {
+      throw new Error('Project connection changed during placement capture')
+    }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
     if (deckNum === 3 && options.replaceExistingMagic && decks[2].regionEntity) {
       setMagicStatus('generating', 'REPLACING PREVIOUS MAGIC DECK')
@@ -1984,6 +2175,7 @@ async function uploadToNexus(
       sample,
       projectDisplayName,
       forceMagicLoop,
+      placement,
       resolution ?? undefined,
       expectedSession,
       options.timing,
@@ -2198,7 +2390,12 @@ function deckStop(deck: DeckState) {
   source?.stop()
   if (deck === decks[2]) redrawMagicWaveform()
 }
-async function loadAudioFile(deckIndex: 0 | 1, file: File, expectedSession: number) {
+async function loadAudioFile(
+  deckIndex: 0 | 1,
+  file: File,
+  expectedSession: number,
+  placement: DeckInsertionPlacement,
+) {
   const deck = decks[deckIndex]
   const operation = deckOperationStates[deckIndex]
   const replacing = isSourceDeckSynchronized(deckIndex)
@@ -2213,7 +2410,7 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File, expectedSession: numb
     updateSourceDeckUi(deckIndex)
   }
 
-  const inserted = await uploadToNexus(deckIndex + 1, file, false, expectedSession)
+  const inserted = await uploadToNexus(deckIndex + 1, file, false, expectedSession, { placement })
   if (!inserted) {
     updateSourceDeckUi(deckIndex)
     return
@@ -2224,7 +2421,7 @@ async function loadAudioFile(deckIndex: 0 | 1, file: File, expectedSession: numb
   updateSourceDeckUi(deckIndex)
 }
 
-function queueDeckLoad(deckIndex: 0 | 1, file: File) {
+function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPlacement) {
   const operation = deckOperationStates[deckIndex]
   const expectedSession = tempoSessionId
   operation.pendingCount += 1
@@ -2232,7 +2429,7 @@ function queueDeckLoad(deckIndex: 0 | 1, file: File) {
   deckLoadQueue = deckLoadQueue
     .then(async () => {
       if (expectedSession !== tempoSessionId) return
-      await loadAudioFile(deckIndex, file, expectedSession)
+      await loadAudioFile(deckIndex, file, expectedSession, placement)
     })
     .catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
@@ -2914,7 +3111,7 @@ async function generateMagicAudio() {
     const magicDeck = decks[2]
     ensureCtx(magicDeck)
     const generatedBuffer = await magicDeck.audioCtx!.decodeAudioData(await generatedBlob.arrayBuffer())
-    await uploadToNexus(3, generatedFile, true, tempoSessionId, {
+    const inserted = await uploadToNexus(3, generatedFile, true, tempoSessionId, {
       timing: {
         bpm: generationBpm,
         musicDurationTicks: Ticks.Bars(MAGIC_DURATION_BARS),
@@ -2922,6 +3119,10 @@ async function generateMagicAudio() {
       replaceExistingMagic: true,
       sampleDescription: promptText,
     })
+    if (!inserted) {
+      setTimeout(() => setMagicStatus('idle', 'IDLE'), 5000)
+      return
+    }
     deckStop(magicDeck)
     magicDeck.looping = true
     magicDeck.audioBuffer = generatedBuffer
@@ -2967,7 +3168,18 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
     const file = e.dataTransfer?.files?.[0]
     if (!file) return
     if (!file.name.match(/\.(mp3|wav)$/i)) { setStatus('error', 'ONLY MP3 / WAV FILES ACCEPTED'); return }
-    queueDeckLoad(deckIndex, file)
+    setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: CAPTURING AUDIOTOOL BAR…`)
+    try {
+      const placement = await captureDeckInsertionPlacement(deckIndex)
+      if (!placement) {
+        setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: LOAD CANCELLED — PROJECT CONTENT PRESERVED`)
+        return
+      }
+      queueDeckLoad(deckIndex, file, placement)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: LOAD FAILED — ${message}`)
+    }
   })
 }
 

@@ -320,5 +320,34 @@
     </div>
   </div>
 </div>
+
+<!-- Deck Assistant fallback for manual Audiotool bar placement -->
+<div id="placement-modal" class="modal-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="placement-modal-title">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-kicker">DECK ASSISTANT</span>
+      <h2 class="modal-title" id="placement-modal-title">Choose Insertion Bar</h2>
+    </div>
+    <div class="modal-body">
+      <p class="modal-copy" id="placement-modal-copy"></p>
+      <label class="modal-label" for="placement-modal-input">CURRENT AUDIOTOOL BAR</label>
+      <input
+        type="number"
+        id="placement-modal-input"
+        class="modal-input"
+        min="1"
+        step="1"
+        value="1"
+        inputmode="numeric"
+        autocomplete="off"
+      />
+      <div class="modal-error" id="placement-modal-error" aria-live="polite"></div>
+    </div>
+    <div class="modal-actions">
+      <button id="placement-modal-cancel" class="btn-danger" type="button">⬡ CANCEL LOAD</button>
+      <button id="placement-modal-confirm" class="btn-primary" type="button">⬡ PLACE AT BAR</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>

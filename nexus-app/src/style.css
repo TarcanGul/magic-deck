@@ -613,6 +613,21 @@ input[type="range"]:not(.v-fader)::-moz-range-thumb {
   margin-left: 4px;
 }
 .modal-hint { min-height: 1.2em; margin: 8px 0 0; color: var(--grey-text); font-family: var(--font-data); font-size: 11px; }
+.modal-copy {
+  margin: 0 0 4px;
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.modal-error {
+  min-height: 1.4em;
+  margin-top: 4px;
+  color: var(--red);
+  font-family: var(--font-data);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+}
 
 .modal-input {
   width: 100%;

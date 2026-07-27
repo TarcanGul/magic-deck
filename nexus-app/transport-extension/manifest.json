@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Magic Deck Audiotool Transport",
+  "version": "1.0.0",
+  "description": "Places Magic Deck regions at the visible Audiotool Studio bar.",
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://beta.audiotool.com/*",
+    "http://127.0.0.1:5173/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://beta.audiotool.com/*"
+      ],
+      "js": [
+        "studio-content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1:5173/*"
+      ],
+      "js": [
+        "app-content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "transport-utils.js"
+      ],
+      "matches": [
+        "https://beta.audiotool.com/*"
+      ]
+    }
+  ]
+}

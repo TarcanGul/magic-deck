@@ -15,6 +15,34 @@ Key files are:
 
 Keep generated build output out of source control. Put future assets under `nexus-app/src/assets/`.
 
+## Deck Placement Process
+
+Deck A, Deck B, and Magic Deck insert at the beginning of the current Audiotool
+bar. The local app requests the visible Studio transport counter through the
+Manifest V3 companion extension in `nexus-app/transport-extension`. Match the
+Audiotool tab to the connected project UUID, accept only a fresh, matching,
+unambiguous response, and convert one-based bar `N` to `Ticks.Bars(N - 1)`.
+
+Treat the synchronized Audiotool project as empty when it contains no
+`audioRegion`, `noteRegion`, `patternRegion`, or `automationRegion` entities. If
+the project is empty, do not request the transport counter or ask the user for
+a bar; place the first inserted deck at bar 1 (`positionTicks = 0`)
+automatically. Empty routing tracks and devices do not count as loaded timeline
+content.
+
+When automatic transport capture is unavailable for a non-empty project, use
+the in-app Deck Assistant placement modal for one-based whole-number bar entry.
+Do not use JavaScript `window.prompt` or `window.alert` for placement. Invalid
+input errors stay inside the modal, Escape and Cancel abort placement, and
+cancelling must preserve existing project content.
+
+Source decks capture their immutable placement when file loading begins, before
+queueing, BPM confirmation, upload, or replacement removal. Magic Deck uploads
+the generated sample first, then captures placement immediately before removing
+the previous Magic region and inserting the new one. Preserve existing routing,
+mixer settings, names, loop configuration, source timing, and Magic prompt
+metadata while changing only region content and position.
+
 ## Magenta Generation Process
 
 `magenta_server.py` exposes `POST /generate`, which returns a generated WAV by blending a reference audio clip with a text style prompt. The server uses Magenta RT2 model `mrt2_small`, 48 kHz audio, an internal 25 fps generation frame rate, and 4 beats per bar. The Magenta runtime loads lazily on the first request: `musiccoca.MusicCoCa()` embeds the reference audio style, and `system.MagentaRT2SystemMlxfn(size="mrt2_small")` performs generation.
