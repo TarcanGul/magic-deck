@@ -66,6 +66,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         projectId,
         ok: true,
         bar: capture.bar,
+        beat: capture.beat,
+        tick: capture.tick,
+        precision: capture.precision,
         raw: capture.raw,
         capturedAt: capture.capturedAt,
       })

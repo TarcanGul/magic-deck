@@ -8,11 +8,19 @@ import {
   TRANSPORT_CHANNEL,
   TRANSPORT_REQUEST_TIMEOUT_MS,
   barToPositionTicks,
+  guardedTransportTicks,
+  planRegionCancel,
+  planRegionLaunch,
+  planRegionStop,
   projectIdFromUrl,
+  resolveLaunchTick,
+  tickToBar,
   validateTransportResponse,
 } from '../transport-extension/transport-utils.js'
 import type {
+  LaunchQuantization,
   TransportRequest,
+  TransportPosition,
   TransportResponse,
 } from '../transport-extension/transport-utils.js'
 import {
@@ -33,10 +41,8 @@ const SCOPE = 'project:write sample:write'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface DeckState {
-  audioCtx: AudioContext | null; sourceNode: AudioBufferSourceNode | null
-  gainNode: GainNode | null; audioBuffer: AudioBuffer | null
-  isPlaying: boolean; isPaused: boolean; pauseOffset: number
-  startedAt: number; looping: boolean; fileName: string | null
+  audioCtx: AudioContext | null; audioBuffer: AudioBuffer | null
+  fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
   tempoPercent: number; tempoRange: TempoRange; tempoSync: boolean
   tempoUpdatePending: boolean; pendingTempoPercent: number | null
@@ -118,7 +124,7 @@ interface AubioBpmResult {
 }
 interface DeckOperationState {
   pendingCount: number
-  activeKind: 'loading' | 'replacing' | 'unloading' | null
+  activeKind: 'loading' | 'replacing' | 'unloading' | 'launching' | 'cancelling' | 'stopping' | 'generating' | null
   suppressProjectRemovalSync: boolean
 }
 interface ManualBpmReportState {
@@ -182,7 +188,6 @@ let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let placementModalQueue: Promise<void> = Promise.resolve()
 let tempoSessionId = 0
-let waveformAnimationFrame: number | null = null
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
 let liveAudioStream: MediaStream | null = null
@@ -199,15 +204,16 @@ const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
   { editing: false, pending: false, requestId: 0 },
 ]
-const deckOperationStates: [DeckOperationState, DeckOperationState] = [
+const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
+  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
   { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
   { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
 ]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -256,10 +262,10 @@ function placementDeckLabel(deckIndex: WaveformDeckIndex) {
   return 'Magic Deck'
 }
 
-function requestExtensionTransportBar(
+function requestExtensionTransportPosition(
   projectId: string,
   deckIndex: WaveformDeckIndex,
-): Promise<{ bar: number; capturedAt: number } | null> {
+): Promise<TransportPosition | null> {
   const requestId = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
   const request: TransportRequest = {
@@ -272,7 +278,7 @@ function requestExtensionTransportBar(
 
   return new Promise((resolve) => {
     let settled = false
-    const finish = (result: { bar: number; capturedAt: number } | null) => {
+    const finish = (result: TransportPosition | null) => {
       if (settled) return
       settled = true
       window.clearTimeout(timeoutId)
@@ -290,7 +296,7 @@ function requestExtensionTransportBar(
         ) finish(null)
         return
       }
-      finish({ bar: validation.bar, capturedAt: validation.capturedAt })
+      finish(validation.position)
     }
     const timeoutId = window.setTimeout(() => finish(null), TRANSPORT_REQUEST_TIMEOUT_MS)
     window.addEventListener('message', onMessage)
@@ -298,7 +304,12 @@ function requestExtensionTransportBar(
   })
 }
 
-function showPlacementModalNow(deckIndex: WaveformDeckIndex): Promise<number | null> {
+type BarModalPurpose = 'placement' | 'launch' | 'exact-launch' | 'stop' | 'cancel-check'
+
+function showBarModalNow(
+  deckIndex: WaveformDeckIndex,
+  purpose: BarModalPurpose,
+): Promise<number | null> {
   return new Promise((resolve) => {
     const overlay = el<HTMLDivElement>('placement-modal')
     const title = el<HTMLHeadingElement>('placement-modal-title')
@@ -309,9 +320,43 @@ function showPlacementModalNow(deckIndex: WaveformDeckIndex): Promise<number | n
     const cancel = el<HTMLButtonElement>('placement-modal-cancel')
     const label = placementDeckLabel(deckIndex)
 
-    title.textContent = `Choose ${label} Insertion Bar`
-    copy.textContent =
-      `The Audiotool transport could not be read automatically. Enter the whole-number bar currently displayed in Studio. ${label} will be placed at the beginning of that bar.`
+    const modalCopy: Record<BarModalPurpose, { title: string; copy: string; confirm: string; cancel: string }> = {
+      placement: {
+        title: `Choose ${label} Insertion Bar`,
+        copy: `The Audiotool transport could not be read automatically. Enter the whole-number bar currently displayed in Studio. ${label} will be placed at the beginning of that bar.`,
+        confirm: '⬡ PLACE AT BAR',
+        cancel: '⬡ CANCEL LOAD',
+      },
+      launch: {
+        title: `Choose ${label} Launch Bar`,
+        copy: 'Automatic transport capture is unavailable. Enter the future whole-number bar where this deck should launch.',
+        confirm: '⬡ LAUNCH AT BAR',
+        cancel: '⬡ CANCEL',
+      },
+      'exact-launch': {
+        title: `Choose ${label} Launch Bar`,
+        copy: 'Enter the future whole-number Audiotool bar where this deck should launch.',
+        confirm: '⬡ USE BAR',
+        cancel: '⬡ CANCEL',
+      },
+      stop: {
+        title: `Choose ${label} Stop Bar`,
+        copy: 'Automatic transport capture is unavailable. Enter the future whole-number bar where this deck should stop.',
+        confirm: '⬡ STOP AT BAR',
+        cancel: '⬡ CANCEL',
+      },
+      'cancel-check': {
+        title: `Confirm ${label} Current Bar`,
+        copy: 'Automatic transport capture is unavailable. Enter the whole-number bar currently displayed in Audiotool so Deck Assistant can confirm the launch has not begun.',
+        confirm: '⬡ CHECK & CANCEL',
+        cancel: '⬡ KEEP LAUNCH',
+      },
+    }
+    const content = modalCopy[purpose]
+    title.textContent = content.title
+    copy.textContent = content.copy
+    confirm.textContent = content.confirm
+    cancel.textContent = content.cancel
     input.value = '1'
     error.textContent = ''
     overlay.classList.remove('is-hidden')
@@ -351,10 +396,14 @@ function showPlacementModalNow(deckIndex: WaveformDeckIndex): Promise<number | n
   })
 }
 
-function showPlacementModal(deckIndex: WaveformDeckIndex) {
-  const queued = placementModalQueue.then(() => showPlacementModalNow(deckIndex))
+function showBarModal(deckIndex: WaveformDeckIndex, purpose: BarModalPurpose) {
+  const queued = placementModalQueue.then(() => showBarModalNow(deckIndex, purpose))
   placementModalQueue = queued.then(() => undefined, () => undefined)
   return queued
+}
+
+function showPlacementModal(deckIndex: WaveformDeckIndex) {
+  return showBarModal(deckIndex, 'placement')
 }
 
 function projectHasLoadedTimelineContent(projectDocument: SyncedDocument) {
@@ -382,7 +431,7 @@ async function captureDeckInsertionPlacement(
   }
   const projectId = currentProjectId
   const extensionCapture = projectId
-    ? await requestExtensionTransportBar(projectId, deckIndex)
+    ? await requestExtensionTransportPosition(projectId, deckIndex)
     : null
   if (nexus !== projectDocument || !projectConnected) {
     throw new Error('Project connection changed during placement capture')
@@ -566,6 +615,7 @@ async function connectProject() {
         updateSourceDeckUi(1)
       }
       decks.forEach((_, deckIndex) => renderTempoControls(deckIndex as WaveformDeckIndex))
+      decks.forEach((_, deckIndex) => renderDeckTransport(deckIndex as WaveformDeckIndex))
       setStatus(connected ? 'connected' : 'error', connected ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…')
     })
     loadBPM()
@@ -602,6 +652,7 @@ function resetTempoMasterSession() {
   resetManualBpmReport(1)
   updateSourceDeckUi(0)
   updateSourceDeckUi(1)
+  decks.forEach((_, deckIndex) => renderDeckTransport(deckIndex as WaveformDeckIndex))
 }
 
 // ── NEXUS ─────────────────────────────────────────────────────────────────────
@@ -1188,7 +1239,6 @@ async function restoreMagicDeckFromProject(
   magicDeck.sampleBpm = isSupportedBpm(metadataBpm) ? metadataBpm : null
   magicDeck.baseBpm = magicDeck.sampleBpm ?? (isSupportedBpm(projectBpm) ? projectBpm : null)
   magicDeck.sampleMeta = sampleMeta
-  magicDeck.looping = true
   magicWaveformPeaks = peaks
   bindDeckContentGraph(2, projectDocument, selected.content, expectedSession)
   updateDeckBpmLabel(2)
@@ -1229,6 +1279,7 @@ function clearDeckContentEntities(deck: DeckState) {
   deck.automationCollectionEntity = null
   const deckIndex = decks.indexOf(deck)
   if (deckIndex >= 0) resetDeckTempoState(deckIndex as WaveformDeckIndex)
+  if (deckIndex >= 0) renderDeckTransport(deckIndex as WaveformDeckIndex)
   if (deckIndex === 0 || deckIndex === 1) {
     resetManualBpmReport(deckIndex)
   }
@@ -1277,7 +1328,7 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
   const operation = deckOperationStates[deckIndex]
   const loaded = isSourceDeckSynchronized(deckIndex)
-  const pending = operation.pendingCount > 0
+  const pending = operation.pendingCount > 0 || decks[deckIndex].tempoUpdatePending
   const zone = el<HTMLDivElement>(`drop-${deckIndex + 1}`)
   const filename = el<HTMLDivElement>(`drop${deckIndex + 1}-filename`)
   const metadataBpm = el<HTMLElement>(`drop${deckIndex + 1}-bpm`)
@@ -1294,12 +1345,12 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   unload.classList.toggle('is-hidden', !loaded)
   unload.disabled = pending || !projectConnected
   renderTempoControls(deckIndex)
+  renderDeckTransport(deckIndex)
   updateManualBpmReportUi(deckIndex)
 }
 
 function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
-  deckStop(deck)
   deck.audioBuffer = null
   deck.fileName = null
   deck.baseBpm = null
@@ -1308,7 +1359,6 @@ function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
 
 function clearMagicDeckLocalMedia() {
   const magicDeck = decks[2]
-  deckStop(magicDeck)
   magicDeck.audioBuffer = null
   magicDeck.fileName = null
   magicDeck.baseBpm = null
@@ -1317,7 +1367,7 @@ function clearMagicDeckLocalMedia() {
   magicDeck.playbackRate = 1
   magicWaveformPeaks = null
   renderTempoControls(2)
-  syncTransportUi('d3', magicDeck)
+  renderDeckTransport(2)
   drawMagicIdle()
 }
 
@@ -1595,7 +1645,12 @@ function applyNativeSourceTiming(
     return { durationTicks, replacementRegion: replacement.region }
   }
 
-  t.update(region.fields.region.fields.durationTicks, durationTicks)
+  const previousFullDurationTicks = terminalEvent.fields.positionTicks.value
+  const previousRegionDurationTicks = region.fields.region.fields.durationTicks.value
+  const regionDurationTicks = previousRegionDurationTicks < previousFullDurationTicks
+    ? Math.min(previousRegionDurationTicks, durationTicks)
+    : durationTicks
+  t.update(region.fields.region.fields.durationTicks, regionDurationTicks)
   t.update(region.fields.region.fields.loopDurationTicks, durationTicks)
   t.update(terminalEvent.fields.positionTicks, durationTicks)
   t.update(region.fields.timestretchMode, 2)
@@ -1700,6 +1755,9 @@ async function applyDeckTempoUpdate(
       const transactionResult = await projectDocument.modify((t) => {
         const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
         if (!region) throw new Error('The project region is no longer available')
+        const magicStopEndTicks = deckIndex < 2
+          ? getMagicScheduledStopEndTicks(t)
+          : null
         const timingResult = deckIndex < 2
           ? applyNativeSourceTiming(
               t,
@@ -1734,6 +1792,8 @@ async function applyDeckTempoUpdate(
           updateMagicLoopDurationInTransaction(
             t,
             new Map([[regionId, timingResult.durationTicks]]),
+            undefined,
+            magicStopEndTicks,
           )
         }
         return {
@@ -1824,6 +1884,7 @@ function updateMagicLoopDurationInTransaction(
   t: SafeTransactionBuilder,
   durationOverrides?: ReadonlyMap<string, number>,
   durationTicksOverride?: number,
+  preservedStopEndTicks?: number | null,
 ) {
   const magicRegionId = decks[2].regionEntity?.id
   if (!magicRegionId) return
@@ -1831,12 +1892,30 @@ function updateMagicLoopDurationInTransaction(
   if (!magicRegion) return
   const durationTicks = durationTicksOverride
     ?? getMagicLoopDurationTicks(t, durationOverrides)
-  if (magicRegion.fields.region.fields.durationTicks.value !== durationTicks) {
-    t.update(magicRegion.fields.region.fields.durationTicks, durationTicks)
+  const regionDurationTicks = preservedStopEndTicks === null || preservedStopEndTicks === undefined
+    ? durationTicks
+    : Math.min(
+        durationTicks,
+        Math.max(0, preservedStopEndTicks - magicRegion.fields.region.fields.positionTicks.value),
+      )
+  if (magicRegion.fields.region.fields.durationTicks.value !== regionDurationTicks) {
+    t.update(magicRegion.fields.region.fields.durationTicks, regionDurationTicks)
   }
   if (magicRegion.fields.timestretchMode.value !== 2) {
     t.update(magicRegion.fields.timestretchMode, 2)
   }
+}
+
+function getMagicScheduledStopEndTicks(t: SafeTransactionBuilder) {
+  const magicRegionId = decks[2].regionEntity?.id
+  if (!magicRegionId) return null
+  const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
+  if (!magicRegion || !magicRegion.fields.region.fields.isEnabled.value) return null
+  const fullDurationTicks = getMagicLoopDurationTicks(t)
+  const durationTicks = magicRegion.fields.region.fields.durationTicks.value
+  return durationTicks < fullDurationTicks
+    ? magicRegion.fields.region.fields.positionTicks.value + durationTicks
+    : null
 }
 
 async function remapLoadedSourceRegions(
@@ -1888,6 +1967,7 @@ async function remapLoadedSourceRegions(
         regionDurationTicks: number
       }> = []
       const durationOverrides = new Map<string, number>()
+      const magicStopEndTicks = getMagicScheduledStopEndTicks(t)
       sources.forEach((source) => {
         const region = t.entities.ofTypes('audioRegion').getEntity(source.regionId)
         if (!region) throw new Error(`Deck ${source.deckIndex + 1} project region was not found`)
@@ -1932,7 +2012,12 @@ async function remapLoadedSourceRegions(
           })
         }
       })
-      updateMagicLoopDurationInTransaction(t, durationOverrides)
+      updateMagicLoopDurationInTransaction(
+        t,
+        durationOverrides,
+        undefined,
+        magicStopEndTicks,
+      )
       return { applied: true, replacements: nextReplacements, timings }
     })
     if (!transactionResult.applied) return { applied: false, rejected }
@@ -1986,6 +2071,7 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
       const transactionResult = await projectDocument.modify((t) => {
         const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
         if (!region) throw new Error('The project region is no longer available')
+        const magicStopEndTicks = getMagicScheduledStopEndTicks(t)
         const sourceDeckCount = loadedSourceDeckCount(t)
         if (sourceDeckCount < 1) throw new Error('No loaded source region was found')
         const projectTempoUpdated = sourceDeckCount === 1
@@ -2035,6 +2121,8 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
         updateMagicLoopDurationInTransaction(
           t,
           new Map([[regionId, timingResult.durationTicks]]),
+          undefined,
+          magicStopEndTicks,
         )
         return {
           projectTempoUpdated,
@@ -2352,10 +2440,647 @@ function getMagicLoopDurationTicks(
       return Math.max(durationTicks, durationOverride)
     }
     const region = t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
-    return region
-      ? Math.max(durationTicks, region.fields.region.fields.durationTicks.value)
-      : durationTicks
+    if (!region) return durationTicks
+    const terminalEvent = getExpectedPlaybackTerminalEvent(t, region)
+    const fullDurationTicks = terminalEvent?.fields.positionTicks.value
+      ?? region.fields.region.fields.loopDurationTicks.value
+    return Math.max(durationTicks, fullDurationTicks)
   }, Ticks.Bars(MAGIC_DURATION_BARS))
+}
+
+function getDeckFullDurationTicks(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  region: NexusEntity<'audioRegion'>,
+) {
+  if (deckIndex === 2) return getMagicLoopDurationTicks(t)
+  const terminalEvent = getExpectedPlaybackTerminalEvent(t, region)
+  if (!terminalEvent) {
+    throw new Error('Deck playback automation is not in the expected synchronized form')
+  }
+  return terminalEvent.fields.positionTicks.value
+}
+
+function getSynchronizedDeckFullDurationTicks(deckIndex: WaveformDeckIndex) {
+  const region = decks[deckIndex].regionEntity
+  const projectDocument = nexus
+  if (!region || !projectDocument) return null
+  if (deckIndex === 2) {
+    return decks.slice(0, 2).reduce((durationTicks, sourceDeck) => {
+      const sourceRegion = sourceDeck.regionEntity
+      if (!sourceRegion) return durationTicks
+      const terminalEvent = getExpectedPlaybackTerminalEvent(
+        { entities: projectDocument.queryEntities },
+        sourceRegion,
+      )
+      return Math.max(
+        durationTicks,
+        terminalEvent?.fields.positionTicks.value
+          ?? sourceRegion.fields.region.fields.loopDurationTicks.value,
+      )
+    }, Ticks.Bars(MAGIC_DURATION_BARS))
+  }
+  return getExpectedPlaybackTerminalEvent(
+    { entities: projectDocument.queryEntities },
+    region,
+  )?.fields.positionTicks.value ?? null
+}
+
+function getDeckTransportElements(deckIndex: WaveformDeckIndex) {
+  const prefix = `d${deckIndex + 1}`
+  return {
+    quantization: el<HTMLSelectElement>(`${prefix}-quantization`),
+    crossfadeFrom: el<HTMLSelectElement>(`${prefix}-crossfade-from`),
+    crossfadeBars: el<HTMLSelectElement>(`${prefix}-crossfade-bars`),
+    launch: el<HTMLButtonElement>(`${prefix}-launch`),
+    cancel: el<HTMLButtonElement>(`${prefix}-cancel`),
+    stop: el<HTMLButtonElement>(`${prefix}-stop-next-bar`),
+    status: el<HTMLSpanElement>(`${prefix}-project-status`),
+    error: el<HTMLDivElement>(`${prefix}-transport-error`),
+  }
+}
+
+function renderDeckTransport(deckIndex: WaveformDeckIndex) {
+  const controls = getDeckTransportElements(deckIndex)
+  const operation = deckOperationStates[deckIndex]
+  const region = decks[deckIndex].regionEntity
+  const available = projectConnected && nexus !== null && region !== null
+  const pending = operation.pendingCount > 0
+  const outgoingValue = controls.crossfadeFrom.value
+  const outgoingDeckIndex = outgoingValue === ''
+    ? null
+    : Number(outgoingValue) as WaveformDeckIndex
+  const incomingAutomationBlocked = deckHasUserGainAutomation(deckIndex)
+  const outgoingAutomationBlocked = outgoingDeckIndex === null
+    ? false
+    : deckHasUserGainAutomation(outgoingDeckIndex)
+  if (outgoingAutomationBlocked) {
+    controls.crossfadeFrom.value = ''
+    controls.error.textContent =
+      `${placementDeckLabel(outgoingDeckIndex!)} HAS USER GAIN AUTOMATION — ORDINARY LAUNCH REMAINS AVAILABLE`
+  }
+  controls.quantization.disabled = !available || pending
+  controls.crossfadeFrom.disabled = !available || pending || incomingAutomationBlocked
+  controls.crossfadeBars.disabled = !available || pending || controls.crossfadeFrom.value === ''
+  controls.crossfadeFrom.title = incomingAutomationBlocked
+    ? 'Crossfade unavailable because this deck gain already has user automation'
+    : ''
+  controls.launch.disabled = !available || pending
+  controls.cancel.disabled = !available || pending || region?.fields.region.fields.isEnabled.value !== true
+  controls.stop.disabled = !available || pending || region?.fields.region.fields.isEnabled.value !== true
+  controls.launch.textContent = pending && operation.activeKind === 'launching' ? 'SCHEDULING…' : 'LAUNCH'
+  controls.cancel.textContent = pending && operation.activeKind === 'cancelling' ? 'CHECKING…' : 'CANCEL'
+  controls.stop.textContent = pending && operation.activeKind === 'stopping' ? 'SCHEDULING…' : 'STOP NEXT BAR'
+
+  if (!region) {
+    controls.status.textContent = 'EMPTY'
+    return
+  }
+  if (!region.fields.region.fields.isEnabled.value) {
+    controls.status.textContent = 'READY'
+    return
+  }
+  const positionTicks = region.fields.region.fields.positionTicks.value
+  const durationTicks = region.fields.region.fields.durationTicks.value
+  const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+  if (fullDurationTicks !== null && durationTicks < fullDurationTicks) {
+    controls.status.textContent = `STOP · BAR ${tickToBar(positionTicks + durationTicks, Ticks.Bars(1))}`
+    return
+  }
+  controls.status.textContent = `ARMED · BAR ${tickToBar(positionTicks, Ticks.Bars(1))}`
+}
+
+function clearDeckTransportError(deckIndex: WaveformDeckIndex) {
+  getDeckTransportElements(deckIndex).error.textContent = ''
+}
+
+function setDeckTransportError(deckIndex: WaveformDeckIndex, message: string) {
+  getDeckTransportElements(deckIndex).error.textContent = message.toUpperCase()
+}
+
+function assertDeckMutationContext(
+  projectDocument: SyncedDocument,
+  deckIndex: WaveformDeckIndex,
+  expectedSession: number,
+  regionId: string,
+  trackId: string,
+  audioDeviceId: string,
+) {
+  const deck = decks[deckIndex]
+  if (
+    nexus !== projectDocument
+    || !projectConnected
+    || expectedSession !== tempoSessionId
+    || deck.regionEntity?.id !== regionId
+    || deck.trackEntity?.id !== trackId
+    || deck.audioDeviceEntity?.id !== audioDeviceId
+  ) {
+    throw new Error('The project session, region, or routing graph changed')
+  }
+}
+
+async function automaticGuardedTransportTicks(
+  deckIndex: WaveformDeckIndex,
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  const projectId = currentProjectId
+  const bpm = currentProjectBpm
+  if (!projectId || !isSupportedBpm(bpm)) return null
+  const position = await requestExtensionTransportPosition(projectId, deckIndex)
+  if (
+    nexus !== projectDocument
+    || expectedSession !== tempoSessionId
+    || currentProjectBpm !== bpm
+  ) {
+    throw new Error('Project connection or tempo changed during transport capture')
+  }
+  return position
+    ? guardedTransportTicks(
+        position,
+        bpm,
+        Date.now(),
+        Ticks.Beat,
+        Ticks.Bars(1),
+      )
+    : null
+}
+
+async function resolveDeckLaunchTarget(
+  deckIndex: WaveformDeckIndex,
+  quantization: LaunchQuantization,
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  const exactBar = quantization === 'exact-bar'
+    ? await showBarModal(deckIndex, 'exact-launch')
+    : undefined
+  if (quantization === 'exact-bar' && exactBar === null) return null
+  const guardedTicks = await automaticGuardedTransportTicks(
+    deckIndex,
+    projectDocument,
+    expectedSession,
+  )
+  if (guardedTicks === null) {
+    const targetBar = exactBar ?? await showBarModal(deckIndex, 'launch')
+    return targetBar === null ? null : barToPositionTicks(targetBar, Ticks.Bars(1))
+  }
+  const targetTicks = resolveLaunchTick(
+    quantization,
+    guardedTicks,
+    Ticks.Bars(1),
+    exactBar ?? undefined,
+  )
+  if (targetTicks === null) {
+    throw new Error(`Bar ${exactBar} is no longer beyond the guarded transport position`)
+  }
+  return targetTicks
+}
+
+async function resolveDeckStopTarget(
+  deckIndex: WaveformDeckIndex,
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  const guardedTicks = await automaticGuardedTransportTicks(
+    deckIndex,
+    projectDocument,
+    expectedSession,
+  )
+  if (guardedTicks !== null) {
+    return {
+      guardedTicks,
+      targetTicks: resolveLaunchTick('next-bar', guardedTicks, Ticks.Bars(1))!,
+    }
+  }
+  const targetBar = await showBarModal(deckIndex, 'stop')
+  if (targetBar === null) return null
+  const targetTicks = barToPositionTicks(targetBar, Ticks.Bars(1))
+  return { guardedTicks: Math.max(0, targetTicks - 1), targetTicks }
+}
+
+async function resolveDeckCancelPosition(
+  deckIndex: WaveformDeckIndex,
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  const guardedTicks = await automaticGuardedTransportTicks(
+    deckIndex,
+    projectDocument,
+    expectedSession,
+  )
+  if (guardedTicks !== null) return guardedTicks
+  const currentBar = await showBarModal(deckIndex, 'cancel-check')
+  if (currentBar === null) return null
+  return guardedTransportTicks(
+    { bar: currentBar, precision: 'bar', capturedAt: Date.now() },
+    currentProjectBpm ?? 120,
+    Date.now(),
+    Ticks.Beat,
+    Ticks.Bars(1),
+  )
+}
+
+function crossfadeAutomationName(deckIndex: WaveformDeckIndex) {
+  return `MAGIC DECK CROSSFADE ${deckIndex === 0 ? 'A' : deckIndex === 1 ? 'B' : 'MAGIC'}`
+}
+
+function inspectGainAutomation(
+  entities: EntityQuery,
+  deckIndex: WaveformDeckIndex,
+  audioDevice: NexusEntity<'audioDevice'>,
+) {
+  const expectedName = crossfadeAutomationName(deckIndex)
+  const targetTracks = entities
+    .ofTypes('automationTrack')
+    .get()
+    .filter((track) =>
+      track.fields.automatedParameter.value.equals(audioDevice.fields.gain.location),
+    )
+  const ownedTracks = targetTracks.filter((track) => {
+    const regions = entities
+      .ofTypes('automationRegion')
+      .get()
+      .filter((region) => region.fields.track.value.entityId === track.id)
+    return regions.length > 0 && regions.every((region) =>
+      region.fields.region.fields.displayName.value === expectedName,
+    )
+  })
+  return {
+    conflict: targetTracks.length > 1
+      || (targetTracks.length === 1 && ownedTracks.length !== 1),
+    ownedTrack: ownedTracks.length === 1 ? ownedTracks[0] : null,
+  }
+}
+
+function deckHasUserGainAutomation(deckIndex: WaveformDeckIndex) {
+  const projectDocument = nexus
+  const audioDevice = decks[deckIndex].audioDeviceEntity
+  return projectDocument && audioDevice
+    ? inspectGainAutomation(projectDocument.queryEntities, deckIndex, audioDevice).conflict
+    : false
+}
+
+function findOwnedGainAutomationTrack(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  audioDevice: NexusEntity<'audioDevice'>,
+) {
+  const inspection = inspectGainAutomation(t.entities, deckIndex, audioDevice)
+  if (inspection.conflict) {
+    throw new Error(
+      `${placementDeckLabel(deckIndex)} gain already has user automation; crossfade is unavailable`,
+    )
+  }
+  return inspection.ownedTrack
+}
+
+function replaceCrossfadeAutomation(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  audioDevice: NexusEntity<'audioDevice'>,
+  positionTicks: number,
+  durationTicks: number,
+  startValue: number,
+  endValue: number,
+) {
+  const displayName = crossfadeAutomationName(deckIndex)
+  const existingTrack = findOwnedGainAutomationTrack(t, deckIndex, audioDevice)
+  const track = existingTrack ?? t.create('automationTrack', {
+    orderAmongTracks: nextTrackOrder(t.entities),
+    automatedParameter: audioDevice.fields.gain.location,
+  })
+  const ownedRegions = t.entities
+    .ofTypes('automationRegion')
+    .get()
+    .filter((region) =>
+      region.fields.track.value.entityId === track.id
+      && region.fields.region.fields.displayName.value === displayName,
+    )
+  ownedRegions.forEach((region) => {
+    const collectionId = region.fields.collection.value.entityId
+    const collection = t.entities.ofTypes('automationCollection').getEntity(collectionId)
+    const events = t.entities
+      .ofTypes('automationEvent')
+      .get()
+      .filter((event) => event.fields.collection.value.entityId === collectionId)
+    t.remove(region)
+    events.forEach((event) => t.remove(event))
+    if (collection) t.remove(collection)
+  })
+
+  const collection = t.create('automationCollection', {})
+  t.create('automationEvent', {
+    collection: collection.location,
+    positionTicks: 0,
+    value: startValue,
+    interpolation: 2,
+  })
+  t.create('automationEvent', {
+    collection: collection.location,
+    positionTicks: durationTicks,
+    value: endValue,
+    interpolation: 2,
+  })
+  t.create('automationRegion', {
+    collection: collection.location,
+    track: track.location,
+    region: {
+      positionTicks,
+      durationTicks,
+      loopDurationTicks: durationTicks,
+      displayName,
+      isEnabled: true,
+    },
+  })
+}
+
+async function mutateDeckCrossfade(
+  incomingDeckIndex: WaveformDeckIndex,
+  outgoingDeckIndex: WaveformDeckIndex,
+  quantization: LaunchQuantization,
+  fadeBars: number,
+  expectedSession: number,
+) {
+  if (incomingDeckIndex === outgoingDeckIndex) throw new Error('Choose a different outgoing deck')
+  if (![1, 2, 4, 8].includes(fadeBars)) throw new Error('Crossfade duration must be 1, 2, 4, or 8 bars')
+  const projectDocument = nexus
+  const incomingDeck = decks[incomingDeckIndex]
+  const outgoingDeck = decks[outgoingDeckIndex]
+  const incomingRegionId = incomingDeck.regionEntity?.id
+  const outgoingRegionId = outgoingDeck.regionEntity?.id
+  const incomingTrackId = incomingDeck.trackEntity?.id
+  const outgoingTrackId = outgoingDeck.trackEntity?.id
+  const incomingDeviceId = incomingDeck.audioDeviceEntity?.id
+  const outgoingDeviceId = outgoingDeck.audioDeviceEntity?.id
+  if (
+    !projectDocument
+    || !incomingRegionId
+    || !outgoingRegionId
+    || !incomingTrackId
+    || !outgoingTrackId
+    || !incomingDeviceId
+    || !outgoingDeviceId
+  ) {
+    throw new Error('Both crossfade decks need synchronized regions and routing')
+  }
+  const targetTicks = await resolveDeckLaunchTarget(
+    incomingDeckIndex,
+    quantization,
+    projectDocument,
+    expectedSession,
+  )
+  if (targetTicks === null) return false
+  const fadeDurationTicks = Ticks.Bars(fadeBars)
+  await serializeSourceTiming(() => projectDocument.modify((t) => {
+    assertDeckMutationContext(
+      projectDocument,
+      incomingDeckIndex,
+      expectedSession,
+      incomingRegionId,
+      incomingTrackId,
+      incomingDeviceId,
+    )
+    assertDeckMutationContext(
+      projectDocument,
+      outgoingDeckIndex,
+      expectedSession,
+      outgoingRegionId,
+      outgoingTrackId,
+      outgoingDeviceId,
+    )
+    const incomingRegion = t.entities.ofTypes('audioRegion').getEntity(incomingRegionId)
+    const outgoingRegion = t.entities.ofTypes('audioRegion').getEntity(outgoingRegionId)
+    const incomingDevice = t.entities.ofTypes('audioDevice').getEntity(incomingDeviceId)
+    const outgoingDevice = t.entities.ofTypes('audioDevice').getEntity(outgoingDeviceId)
+    if (!incomingRegion || !outgoingRegion || !incomingDevice || !outgoingDevice) {
+      throw new Error('A crossfade deck changed before scheduling')
+    }
+    if (!outgoingRegion.fields.region.fields.isEnabled.value) {
+      throw new Error('The outgoing deck is not enabled on the project timeline')
+    }
+    const incomingPlan = planRegionLaunch(
+      getDeckFullDurationTicks(t, incomingDeckIndex, incomingRegion),
+      targetTicks,
+    )
+    t.update(incomingRegion.fields.region.fields.durationTicks, incomingPlan.durationTicks)
+    t.update(incomingRegion.fields.region.fields.positionTicks, incomingPlan.positionTicks)
+    t.update(incomingRegion.fields.region.fields.isEnabled, incomingPlan.isEnabled)
+
+    const fadeEndTicks = targetTicks + fadeDurationTicks
+    if (!Number.isSafeInteger(fadeEndTicks)) throw new Error('Crossfade boundary exceeds the safe tick range')
+    const outgoingPlan = planRegionStop(
+      outgoingRegion.fields.region.fields.positionTicks.value,
+      outgoingRegion.fields.region.fields.durationTicks.value,
+      getDeckFullDurationTicks(t, outgoingDeckIndex, outgoingRegion),
+      true,
+      targetTicks,
+      fadeEndTicks,
+    )
+    if (outgoingPlan.kind === 'cancel') {
+      throw new Error('The outgoing deck has not begun by the crossfade boundary')
+    }
+    if (outgoingPlan.kind === 'stop') {
+      t.update(outgoingRegion.fields.region.fields.durationTicks, outgoingPlan.durationTicks)
+    }
+    replaceCrossfadeAutomation(
+      t,
+      incomingDeckIndex,
+      incomingDevice,
+      targetTicks,
+      fadeDurationTicks,
+      0,
+      incomingDevice.fields.gain.value,
+    )
+    replaceCrossfadeAutomation(
+      t,
+      outgoingDeckIndex,
+      outgoingDevice,
+      targetTicks,
+      fadeDurationTicks,
+      outgoingDevice.fields.gain.value,
+      0,
+    )
+  }))
+  return true
+}
+
+async function mutateDeckLaunch(
+  deckIndex: WaveformDeckIndex,
+  quantization: LaunchQuantization,
+  expectedSession: number,
+) {
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  const regionId = deck.regionEntity?.id
+  const trackId = deck.trackEntity?.id
+  const audioDeviceId = deck.audioDeviceEntity?.id
+  if (!projectDocument || !regionId || !trackId || !audioDeviceId) {
+    throw new Error('The synchronized deck region and routing graph are required')
+  }
+  const targetTicks = await resolveDeckLaunchTarget(
+    deckIndex,
+    quantization,
+    projectDocument,
+    expectedSession,
+  )
+  if (targetTicks === null) return false
+  assertDeckMutationContext(
+    projectDocument,
+    deckIndex,
+    expectedSession,
+    regionId,
+    trackId,
+    audioDeviceId,
+  )
+  await serializeSourceTiming(() => projectDocument.modify((t) => {
+    assertDeckMutationContext(
+      projectDocument,
+      deckIndex,
+      expectedSession,
+      regionId,
+      trackId,
+      audioDeviceId,
+    )
+    const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+    const track = t.entities.ofTypes('audioTrack').getEntity(trackId)
+    const audioDevice = t.entities.ofTypes('audioDevice').getEntity(audioDeviceId)
+    if (!region || !track || !audioDevice || region.fields.track.value.entityId !== trackId) {
+      throw new Error('The deck region or routing graph changed before launch')
+    }
+    const plan = planRegionLaunch(
+      getDeckFullDurationTicks(t, deckIndex, region),
+      targetTicks,
+    )
+    t.update(region.fields.region.fields.durationTicks, plan.durationTicks)
+    t.update(region.fields.region.fields.positionTicks, plan.positionTicks)
+    t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+  }))
+  return true
+}
+
+async function mutateDeckCancel(deckIndex: WaveformDeckIndex, expectedSession: number) {
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  const regionId = deck.regionEntity?.id
+  const trackId = deck.trackEntity?.id
+  const audioDeviceId = deck.audioDeviceEntity?.id
+  if (!projectDocument || !regionId || !trackId || !audioDeviceId) {
+    throw new Error('The synchronized deck region and routing graph are required')
+  }
+  const guardedTicks = await resolveDeckCancelPosition(deckIndex, projectDocument, expectedSession)
+  if (guardedTicks === null) return false
+  await serializeSourceTiming(() => projectDocument.modify((t) => {
+    assertDeckMutationContext(
+      projectDocument,
+      deckIndex,
+      expectedSession,
+      regionId,
+      trackId,
+      audioDeviceId,
+    )
+    const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+    if (!region || region.fields.track.value.entityId !== trackId) {
+      throw new Error('The deck region changed before cancellation')
+    }
+    const plan = planRegionCancel(region.fields.region.fields.positionTicks.value, guardedTicks)
+    if (plan.kind === 'refuse') {
+      throw new Error('Launch boundary reached — use Stop Next Bar')
+    }
+    t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+  }))
+  return true
+}
+
+async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: number) {
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  const regionId = deck.regionEntity?.id
+  const trackId = deck.trackEntity?.id
+  const audioDeviceId = deck.audioDeviceEntity?.id
+  if (!projectDocument || !regionId || !trackId || !audioDeviceId) {
+    throw new Error('The synchronized deck region and routing graph are required')
+  }
+  const transport = await resolveDeckStopTarget(deckIndex, projectDocument, expectedSession)
+  if (transport === null) return false
+  await serializeSourceTiming(() => projectDocument.modify((t) => {
+    assertDeckMutationContext(
+      projectDocument,
+      deckIndex,
+      expectedSession,
+      regionId,
+      trackId,
+      audioDeviceId,
+    )
+    const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+    if (!region || region.fields.track.value.entityId !== trackId) {
+      throw new Error('The deck region changed before stop scheduling')
+    }
+    const plan = planRegionStop(
+      region.fields.region.fields.positionTicks.value,
+      region.fields.region.fields.durationTicks.value,
+      getDeckFullDurationTicks(t, deckIndex, region),
+      region.fields.region.fields.isEnabled.value,
+      transport.guardedTicks,
+      transport.targetTicks,
+    )
+    if (plan.kind === 'cancel') {
+      t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+    } else if (plan.kind === 'stop') {
+      t.update(region.fields.region.fields.durationTicks, plan.durationTicks)
+    }
+  }))
+  return true
+}
+
+function queueDeckTransportOperation(
+  deckIndex: WaveformDeckIndex,
+  kind: 'launching' | 'cancelling' | 'stopping',
+  task: (expectedSession: number) => Promise<boolean>,
+  relatedDeckIndex?: WaveformDeckIndex,
+) {
+  const operation = deckOperationStates[deckIndex]
+  const relatedOperation = relatedDeckIndex === undefined
+    ? null
+    : deckOperationStates[relatedDeckIndex]
+  if (
+    operation.pendingCount > 0
+    || relatedOperation?.pendingCount
+    || !projectConnected
+    || !decks[deckIndex].regionEntity
+    || (relatedDeckIndex !== undefined && !decks[relatedDeckIndex].regionEntity)
+  ) return
+  const expectedSession = tempoSessionId
+  operation.pendingCount += 1
+  operation.activeKind = kind
+  if (relatedOperation) {
+    relatedOperation.pendingCount += 1
+    relatedOperation.activeKind = 'stopping'
+    renderDeckTransport(relatedDeckIndex!)
+  }
+  clearDeckTransportError(deckIndex)
+  renderDeckTransport(deckIndex)
+  deckLoadQueue = deckLoadQueue
+    .then(async () => {
+      if (expectedSession !== tempoSessionId) return
+      const changed = await task(expectedSession)
+      if (changed) setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: PROJECT TIMELINE UPDATED ✓`)
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      setDeckTransportError(deckIndex, message)
+      setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: ${message}`)
+    })
+    .finally(() => {
+      operation.pendingCount = Math.max(0, operation.pendingCount - 1)
+      if (operation.pendingCount === 0) operation.activeKind = null
+      if (relatedOperation) {
+        relatedOperation.pendingCount = Math.max(0, relatedOperation.pendingCount - 1)
+        if (relatedOperation.pendingCount === 0) relatedOperation.activeKind = null
+        renderDeckTransport(relatedDeckIndex!)
+      }
+      renderDeckTransport(deckIndex)
+    })
 }
 
 async function syncMagicLoopDuration(projectDocument: SyncedDocument, expectedSession: number) {
@@ -2480,7 +3205,14 @@ function watchSourceDeckContent(
       if (deck.regionEntity?.id === region.id) {
         scheduleDeckTimingReconstruction(deckIndex)
         void syncMagicLoopDuration(projectDocument, expectedSession)
+        renderDeckTransport(deckIndex)
       }
+    }),
+    projectDocument.events.onUpdate(region.fields.region.fields.positionTicks, () => {
+      if (deck.regionEntity?.id === region.id) renderDeckTransport(deckIndex)
+    }),
+    projectDocument.events.onUpdate(region.fields.region.fields.isEnabled, () => {
+      if (deck.regionEntity?.id === region.id) renderDeckTransport(deckIndex)
     }),
     projectDocument.events.onUpdate(region.fields.region.fields.loopDurationTicks, () => {
       if (deck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(deckIndex)
@@ -2511,6 +3243,15 @@ function watchMagicDeckContent(
     region,
   )
   magicDeck.contentSubscriptions.push(
+    projectDocument.events.onUpdate(region.fields.region.fields.durationTicks, () => {
+      if (magicDeck.regionEntity?.id === region.id) renderDeckTransport(2)
+    }),
+    projectDocument.events.onUpdate(region.fields.region.fields.positionTicks, () => {
+      if (magicDeck.regionEntity?.id === region.id) renderDeckTransport(2)
+    }),
+    projectDocument.events.onUpdate(region.fields.region.fields.isEnabled, () => {
+      if (magicDeck.regionEntity?.id === region.id) renderDeckTransport(2)
+    }),
     projectDocument.events.onUpdate(region.fields.region.fields.loopDurationTicks, () => {
       if (magicDeck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(2)
     }),
@@ -2579,6 +3320,7 @@ function bindDeckContentGraph(
     watchMagicDeckContent(projectDocument, content.region, expectedSession)
   }
   scheduleDeckTimingReconstruction(deckIndex)
+  renderDeckTransport(deckIndex)
 }
 
 async function insertSampleIntoProject(
@@ -2613,6 +3355,7 @@ async function insertSampleIntoProject(
     const targetTrack = t.entities.ofTypes('audioTrack').getEntity(targetTrackId)
     if (!targetTrack) throw new Error('Provisioned deck track is no longer available')
     const isSourceDeck = deckNum <= 2
+    const magicStopEndTicks = isSourceDeck ? getMagicScheduledStopEndTicks(t) : null
     const establishedTempo = isSourceDeck && loadedSourceDeckCount(t) === 0
     if (isSourceDeck && !config) throw new Error('Project tempo configuration was not found')
     const effectiveProjectBpm = establishedTempo
@@ -2641,7 +3384,10 @@ async function insertSampleIntoProject(
           ? { bpm }
           : { musicDurationTicks: timing.musicDurationTicks },
       region: forceMagicLoop
-        ? { positionTicks: placement.positionTicks, durationTicks: getMagicLoopDurationTicks(t) }
+        ? {
+            positionTicks: placement.positionTicks,
+            durationTicks: getMagicLoopDurationTicks(t),
+          }
         : { positionTicks: placement.positionTicks },
       loop: forceMagicLoop ? true : undefined,
       attachTo: targetTrack,
@@ -2652,11 +3398,13 @@ async function insertSampleIntoProject(
     } else if (forceMagicLoop) {
       t.update(region.fields.timestretchMode, 2)
     }
-    if (establishedTempo && sourceDurationTicks !== undefined) {
+    t.update(region.fields.region.fields.isEnabled, false)
+    if (isSourceDeck && sourceDurationTicks !== undefined) {
       updateMagicLoopDurationInTransaction(
         t,
         undefined,
-        Math.max(Ticks.Bars(MAGIC_DURATION_BARS), sourceDurationTicks),
+        Math.max(getMagicLoopDurationTicks(t), sourceDurationTicks),
+        magicStopEndTicks,
       )
     }
     const entities = resolveInsertedProjectEntities(region, t)
@@ -2835,11 +3583,18 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
     operation.suppressProjectRemovalSync = true
     try {
       await projectDocument.modify((t) => {
+        const magicStopEndTicks = getMagicScheduledStopEndTicks(t)
         removeDeckContentInTransaction(
           t,
           regionId,
           storedSampleId,
           storedAutomationCollectionId,
+        )
+        updateMagicLoopDurationInTransaction(
+          t,
+          undefined,
+          undefined,
+          magicStopEndTicks,
         )
       })
       clearDeckContentEntities(deck)
@@ -2936,37 +3691,12 @@ async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
 }
 
 function applyCurrentDeckLevels(deckIndex: WaveformDeckIndex) {
-  applyDeckPreviewGain(decks[deckIndex])
   return applyDeckProjectLevels(deckIndex)
 }
 
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
-function applyDeckPreviewGain(deck: DeckState) {
-  if (deck.gainNode) deck.gainNode.gain.value = deck.volume * deck.gainTrim
-}
-
 function ensureCtx(deck: DeckState) {
-  if (!deck.audioCtx) {
-    deck.audioCtx = new AudioContext(); deck.gainNode = deck.audioCtx.createGain()
-    deck.gainNode.connect(deck.audioCtx.destination)
-    applyDeckPreviewGain(deck)
-  }
-}
-function formatPitch(value: number) {
-  const rounded = Number(value.toFixed(1))
-  return `${rounded >= 0 ? '+' : ''}${rounded.toFixed(1)}%`
-}
-function normalizeDeckOffset(deck: DeckState, offset: number) {
-  if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return 0
-  if (deck.looping) return ((offset % deck.audioBuffer.duration) + deck.audioBuffer.duration) % deck.audioBuffer.duration
-  return Math.max(0, Math.min(offset, Math.max(0, deck.audioBuffer.duration - 0.001)))
-}
-function deckStop(deck: DeckState) {
-  const source = deck.sourceNode
-  deck.sourceNode = null
-  deck.isPlaying = false; deck.isPaused = false; deck.pauseOffset = 0
-  source?.stop()
-  if (deck === decks[2]) redrawMagicWaveform()
+  if (!deck.audioCtx) deck.audioCtx = new AudioContext()
 }
 async function loadAudioFile(
   deckIndex: 0 | 1,
@@ -3068,20 +3798,6 @@ function drawWaveformBase(canvas: HTMLCanvasElement, buf: AudioBuffer) {
   }
 }
 
-function drawWaveformPlayhead(canvas: HTMLCanvasElement, deck: DeckState) {
-  if (!deck.audioBuffer || deck.audioBuffer.duration <= 0) return
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
-  const ratio = getDeckPositionSeconds(deck) / deck.audioBuffer.duration
-  const x = Math.max(0, Math.min(W - 1, ratio * W))
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)'
-  ctx.lineWidth = 1
-  ctx.beginPath()
-  ctx.moveTo(Math.round(x) + 0.5, 0)
-  ctx.lineTo(Math.round(x) + 0.5, H)
-  ctx.stroke()
-}
-
 function drawMagicPeakWaveform(peaks: readonly number[]) {
   const ctx = magicWaveform.getContext('2d')!
   const W = magicWaveform.width
@@ -3117,31 +3833,14 @@ function redrawMagicWaveform() {
   const deck = decks[2]
   if (deck.audioBuffer) {
     drawWaveformBase(magicWaveform, deck.audioBuffer)
-    drawWaveformPlayhead(magicWaveform, deck)
   } else if (magicWaveformPeaks) {
     drawMagicPeakWaveform(magicWaveformPeaks)
   }
 }
 
-function anyWaveformLoaded() {
-  return Boolean(decks[2].audioBuffer && decks[2].isPlaying)
-}
-
-function scheduleWaveformRendering() {
-  if (waveformAnimationFrame !== null || !anyWaveformLoaded()) return
-
-  const tick = () => {
-    redrawMagicWaveform()
-    waveformAnimationFrame = anyWaveformLoaded() ? requestAnimationFrame(tick) : null
-  }
-
-  waveformAnimationFrame = requestAnimationFrame(tick)
-}
-
 function drawMagicWaveform(buf: AudioBuffer) {
   magicWaveformPeaks = null
   drawWaveformBase(magicWaveform, buf)
-  scheduleWaveformRendering()
 }
 
 // ── KNOBS ─────────────────────────────────────────────────────────────────────
@@ -3231,16 +3930,6 @@ function drawMagicIdle(label = '[ GENERATE AUDIO FROM THE NEXT 4 BARS ]') {
   ctx.fillStyle = '#050000'; ctx.fillRect(0, 0, W, H)
   ctx.strokeStyle = '#1a0000'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2); ctx.stroke()
   ctx.fillStyle = '#440000'; ctx.font = '12px Share Tech Mono'; ctx.textAlign = 'center'; ctx.fillText(label, W / 2, H / 2 + 4); ctx.textAlign = 'left'
-}
-
-function getDeckPositionSeconds(deck: DeckState) {
-  if (!deck.audioBuffer) return 0
-  if (deck.isPlaying && deck.audioCtx) {
-    const elapsed = deck.pauseOffset + ((deck.audioCtx.currentTime - deck.startedAt) * deck.playbackRate)
-    if (deck.looping && deck.audioBuffer.duration > 0) return normalizeDeckOffset(deck, elapsed)
-    return Math.max(0, Math.min(elapsed, deck.audioBuffer.duration))
-  }
-  return Math.max(0, Math.min(deck.pauseOffset, deck.audioBuffer.duration))
 }
 
 function barsDurationSeconds(bars: number, bpm: number) {
@@ -3654,6 +4343,10 @@ async function generateMagicAudio() {
   }
 
   const stemRole = selectedMagicStemRole()
+  const magicOperation = deckOperationStates[2]
+  magicOperation.pendingCount += 1
+  magicOperation.activeKind = 'generating'
+  renderDeckTransport(2)
   setMagicStatus('generating', 'PREPARING AUDIO CAPTURE')
   btnGenerate.disabled = true
   setMagicStemRoleDisabled(true)
@@ -3701,14 +4394,11 @@ async function generateMagicAudio() {
       setTimeout(() => setMagicStatus('idle', 'IDLE'), 5000)
       return
     }
-    deckStop(magicDeck)
-    magicDeck.looping = true
     magicDeck.audioBuffer = generatedBuffer
     magicDeck.fileName = generatedFile.name
     magicWaveformPeaks = null
-    applyDeckPreviewGain(magicDeck)
     drawMagicWaveform(generatedBuffer)
-    syncTransportUi('d3', magicDeck)
+    renderDeckTransport(2)
 
     if (timingWarning || timingStatus !== 'aligned') {
       const warning = timingWarning || `Timing status: ${timingStatus}`
@@ -3730,6 +4420,9 @@ async function generateMagicAudio() {
     setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
   }
   finally {
+    magicOperation.pendingCount = Math.max(0, magicOperation.pendingCount - 1)
+    if (magicOperation.pendingCount === 0) magicOperation.activeKind = null
+    renderDeckTransport(2)
     btnGenerate.disabled = false
     setMagicStemRoleDisabled(false)
   }
@@ -3768,58 +4461,82 @@ function setupUnloadButton(deckIndex: 0 | 1) {
 }
 
 // ── TRANSPORT ─────────────────────────────────────────────────────────────────
-function syncTransportUi(prefix: DeckPrefix, deck: DeckState) {
-  document.getElementById(`${prefix}-play`)?.classList.toggle('active', deck.isPlaying)
-  document.getElementById(`${prefix}-pause`)?.classList.toggle('active', deck.isPaused)
-  document.getElementById(`${prefix}-loop`)?.classList.toggle('active', deck.looping)
-  const pitchValue = document.getElementById(`${prefix}-pitch`)
-  if (pitchValue) pitchValue.textContent = formatPitch(deck.pitchPercent)
-}
 function setupMagicWaveformSeek() {
   magicWaveform.title = 'Use Audiotool Studio timeline controls for playback and seeking'
   magicWaveform.addEventListener('click', (event) => {
     event.preventDefault()
-    setStatus('connected', ``)
+    setStatus('connected', 'MAGIC WAVEFORM IS STATIC — USE AUDIOTOOL STUDIO FOR PLAYBACK AND SEEKING')
   })
 }
 function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const deck = decks[deckIndex]
-  const playBtn = document.getElementById(`${prefix}-play`) as HTMLButtonElement | null
-  const pauseBtn = document.getElementById(`${prefix}-pause`) as HTMLButtonElement | null
-  const stopBtn = document.getElementById(`${prefix}-stop`) as HTMLButtonElement | null
-  const loopBtn = document.getElementById(`${prefix}-loop`) as HTMLButtonElement | null
+  const transport = getDeckTransportElements(deckIndex)
   const volSlider = document.getElementById(`${prefix}-vol`) as HTMLInputElement | null
   const volVal = document.getElementById(`${prefix}-vol-val`) as HTMLSpanElement | null
   const gainSlider = document.getElementById(`${prefix}-gain`) as HTMLInputElement | null
   const gainVal = document.getElementById(`${prefix}-gain-val`) as HTMLSpanElement | null
 
-  const transportButtons = [playBtn, pauseBtn, stopBtn, loopBtn].filter(
-    (button): button is HTMLButtonElement => button !== null,
-  )
-  transportButtons.forEach((button) => {
-    button.disabled = true
-    button.title = 'Use Audiotool Studio transport'
-    button.setAttribute('aria-label', 'Project transport is controlled in Audiotool Studio')
+  transport.launch.addEventListener('click', () => {
+    const quantization = transport.quantization.value as LaunchQuantization
+    if (
+      quantization !== 'next-bar'
+      && quantization !== 'next-phrase'
+      && quantization !== 'exact-bar'
+    ) return
+    const outgoingValue = transport.crossfadeFrom.value
+    if (outgoingValue === '') {
+      queueDeckTransportOperation(
+        deckIndex,
+        'launching',
+        (expectedSession) => mutateDeckLaunch(deckIndex, quantization, expectedSession),
+      )
+      return
+    }
+    const outgoingDeckIndex = Number(outgoingValue) as WaveformDeckIndex
+    const fadeBars = Number(transport.crossfadeBars.value)
+    queueDeckTransportOperation(
+      deckIndex,
+      'launching',
+      (expectedSession) => mutateDeckCrossfade(
+        deckIndex,
+        outgoingDeckIndex,
+        quantization,
+        fadeBars,
+        expectedSession,
+      ),
+      outgoingDeckIndex,
+    )
+  })
+  transport.crossfadeFrom.addEventListener('change', () => renderDeckTransport(deckIndex))
+  transport.cancel.addEventListener('click', () => {
+    queueDeckTransportOperation(
+      deckIndex,
+      'cancelling',
+      (expectedSession) => mutateDeckCancel(deckIndex, expectedSession),
+    )
+  })
+  transport.stop.addEventListener('click', () => {
+    queueDeckTransportOperation(
+      deckIndex,
+      'stopping',
+      (expectedSession) => mutateDeckStop(deckIndex, expectedSession),
+    )
   })
 
   volSlider?.addEventListener('input', () => {
     deck.volume = parseFloat(volSlider.value)
     if (volVal) volVal.textContent = String(Math.round(deck.volume * 100))
-    if (deckIndex === 2) ensureCtx(deck)
-    applyDeckPreviewGain(deck)
     void applyDeckProjectLevels(deckIndex)
   })
 
   gainSlider?.addEventListener('input', () => {
     deck.gainTrim = parseFloat(gainSlider.value)
     if (gainVal) gainVal.textContent = `${deck.gainTrim.toFixed(1)}x`
-    if (deckIndex === 2) ensureCtx(deck)
-    applyDeckPreviewGain(deck)
     void applyDeckProjectLevels(deckIndex)
   })
 
   if (deckIndex === 2) setupMagicWaveformSeek()
-  syncTransportUi(prefix, deck)
+  renderDeckTransport(deckIndex)
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────

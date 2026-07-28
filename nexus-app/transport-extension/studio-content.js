@@ -29,7 +29,8 @@ function candidateRawValues(element) {
 async function captureTransport(projectId) {
   const {
     TRANSPORT_CHANNEL,
-    parseTransportBar,
+    mergeTransportPositions,
+    parseTransportPosition,
     projectIdFromUrl,
   } = await utilsPromise
   const capturedAt = Date.now()
@@ -64,31 +65,38 @@ async function captureTransport(projectId) {
       if (seenElements.has(element) || !isVisible(element)) continue
       seenElements.add(element)
       for (const raw of candidateRawValues(element)) {
-        const bar = parseTransportBar(raw)
-        if (bar !== null) parsed.push({ bar, raw: raw.trim() })
+        const position = parseTransportPosition(raw, capturedAt)
+        if (position !== null) parsed.push({ position, raw: raw.trim() })
       }
     }
   }
 
-  const bars = new Set(parsed.map((candidate) => candidate.bar))
-  if (bars.size !== 1) {
+  const position = mergeTransportPositions(parsed.map((candidate) => candidate.position))
+  if (!position) {
     return {
       channel: TRANSPORT_CHANNEL,
       type: 'capture-response',
       projectId,
       ok: false,
       capturedAt,
-      reason: bars.size === 0 ? 'unreadable-transport-counter' : 'ambiguous-transport-counter',
+      reason: parsed.length === 0 ? 'unreadable-transport-counter' : 'ambiguous-transport-counter',
     }
   }
-  const bar = parsed[0].bar
-  const raw = parsed.find((candidate) => candidate.bar === bar)?.raw
+  const raw = parsed.find((candidate) =>
+    candidate.position.precision === position.precision
+    && candidate.position.bar === position.bar
+    && candidate.position.beat === position.beat
+    && candidate.position.tick === position.tick,
+  )?.raw
   return {
     channel: TRANSPORT_CHANNEL,
     type: 'capture-response',
     projectId,
     ok: true,
-    bar,
+    bar: position.bar,
+    beat: position.beat,
+    tick: position.tick,
+    precision: position.precision,
     raw,
     capturedAt,
   }

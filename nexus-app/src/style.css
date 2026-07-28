@@ -215,17 +215,58 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 
 /* ============================  TRANSPORT  ============================ */
 .transport { display: flex; align-items: center; gap: 6px; }
-.t-btn { width: 36px; height: 36px; background: var(--grey); border: 1px solid var(--grey-light); color: var(--white); font-size: 14px; cursor: pointer; transition: all 0.15s; display: flex; align-items: center; justify-content: center; }
-.t-btn:hover { background: var(--red); border-color: var(--red); box-shadow: 0 0 8px var(--red-glow); }
-.t-btn.active { background: var(--red); border-color: var(--red); box-shadow: 0 0 10px var(--red-glow); }
-.loop-btn.active { color: var(--red); border-color: var(--red); background: var(--grey); }
-.pitch-display { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; }
-.pitch-label { font-family: var(--font-data); font-size: 9px; color: var(--grey-text); letter-spacing: 1px; }
-.pitch-value { font-family: var(--font-live); font-size: 16px; color: var(--white); }
-
-/* Hide the transport row on Deck A and Deck B (only Magic Deck shows it) */
-#deck-1 .transport,
-#deck-2 .transport { display: none; }
+.project-transport {
+  min-height: 42px;
+  padding: 7px;
+  border: 1px solid var(--grey-light);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.45);
+  flex-wrap: wrap;
+}
+.magic-project-transport { margin-top: 10px; }
+.quantization-select,
+.crossfade-select,
+.crossfade-bars-select,
+.transport-action {
+  height: 30px;
+  border: 1px solid var(--grey-light);
+  background: var(--grey);
+  color: var(--white);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 1px;
+}
+.quantization-select { min-width: 116px; padding: 0 8px; }
+.crossfade-select { min-width: 126px; padding: 0 8px; }
+.crossfade-bars-select { min-width: 78px; padding: 0 8px; }
+.transport-action { padding: 0 11px; cursor: pointer; transition: all 0.15s; }
+.transport-action:hover:not(:disabled) {
+  border-color: var(--red);
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red-glow);
+}
+.launch-action { border-color: #287d56; color: #62efa9; }
+.stop-action { border-color: var(--red-dim); }
+.transport-action:disabled,
+.quantization-select:disabled,
+.crossfade-select:disabled,
+.crossfade-bars-select:disabled { cursor: not-allowed; opacity: 0.38; }
+.project-transport-status {
+  margin-left: auto;
+  color: #62efa9;
+  font-family: var(--font-live);
+  font-size: 12px;
+  letter-spacing: 1px;
+}
+.transport-error {
+  flex-basis: 100%;
+  min-height: 0;
+  color: #ff7777;
+  font-family: var(--font-data);
+  font-size: 8px;
+  letter-spacing: 0.8px;
+}
+.transport-error:empty { display: none; }
 
 /* ============================  CONTROLS ROW (VOL + EQ)  ============================ */
 .controls-row { display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap; min-width: 0; }

@@ -4,26 +4,60 @@ import { Ticks } from '@audiotool/nexus/utils'
 import {
   TRANSPORT_CHANNEL,
   barToPositionTicks,
+  guardedTransportTicks,
   matchProjectTabs,
-  parseTransportBar,
+  mergeTransportPositions,
+  parseTransportPosition,
+  planRegionCancel,
+  planRegionLaunch,
+  planRegionStop,
   projectIdFromUrl,
+  resolveLaunchTick,
+  transportPositionToTicks,
   validateTransportResponse,
 } from '../transport-extension/transport-utils.js'
 
 test('parses one-based Audiotool transport counters', () => {
-  assert.equal(parseTransportBar('001.03.240'), 1)
-  assert.equal(parseTransportBar('12:4:000'), 12)
-  assert.equal(parseTransportBar('27 | 2 | 120'), 27)
-  assert.equal(parseTransportBar('BAR 9'), 9)
-  assert.equal(parseTransportBar('Transport position — Bar: 42 Beat: 3'), 42)
+  const capturedAt = 123
+  assert.deepEqual(parseTransportPosition('001.03.240', capturedAt), {
+    bar: 1, beat: 3, tick: 240, precision: 'tick', capturedAt,
+  })
+  assert.deepEqual(parseTransportPosition('12:4', capturedAt), {
+    bar: 12, beat: 4, precision: 'beat', capturedAt,
+  })
+  assert.deepEqual(parseTransportPosition('BAR 9', capturedAt), {
+    bar: 9, precision: 'bar', capturedAt,
+  })
+  assert.deepEqual(parseTransportPosition('Transport position — Bar: 42 Beat: 3', capturedAt), {
+    bar: 42, beat: 3, precision: 'beat', capturedAt,
+  })
+})
+
+test('merges compatible counter precision and rejects ambiguous positions', () => {
+  const capturedAt = 500
+  const barOnly = { bar: 9, precision: 'bar', capturedAt }
+  const beatOnly = { bar: 9, beat: 3, precision: 'beat', capturedAt }
+  const full = { bar: 9, beat: 3, tick: 120, precision: 'tick', capturedAt }
+  assert.deepEqual(mergeTransportPositions([barOnly, beatOnly, full]), full)
+  assert.equal(
+    mergeTransportPositions([beatOnly, { ...beatOnly, beat: 4 }]),
+    null,
+  )
+  assert.equal(
+    mergeTransportPositions([full, { ...full, tick: 121 }]),
+    null,
+  )
 })
 
 test('rejects invalid or unrelated counter text', () => {
-  assert.equal(parseTransportBar('0.4.000'), null)
-  assert.equal(parseTransportBar('120 BPM'), null)
-  assert.equal(parseTransportBar('01:00'), 1)
-  assert.equal(parseTransportBar('No transport position'), null)
-  assert.equal(parseTransportBar(''), null)
+  assert.equal(parseTransportPosition('0.4.000'), null)
+  assert.equal(parseTransportPosition('12.5.000'), null)
+  assert.equal(parseTransportPosition('12.0.000'), null)
+  assert.equal(parseTransportPosition(`12.1.${Ticks.Beat}`), null)
+  assert.equal(parseTransportPosition('120 BPM'), null)
+  assert.equal(parseTransportPosition('01:00'), null)
+  assert.equal(parseTransportPosition('No transport position'), null)
+  assert.equal(parseTransportPosition(''), null)
 })
 
 test('extracts and matches an exact connected project id', () => {
@@ -67,14 +101,22 @@ test('accepts only a fresh response for the exact request and project', () => {
     projectId: expected.projectId,
     ok: true,
     bar: 8,
+    beat: 2,
+    tick: 0,
+    precision: 'tick',
     raw: '008.02.000',
     capturedAt: now - 1_500,
   }
   assert.deepEqual(validateTransportResponse(response, expected, now), {
     ok: true,
-    bar: 8,
+    position: {
+      bar: 8,
+      beat: 2,
+      tick: 0,
+      precision: 'tick',
+      capturedAt: now - 1_500,
+    },
     raw: '008.02.000',
-    capturedAt: now - 1_500,
   })
   assert.deepEqual(
     validateTransportResponse({ ...response, capturedAt: now - 2_001 }, expected, now),
@@ -90,6 +132,41 @@ test('accepts only a fresh response for the exact request and project', () => {
   )
 })
 
+test('rejects invalid response precision and tick ranges', () => {
+  const now = 20_000
+  const expected = { requestId: 'request-2', projectId: 'project-1' }
+  const response = {
+    channel: TRANSPORT_CHANNEL,
+    type: 'response',
+    requestId: expected.requestId,
+    projectId: expected.projectId,
+    ok: true,
+    bar: 2,
+    beat: 5,
+    capturedAt: now,
+  }
+  assert.deepEqual(validateTransportResponse(response, expected, now), {
+    ok: false,
+    reason: 'invalid-position',
+  })
+  assert.equal(
+    transportPositionToTicks(
+      { bar: 1, beat: 1, tick: Ticks.Beat - 1, precision: 'tick', capturedAt: now },
+      Ticks.Beat,
+      Ticks.Bars(1),
+    ),
+    Ticks.Beat - 1,
+  )
+  assert.throws(
+    () => transportPositionToTicks(
+      { bar: 1, beat: 1, tick: Ticks.Beat, precision: 'tick', capturedAt: now },
+      Ticks.Beat,
+      Ticks.Bars(1),
+    ),
+    /invalid/,
+  )
+})
+
 test('converts a one-based bar to its bar-start Nexus ticks', () => {
   const ticksPerBar = Ticks.Bars(1)
   assert.equal(barToPositionTicks(1, ticksPerBar), Ticks.Bars(0))
@@ -100,4 +177,95 @@ test('converts a one-based bar to its bar-start Nexus ticks', () => {
     () => barToPositionTicks(Number.MAX_SAFE_INTEGER, ticksPerBar),
     /safe tick range/,
   )
+})
+
+test('conservatively converts bar, beat, and tick captures', () => {
+  const bar = Ticks.Bars(1)
+  assert.equal(
+    transportPositionToTicks(
+      { bar: 3, precision: 'bar', capturedAt: 0 },
+      Ticks.Beat,
+      bar,
+    ),
+    Ticks.Bars(3) - 1,
+  )
+  assert.equal(
+    transportPositionToTicks(
+      { bar: 3, beat: 2, precision: 'beat', capturedAt: 0 },
+      Ticks.Beat,
+      bar,
+    ),
+    Ticks.Bars(2) + (Ticks.Beat * 2) - 1,
+  )
+  assert.equal(
+    transportPositionToTicks(
+      { bar: 3, beat: 2, tick: 120, precision: 'tick', capturedAt: 0 },
+      Ticks.Beat,
+      bar,
+    ),
+    Ticks.Bars(2) + Ticks.Beat + 120,
+  )
+})
+
+test('guards captures by response age and delivery time across BPM limits', () => {
+  const position = { bar: 1, beat: 1, tick: 0, precision: 'tick', capturedAt: 1_000 }
+  for (const bpm of [40, 120, 240]) {
+    const guarded = guardedTransportTicks(
+      position,
+      bpm,
+      1_250,
+      Ticks.Beat,
+      Ticks.Bars(1),
+    )
+    assert.equal(guarded, Math.ceil(1_000 * bpm * Ticks.Beat / 60_000))
+  }
+})
+
+test('rounds to safe next-bar and four-bar phrase boundaries', () => {
+  const bar = Ticks.Bars(1)
+  assert.equal(resolveLaunchTick('next-bar', 0, bar), bar)
+  assert.equal(resolveLaunchTick('next-bar', bar, bar), bar * 2)
+  assert.equal(resolveLaunchTick('next-phrase', 0, bar), bar * 4)
+  assert.equal(resolveLaunchTick('next-phrase', bar * 4, bar), bar * 8)
+  assert.equal(resolveLaunchTick('exact-bar', bar * 3 - 1, bar, 4), bar * 3)
+  assert.equal(resolveLaunchTick('exact-bar', bar * 3, bar, 4), null)
+  assert.equal(resolveLaunchTick('exact-bar', bar * 5, bar, 4), null)
+  assert.throws(
+    () => resolveLaunchTick('next-bar', Number.MAX_SAFE_INTEGER, bar),
+    /safe tick range|boundary/,
+  )
+})
+
+test('plans launch restoration, cancellation, and quantized stopping', () => {
+  const bar = Ticks.Bars(1)
+  assert.deepEqual(planRegionLaunch(bar * 8, bar * 12), {
+    kind: 'launch',
+    positionTicks: bar * 12,
+    durationTicks: bar * 8,
+    isEnabled: true,
+  })
+  assert.deepEqual(planRegionCancel(bar * 12, bar * 11), {
+    kind: 'cancel',
+    isEnabled: false,
+  })
+  assert.deepEqual(planRegionCancel(bar * 12, bar * 12), {
+    kind: 'refuse',
+    reason: 'launch-boundary-reached',
+  })
+  assert.deepEqual(planRegionStop(bar * 8, bar * 8, bar * 8, true, bar * 9, bar * 10), {
+    kind: 'stop',
+    durationTicks: bar * 2,
+  })
+  assert.deepEqual(planRegionStop(bar * 12, bar * 8, bar * 8, true, bar * 9, bar * 10), {
+    kind: 'cancel',
+    isEnabled: false,
+  })
+  assert.deepEqual(planRegionStop(bar * 8, bar, bar, true, bar * 8, bar * 10), {
+    kind: 'noop',
+    reason: 'natural-end-first',
+  })
+  assert.deepEqual(planRegionStop(bar * 8, bar * 2, bar * 8, true, bar * 9, bar * 11), {
+    kind: 'noop',
+    reason: 'natural-end-first',
+  })
 })

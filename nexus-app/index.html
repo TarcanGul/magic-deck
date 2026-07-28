@@ -75,15 +75,28 @@
               </div>
             </div>
           </div>
-          <div class="transport">
-            <button class="t-btn" id="d1-play">▶</button>
-            <button class="t-btn" id="d1-pause">⏸</button>
-            <button class="t-btn" id="d1-stop">■</button>
-            <button class="t-btn loop-btn" id="d1-loop">⟲</button>
-            <div class="pitch-display">
-              <span class="pitch-label">PITCH</span>
-              <span class="pitch-value" id="d1-pitch">+0.0</span>
-            </div>
+          <div class="transport project-transport" aria-label="Deck A project launch controls">
+            <select class="quantization-select" id="d1-quantization" aria-label="Deck A launch quantization">
+              <option value="next-bar">NEXT BAR</option>
+              <option value="next-phrase">NEXT 4 BARS</option>
+              <option value="exact-bar">BAR…</option>
+            </select>
+            <select class="crossfade-select" id="d1-crossfade-from" aria-label="Crossfade into Deck A from">
+              <option value="">NO CROSSFADE</option>
+              <option value="1">FROM DECK B</option>
+              <option value="2">FROM MAGIC</option>
+            </select>
+            <select class="crossfade-bars-select" id="d1-crossfade-bars" aria-label="Deck A crossfade duration">
+              <option value="1">1 BAR</option>
+              <option value="2">2 BARS</option>
+              <option value="4" selected>4 BARS</option>
+              <option value="8">8 BARS</option>
+            </select>
+            <button class="transport-action launch-action" id="d1-launch" type="button">LAUNCH</button>
+            <button class="transport-action" id="d1-cancel" type="button">CANCEL</button>
+            <button class="transport-action stop-action" id="d1-stop-next-bar" type="button">STOP NEXT BAR</button>
+            <span class="project-transport-status" id="d1-project-status">EMPTY</span>
+            <div class="transport-error" id="d1-transport-error" aria-live="polite"></div>
           </div>
           <div class="controls-row source-controls-row">
             <div class="effects-tempo-strip">
@@ -183,15 +196,28 @@
               </div>
             </div>
           </div>
-          <div class="transport">
-            <button class="t-btn" id="d2-play">▶</button>
-            <button class="t-btn" id="d2-pause">⏸</button>
-            <button class="t-btn" id="d2-stop">■</button>
-            <button class="t-btn loop-btn" id="d2-loop">⟲</button>
-            <div class="pitch-display">
-              <span class="pitch-label">PITCH</span>
-              <span class="pitch-value" id="d2-pitch">+0.0</span>
-            </div>
+          <div class="transport project-transport" aria-label="Deck B project launch controls">
+            <select class="quantization-select" id="d2-quantization" aria-label="Deck B launch quantization">
+              <option value="next-bar">NEXT BAR</option>
+              <option value="next-phrase">NEXT 4 BARS</option>
+              <option value="exact-bar">BAR…</option>
+            </select>
+            <select class="crossfade-select" id="d2-crossfade-from" aria-label="Crossfade into Deck B from">
+              <option value="">NO CROSSFADE</option>
+              <option value="0">FROM DECK A</option>
+              <option value="2">FROM MAGIC</option>
+            </select>
+            <select class="crossfade-bars-select" id="d2-crossfade-bars" aria-label="Deck B crossfade duration">
+              <option value="1">1 BAR</option>
+              <option value="2">2 BARS</option>
+              <option value="4" selected>4 BARS</option>
+              <option value="8">8 BARS</option>
+            </select>
+            <button class="transport-action launch-action" id="d2-launch" type="button">LAUNCH</button>
+            <button class="transport-action" id="d2-cancel" type="button">CANCEL</button>
+            <button class="transport-action stop-action" id="d2-stop-next-bar" type="button">STOP NEXT BAR</button>
+            <span class="project-transport-status" id="d2-project-status">EMPTY</span>
+            <div class="transport-error" id="d2-transport-error" aria-live="polite"></div>
           </div>
           <div class="controls-row source-controls-row">
             <div class="effects-tempo-strip">
@@ -314,6 +340,29 @@
           </div>
           <div class="magic-duration-label">DURATION: 4 BARS</div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE FROM LIVE AUDIO</button>
+          <div class="transport project-transport magic-project-transport" aria-label="Magic Deck project launch controls">
+            <select class="quantization-select" id="d3-quantization" aria-label="Magic Deck launch quantization">
+              <option value="next-bar">NEXT BAR</option>
+              <option value="next-phrase">NEXT 4 BARS</option>
+              <option value="exact-bar">BAR…</option>
+            </select>
+            <select class="crossfade-select" id="d3-crossfade-from" aria-label="Crossfade into Magic Deck from">
+              <option value="">NO CROSSFADE</option>
+              <option value="0">FROM DECK A</option>
+              <option value="1">FROM DECK B</option>
+            </select>
+            <select class="crossfade-bars-select" id="d3-crossfade-bars" aria-label="Magic Deck crossfade duration">
+              <option value="1">1 BAR</option>
+              <option value="2">2 BARS</option>
+              <option value="4" selected>4 BARS</option>
+              <option value="8">8 BARS</option>
+            </select>
+            <button class="transport-action launch-action" id="d3-launch" type="button">LAUNCH</button>
+            <button class="transport-action" id="d3-cancel" type="button">CANCEL</button>
+            <button class="transport-action stop-action" id="d3-stop-next-bar" type="button">STOP NEXT BAR</button>
+            <span class="project-transport-status" id="d3-project-status">EMPTY</span>
+            <div class="transport-error" id="d3-transport-error" aria-live="polite"></div>
+          </div>
           <div class="magic-playback-row">
             <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>
             <div class="controls-row magic-controls-row">
@@ -385,7 +434,7 @@
   </div>
 </div>
 
-<!-- Deck Assistant fallback for manual Audiotool bar placement -->
+<!-- Deck Assistant fallback for manual Audiotool bar operations -->
 <div id="placement-modal" class="modal-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="placement-modal-title">
   <div class="modal">
     <div class="modal-header">
@@ -394,7 +443,7 @@
     </div>
     <div class="modal-body">
       <p class="modal-copy" id="placement-modal-copy"></p>
-      <label class="modal-label" for="placement-modal-input">CURRENT AUDIOTOOL BAR</label>
+      <label class="modal-label" for="placement-modal-input">AUDIOTOOL BAR</label>
       <input
         type="number"
         id="placement-modal-input"

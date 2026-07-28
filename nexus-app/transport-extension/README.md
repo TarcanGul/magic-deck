@@ -1,9 +1,10 @@
 # Magic Deck Audiotool Transport extension
 
-This unpacked Chrome/Edge extension reads only Audiotool Studio's visible
-bar/beat transport counter and returns its current one-based bar to the local
-Magic Deck app. It does not access cookies, OAuth tokens, page storage, or
-unrelated page data.
+This unpacked Chrome/Edge extension implements the
+`magic-deck.transport.v2` contract. It reads only Audiotool Studio's visible
+bar/beat/tick transport counter and returns the most precise unambiguous
+one-based project position to the local Magic Deck app. It does not access
+cookies, OAuth tokens, page storage, or unrelated page data.
 
 ## Install
 
@@ -15,5 +16,6 @@ unrelated page data.
 
 Keep exactly one Audiotool Studio tab open for the connected project. If the
 extension is missing, finds zero or multiple matching project tabs, or cannot
-read a unique visible transport counter, Magic Deck asks for the current bar
-instead of guessing.
+read a unique visible transport counter, Magic Deck asks for the relevant
+launch, stop, or current bar instead of guessing. Older extension versions do
+not satisfy the v2 handshake and therefore use the same safe manual fallback.

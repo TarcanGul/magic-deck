@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Magic Deck Audiotool Transport",
-  "version": "1.0.0",
-  "description": "Places Magic Deck regions at the visible Audiotool Studio bar.",
+  "version": "2.0.0",
+  "description": "Captures Audiotool Studio transport positions for quantized Magic Deck launches.",
   "permissions": [
     "tabs"
   ],

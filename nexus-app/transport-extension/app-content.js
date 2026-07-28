@@ -1,4 +1,4 @@
-const CHANNEL = 'magic-deck.transport.v1'
+const CHANNEL = 'magic-deck.transport.v2'
 
 window.addEventListener('message', (event) => {
   const request = event.data
