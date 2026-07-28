@@ -55,7 +55,7 @@
         <div class="deck-header">
           <span class="deck-num">01</span>
           <span class="deck-title">DECK A — PLAYER</span>
-          <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
+          <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
         </div>
         <div class="deck-body">
           <div class="deck-media-layout">
@@ -85,25 +85,47 @@
               <span class="pitch-value" id="d1-pitch">+0.0</span>
             </div>
           </div>
-          <div class="controls-row">
-            <div class="fader-section">
+          <div class="controls-row source-controls-row">
+            <div class="effects-tempo-strip">
+              <div class="fader-section">
               <div class="fader-label">VOL</div>
               <div class="fader-wrap">
                 <input type="range" class="v-fader" id="d1-vol" min="0" max="1" step="0.01" value="0.8" orient="vertical">
               </div>
               <div class="fader-val" id="d1-vol-val">80</div>
-            </div>
-            <div class="fader-section">
+              </div>
+              <div class="fader-section">
               <div class="fader-label">GAIN</div>
               <div class="fader-wrap">
                 <input type="range" class="v-fader" id="d1-gain" min="1" max="2" step="0.01" value="1" orient="vertical">
               </div>
               <div class="fader-val" id="d1-gain-val">1.0x</div>
-            </div>
-            <div class="eq-section">
-              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
-              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
-              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              </div>
+              <div class="eq-section">
+                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              </div>
+              <div class="tempo-module" id="d1-tempo-module">
+                <div class="tempo-module-title">TEMPO</div>
+                <div class="tempo-module-body">
+                  <div class="tempo-fader-column">
+                    <span id="d1-tempo-max">+10</span>
+                    <input type="range" class="tempo-fader" id="d1-tempo" min="-10" max="10" step="0.1" value="0" orient="vertical" aria-label="Deck A tempo percentage">
+                    <span id="d1-tempo-min">−10</span>
+                  </div>
+                  <div class="tempo-actions">
+                    <button class="tempo-sync" id="d1-tempo-sync" type="button" aria-pressed="false">SYNC</button>
+                    <output class="tempo-value" id="d1-tempo-value">+0.0%</output>
+                    <div class="tempo-ranges" role="group" aria-label="Deck A tempo range">
+                      <button type="button" data-range="10" class="active" aria-pressed="true">±10</button>
+                      <button type="button" data-range="30" aria-pressed="false">±30</button>
+                      <button type="button" data-range="50" aria-pressed="false">±50</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="tempo-error" id="d1-tempo-error" aria-live="polite"></div>
+              </div>
             </div>
             <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
               <div class="bpm-dialogue-header">
@@ -141,7 +163,7 @@
         <div class="deck-header">
           <span class="deck-num">02</span>
           <span class="deck-title">DECK B — PLAYER</span>
-          <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
+          <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
         </div>
         <div class="deck-body">
           <div class="deck-media-layout">
@@ -171,25 +193,47 @@
               <span class="pitch-value" id="d2-pitch">+0.0</span>
             </div>
           </div>
-          <div class="controls-row">
-            <div class="fader-section">
+          <div class="controls-row source-controls-row">
+            <div class="effects-tempo-strip">
+              <div class="fader-section">
               <div class="fader-label">VOL</div>
               <div class="fader-wrap">
                 <input type="range" class="v-fader" id="d2-vol" min="0" max="1" step="0.01" value="0.8" orient="vertical">
               </div>
               <div class="fader-val" id="d2-vol-val">80</div>
-            </div>
-            <div class="fader-section">
+              </div>
+              <div class="fader-section">
               <div class="fader-label">GAIN</div>
               <div class="fader-wrap">
                 <input type="range" class="v-fader" id="d2-gain" min="1" max="2" step="0.01" value="1" orient="vertical">
               </div>
               <div class="fader-val" id="d2-gain-val">1.0x</div>
-            </div>
-            <div class="eq-section">
-              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
-              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
-              <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              </div>
+              <div class="eq-section">
+                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              </div>
+              <div class="tempo-module" id="d2-tempo-module">
+                <div class="tempo-module-title">TEMPO</div>
+                <div class="tempo-module-body">
+                  <div class="tempo-fader-column">
+                    <span id="d2-tempo-max">+10</span>
+                    <input type="range" class="tempo-fader" id="d2-tempo" min="-10" max="10" step="0.1" value="0" orient="vertical" aria-label="Deck B tempo percentage">
+                    <span id="d2-tempo-min">−10</span>
+                  </div>
+                  <div class="tempo-actions">
+                    <button class="tempo-sync" id="d2-tempo-sync" type="button" aria-pressed="false">SYNC</button>
+                    <output class="tempo-value" id="d2-tempo-value">+0.0%</output>
+                    <div class="tempo-ranges" role="group" aria-label="Deck B tempo range">
+                      <button type="button" data-range="10" class="active" aria-pressed="true">±10</button>
+                      <button type="button" data-range="30" aria-pressed="false">±30</button>
+                      <button type="button" data-range="50" aria-pressed="false">±50</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="tempo-error" id="d2-tempo-error" aria-live="polite"></div>
+              </div>
             </div>
             <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
               <div class="bpm-dialogue-header">
@@ -227,7 +271,7 @@
         <div class="deck-header magic-header">
           <span class="deck-num magic-num">03</span>
           <span class="deck-title magic-title">MAGIC DECK</span>
-          <div class="deck-bpm"><span class="bpm-label">BPM</span><span class="bpm-value" id="deck3-bpm">—</span></div>
+          <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck3-bpm">—</span></div>
           <div class="magic-status">
             <span class="status-dot-magic" id="magic-dot"></span>
             <span class="status-label-magic" id="magic-status-label">IDLE</span>
@@ -291,6 +335,26 @@
                 <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
                 <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
                 <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+              </div>
+              <div class="tempo-module" id="d3-tempo-module">
+                <div class="tempo-module-title">TEMPO</div>
+                <div class="tempo-module-body">
+                  <div class="tempo-fader-column">
+                    <span id="d3-tempo-max">+10</span>
+                    <input type="range" class="tempo-fader" id="d3-tempo" min="-10" max="10" step="0.1" value="0" orient="vertical" aria-label="Magic Deck tempo percentage">
+                    <span id="d3-tempo-min">−10</span>
+                  </div>
+                  <div class="tempo-actions">
+                    <button class="tempo-sync" id="d3-tempo-sync" type="button" aria-pressed="false">SYNC</button>
+                    <output class="tempo-value" id="d3-tempo-value">+0.0%</output>
+                    <div class="tempo-ranges" role="group" aria-label="Magic Deck tempo range">
+                      <button type="button" data-range="10" class="active" aria-pressed="true">±10</button>
+                      <button type="button" data-range="30" aria-pressed="false">±30</button>
+                      <button type="button" data-range="50" aria-pressed="false">±50</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="tempo-error" id="d3-tempo-error" aria-live="polite"></div>
               </div>
             </div>
           </div>

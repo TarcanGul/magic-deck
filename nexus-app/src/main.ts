@@ -15,6 +15,16 @@ import type {
   TransportRequest,
   TransportResponse,
 } from '../transport-extension/transport-utils.js'
+import {
+  clampTempoPercent,
+  effectiveBpm,
+  mappedDurationTicks,
+  reconstructTempoPercent,
+  smallestTempoRange,
+  tempoPercentForBpm,
+  tempoPercentToPlaybackRate,
+} from './tempo-utils.js'
+import type { TempoRange } from './tempo-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -28,6 +38,10 @@ interface DeckState {
   isPlaying: boolean; isPaused: boolean; pauseOffset: number
   startedAt: number; looping: boolean; fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
+  tempoPercent: number; tempoRange: TempoRange; tempoSync: boolean
+  tempoUpdatePending: boolean; pendingTempoPercent: number | null
+  tempoWorker: Promise<void> | null; tempoReconcileScheduled: boolean
+  lastAppliedTiming: TempoTimingSnapshot | null
   volume: number; gainTrim: number
   sampleBpm: number | null; sampleMeta: SampleMeta | null
   regionEntity: NexusEntity<'audioRegion'> | null
@@ -116,8 +130,16 @@ interface NativeTimingResult {
   durationTicks: number
   replacementRegion: NexusEntity<'audioRegion'> | null
 }
+interface TempoTimingSnapshot {
+  projectBpm: number
+  sourceBpm: number
+  percent: number
+  playbackRate: number
+  mappedDurationTicks: number
+  regionDurationTicks: number
+}
 interface SourceTimingReplacement {
-  deckIndex: 0 | 1
+  deckIndex: WaveformDeckIndex
   previousRegionId: string
   region: NexusEntity<'audioRegion'>
   automationCollection: NexusEntity<'automationCollection'>
@@ -183,9 +205,9 @@ const deckOperationStates: [DeckOperationState, DeckOperationState] = [
 ]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, sourceNode: null, gainNode: null, audioBuffer: null, isPlaying: false, isPaused: false, pauseOffset: 0, startedAt: 0, looping: true, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -543,6 +565,7 @@ async function connectProject() {
         updateSourceDeckUi(0)
         updateSourceDeckUi(1)
       }
+      decks.forEach((_, deckIndex) => renderTempoControls(deckIndex as WaveformDeckIndex))
       setStatus(connected ? 'connected' : 'error', connected ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…')
     })
     loadBPM()
@@ -569,6 +592,7 @@ function resetTempoMasterSession() {
   projectConnected = false
   currentProjectId = null
   currentProjectBpm = null
+  decks.forEach((_, deckIndex) => resetDeckTempoState(deckIndex as WaveformDeckIndex))
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
     pendingBpmResolutions[deckIndex] = null
@@ -586,18 +610,158 @@ function updateDeckBpmLabels(bpm: number | null) {
   currentProjectBpm = normalizedBpm
   decks.forEach((deck, index) => {
     if (deck.sampleBpm === null) deck.baseBpm = normalizedBpm
-    updateDeckBpmLabel(index as WaveformDeckIndex)
+    renderTempoControls(index as WaveformDeckIndex)
   })
   updateLiveAudioShareStatus()
 }
 function updateDeckBpmLabel(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
-  if (deckIndex < 2 && !isSourceDeckSynchronized(deckIndex as 0 | 1)) {
+  if (!canUseDeckTempo(deckIndex)) {
     el(`deck${deckIndex + 1}-bpm`).textContent = '—'
     return
   }
-  const bpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
-  el(`deck${deckIndex + 1}-bpm`).textContent = bpm === null ? '—' : String(bpm)
+  const sourceBpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+  const bpm = sourceBpm === null ? null : effectiveBpm(sourceBpm, deck.tempoPercent)
+  el(`deck${deckIndex + 1}-bpm`).textContent =
+    bpm === null ? '—' : bpm.toFixed(2).replace(/\.?0+$/, '')
+}
+
+function canUseDeckTempo(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  return projectConnected
+    && nexus !== null
+    && isSupportedBpm(currentProjectBpm)
+    && isSupportedBpm(normalizeBpm(deck.sampleBpm ?? deck.baseBpm))
+    && deck.sampleMeta !== null
+    && deck.regionEntity !== null
+    && deck.automationCollectionEntity !== null
+}
+
+function resetDeckTempoState(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  deck.tempoPercent = 0
+  deck.tempoRange = 10
+  deck.tempoSync = false
+  deck.tempoUpdatePending = false
+  deck.pendingTempoPercent = null
+  deck.tempoWorker = null
+  deck.tempoReconcileScheduled = false
+  deck.lastAppliedTiming = null
+  deck.playbackRate = 1
+  renderTempoControls(deckIndex)
+}
+
+function getTempoElements(deckIndex: WaveformDeckIndex) {
+  const prefix = `d${deckIndex + 1}-tempo`
+  const module = el<HTMLDivElement>(`${prefix}-module`)
+  return {
+    module,
+    fader: el<HTMLInputElement>(prefix),
+    value: el<HTMLOutputElement>(`${prefix}-value`),
+    sync: el<HTMLButtonElement>(`${prefix}-sync`),
+    maximum: el<HTMLSpanElement>(`${prefix}-max`),
+    minimum: el<HTMLSpanElement>(`${prefix}-min`),
+    error: el<HTMLDivElement>(`${prefix}-error`),
+    ranges: Array.from(module.querySelectorAll<HTMLButtonElement>('.tempo-ranges button')),
+  }
+}
+
+function formatTempoPercent(percent: number) {
+  const rounded = Math.abs(percent) < 0.0005 ? 0 : percent
+  return `${rounded >= 0 ? '+' : ''}${rounded.toFixed(1)}%`
+}
+
+function renderTempoControls(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const controls = getTempoElements(deckIndex)
+  const enabled = canUseDeckTempo(deckIndex)
+  controls.fader.min = String(-deck.tempoRange)
+  controls.fader.max = String(deck.tempoRange)
+  controls.fader.value = String(clampTempoPercent(deck.tempoPercent, deck.tempoRange))
+  controls.value.value = formatTempoPercent(deck.tempoPercent)
+  controls.value.textContent = formatTempoPercent(deck.tempoPercent)
+  controls.maximum.textContent = `+${deck.tempoRange}`
+  controls.minimum.textContent = `−${deck.tempoRange}`
+  controls.sync.classList.toggle('active', deck.tempoSync)
+  controls.sync.setAttribute('aria-pressed', String(deck.tempoSync))
+  controls.module.classList.toggle('is-pending', deck.tempoUpdatePending)
+  controls.module.setAttribute('aria-busy', String(deck.tempoUpdatePending))
+  controls.fader.disabled = !enabled
+  controls.sync.disabled = !enabled
+  controls.ranges.forEach((button) => {
+    const selected = Number(button.dataset.range) === deck.tempoRange
+    button.classList.toggle('active', selected)
+    button.setAttribute('aria-pressed', String(selected))
+    button.disabled = !enabled
+  })
+  updateDeckBpmLabel(deckIndex)
+}
+
+function setTempoError(deckIndex: WaveformDeckIndex, message: string) {
+  getTempoElements(deckIndex).error.textContent = message.toUpperCase()
+}
+
+function clearTempoError(deckIndex: WaveformDeckIndex) {
+  getTempoElements(deckIndex).error.textContent = ''
+}
+
+function setupTempoControls(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const controls = getTempoElements(deckIndex)
+  controls.fader.addEventListener('input', () => {
+    if (!canUseDeckTempo(deckIndex)) return
+    deck.tempoSync = false
+    deck.tempoPercent = clampTempoPercent(Number(controls.fader.value), deck.tempoRange)
+    deck.playbackRate = tempoPercentToPlaybackRate(deck.tempoPercent)
+    clearTempoError(deckIndex)
+    renderTempoControls(deckIndex)
+    queueDeckTempoUpdate(deckIndex, deck.tempoPercent)
+  })
+  controls.sync.addEventListener('click', () => {
+    if (!canUseDeckTempo(deckIndex)) return
+    if (deck.tempoSync) {
+      deck.tempoSync = false
+      clearTempoError(deckIndex)
+      renderTempoControls(deckIndex)
+      return
+    }
+    const sourceBpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+    const projectBpm = normalizeBpm(currentProjectBpm)
+    if (!isSupportedBpm(sourceBpm) || !isSupportedBpm(projectBpm)) return
+    const percent = tempoPercentForBpm(sourceBpm, projectBpm)
+    const range = smallestTempoRange(percent)
+    if (range === null) {
+      setTempoError(deckIndex, 'SYNC TARGET EXCEEDS ±50%')
+      setStatus('error', `DECK ${deckIndex + 1}: SYNC TARGET EXCEEDS THE ±50% TEMPO RANGE`)
+      return
+    }
+    deck.tempoSync = true
+    deck.tempoRange = range
+    deck.tempoPercent = percent
+    deck.playbackRate = tempoPercentToPlaybackRate(percent)
+    clearTempoError(deckIndex)
+    renderTempoControls(deckIndex)
+    queueDeckTempoUpdate(deckIndex, percent)
+  })
+  controls.ranges.forEach((button) => {
+    button.addEventListener('click', () => {
+      if (!canUseDeckTempo(deckIndex)) return
+      const range = Number(button.dataset.range) as TempoRange
+      if (range !== 10 && range !== 30 && range !== 50) return
+      deck.tempoRange = range
+      const clamped = clampTempoPercent(deck.tempoPercent, range)
+      const changed = Math.abs(clamped - deck.tempoPercent) > 1e-9
+      if (changed) {
+        deck.tempoSync = false
+        deck.tempoPercent = clamped
+        deck.playbackRate = tempoPercentToPlaybackRate(clamped)
+      }
+      clearTempoError(deckIndex)
+      renderTempoControls(deckIndex)
+      if (changed) queueDeckTempoUpdate(deckIndex, clamped)
+    })
+  })
+  renderTempoControls(deckIndex)
 }
 
 function serializeSourceTiming<T>(task: () => Promise<T>): Promise<T> {
@@ -621,17 +785,26 @@ function scheduleProjectTempoRemap(
   projectBpm: number,
   expectedSession: number,
 ) {
+  currentProjectBpm = projectBpm
+  decks.forEach((_, deckIndex) => renderTempoControls(deckIndex as WaveformDeckIndex))
   void serializeSourceTiming(async () => {
     if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
     try {
-      const applied = await remapLoadedSourceRegions(
+      const result = await remapLoadedSourceRegions(
         projectDocument,
         projectBpm,
         expectedSession,
       )
-      if (!applied) return
+      if (!result.applied) return
       if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
       updateDeckBpmLabels(projectBpm)
+      result.rejected.forEach((deckIndex) => {
+        setTempoError(deckIndex, 'SYNC TARGET EXCEEDS ±50%')
+        setStatus(
+          'error',
+          `DECK ${deckIndex + 1}: PROJECT TEMPO CHANGED, BUT THE SYNC TARGET EXCEEDS ±50%`,
+        )
+      })
     } catch (error) {
       if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
       const message = error instanceof Error ? error.message : String(error)
@@ -1055,6 +1228,7 @@ function clearDeckContentEntities(deck: DeckState) {
   deck.sampleEntity = null
   deck.automationCollectionEntity = null
   const deckIndex = decks.indexOf(deck)
+  if (deckIndex >= 0) resetDeckTempoState(deckIndex as WaveformDeckIndex)
   if (deckIndex === 0 || deckIndex === 1) {
     resetManualBpmReport(deckIndex)
   }
@@ -1119,7 +1293,7 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   metadataDuration.textContent = loaded ? formatDuration(deck.sampleMeta?.durationSeconds) : '—'
   unload.classList.toggle('is-hidden', !loaded)
   unload.disabled = pending || !projectConnected
-  updateDeckBpmLabel(deckIndex)
+  renderTempoControls(deckIndex)
   updateManualBpmReportUi(deckIndex)
 }
 
@@ -1142,7 +1316,7 @@ function clearMagicDeckLocalMedia() {
   magicDeck.sampleMeta = null
   magicDeck.playbackRate = 1
   magicWaveformPeaks = null
-  updateDeckBpmLabel(2)
+  renderTempoControls(2)
   syncTransportUi('d3', magicDeck)
   drawMagicIdle()
 }
@@ -1209,7 +1383,7 @@ function loadedSourceDeckCount(t: SafeTransactionBuilder) {
 }
 
 function getExpectedPlaybackTerminalEvent(
-  t: SafeTransactionBuilder,
+  t: { entities: EntityQuery },
   region: NexusEntity<'audioRegion'>,
 ) {
   const collectionId = region.fields.playbackAutomationCollection.value.entityId
@@ -1241,11 +1415,98 @@ function getExpectedPlaybackTerminalEvent(
   return terminalEvents[0]
 }
 
+function reconstructDeckTempoFromSynchronizedRegion(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const projectBpm = normalizeBpm(currentProjectBpm)
+  const sourceBpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+  const sampleDurationSeconds = deck.sampleMeta?.durationSeconds
+  const region = deck.regionEntity
+  if (
+    !region
+    || !isSupportedBpm(projectBpm)
+    || !isSupportedBpm(sourceBpm)
+    || !sampleDurationSeconds
+  ) {
+    renderTempoControls(deckIndex)
+    return false
+  }
+  const nativeDurationTicks = secondsToTicks(sampleDurationSeconds, projectBpm)
+  const terminalEvent = nexus
+    ? getExpectedPlaybackTerminalEvent({ entities: nexus.queryEntities }, region)
+    : null
+  const synchronizedDurationTicks = terminalEvent?.fields.positionTicks.value
+    ?? (deckIndex < 2
+      ? region.fields.region.fields.durationTicks.value
+      : region.fields.region.fields.loopDurationTicks.value)
+  if (
+    !Number.isFinite(nativeDurationTicks)
+    || nativeDurationTicks <= 0
+    || !Number.isFinite(synchronizedDurationTicks)
+    || synchronizedDurationTicks <= 0
+  ) {
+    setTempoError(deckIndex, 'INVALID SYNCHRONIZED TIMING')
+    renderTempoControls(deckIndex)
+    return false
+  }
+
+  const percent = reconstructTempoPercent(nativeDurationTicks, synchronizedDurationTicks)
+  const requiredRange = smallestTempoRange(percent)
+  deck.tempoPercent = percent
+  deck.playbackRate = tempoPercentToPlaybackRate(percent)
+  if (requiredRange !== null && Math.abs(percent) > deck.tempoRange + 1e-9) {
+    deck.tempoRange = requiredRange
+  }
+  deck.lastAppliedTiming = {
+    projectBpm,
+    sourceBpm,
+    percent,
+    playbackRate: deck.playbackRate,
+    mappedDurationTicks: synchronizedDurationTicks,
+    regionDurationTicks: region.fields.region.fields.durationTicks.value,
+  }
+  if (requiredRange === null) {
+    setTempoError(deckIndex, 'PROJECT TIMING EXCEEDS ±50%')
+  } else {
+    clearTempoError(deckIndex)
+  }
+  renderTempoControls(deckIndex)
+  return true
+}
+
+function scheduleDeckTimingReconstruction(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  if (deck.tempoReconcileScheduled) return
+  deck.tempoReconcileScheduled = true
+  queueMicrotask(() => {
+    deck.tempoReconcileScheduled = false
+    if (!canUseDeckTempo(deckIndex)) return
+    if (deck.tempoUpdatePending) return
+    reconstructDeckTempoFromSynchronizedRegion(deckIndex)
+    if (!deck.tempoSync) return
+    const sourceBpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+    const projectBpm = normalizeBpm(currentProjectBpm)
+    if (!isSupportedBpm(sourceBpm) || !isSupportedBpm(projectBpm)) return
+    const targetPercent = tempoPercentForBpm(sourceBpm, projectBpm)
+    const targetRange = smallestTempoRange(targetPercent)
+    if (targetRange === null) {
+      setTempoError(deckIndex, 'SYNC TARGET EXCEEDS ±50%')
+      return
+    }
+    deck.tempoRange = targetRange
+    if (Math.abs(deck.tempoPercent - targetPercent) > 0.01) {
+      deck.tempoPercent = targetPercent
+      renderTempoControls(deckIndex)
+      queueDeckTempoUpdate(deckIndex, targetPercent)
+    }
+  })
+}
+
 function replaceSourceRegionWithNativeTiming(
   t: SafeTransactionBuilder,
   region: NexusEntity<'audioRegion'>,
   durationTicks: number,
   guardedIds: string[],
+  regionDurationTicks = durationTicks,
 ) {
   const oldCollectionId = region.fields.playbackAutomationCollection.value.entityId
   const oldCollection = t.entities.ofTypes('automationCollection').getEntity(oldCollectionId)
@@ -1278,7 +1539,7 @@ function replaceSourceRegionWithNativeTiming(
     sample: region.fields.sample.value,
     region: {
       positionTicks: region.fields.region.fields.positionTicks.value,
-      durationTicks,
+      durationTicks: regionDurationTicks,
       collectionOffsetTicks: region.fields.region.fields.collectionOffsetTicks.value,
       loopOffsetTicks: region.fields.region.fields.loopOffsetTicks.value,
       loopDurationTicks: durationTicks,
@@ -1291,7 +1552,7 @@ function replaceSourceRegionWithNativeTiming(
     fadeInSlope: region.fields.fadeInSlope.value,
     fadeOutDurationTicks: region.fields.fadeOutDurationTicks.value,
     fadeOutSlope: region.fields.fadeOutSlope.value,
-    timestretchMode: 1,
+    timestretchMode: 2,
     pitchShiftSemitones: region.fields.pitchShiftSemitones.value,
   })
 
@@ -1315,11 +1576,13 @@ function applyNativeSourceTiming(
   sampleDurationSeconds: number,
   projectBpm: number,
   guardedIds: string[],
+  percent = 0,
 ): NativeTimingResult {
-  const durationTicks = secondsToTicks(sampleDurationSeconds, projectBpm)
-  if (!Number.isFinite(durationTicks) || durationTicks <= 0) {
+  const nativeDurationTicks = secondsToTicks(sampleDurationSeconds, projectBpm)
+  if (!Number.isFinite(nativeDurationTicks) || nativeDurationTicks <= 0) {
     throw new Error('The source duration could not be converted to project ticks')
   }
+  const durationTicks = mappedDurationTicks(nativeDurationTicks, percent)
 
   const terminalEvent = getExpectedPlaybackTerminalEvent(t, region)
   if (!terminalEvent) {
@@ -1335,7 +1598,47 @@ function applyNativeSourceTiming(
   t.update(region.fields.region.fields.durationTicks, durationTicks)
   t.update(region.fields.region.fields.loopDurationTicks, durationTicks)
   t.update(terminalEvent.fields.positionTicks, durationTicks)
-  t.update(region.fields.timestretchMode, 1)
+  t.update(region.fields.timestretchMode, 2)
+  return { durationTicks, replacementRegion: null }
+}
+
+function applyMagicTempoTiming(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+  sampleDurationSeconds: number,
+  projectBpm: number,
+  guardedIds: string[],
+  percent: number,
+  regionDurationTicksOverride?: number,
+): NativeTimingResult {
+  const nativeDurationTicks = secondsToTicks(sampleDurationSeconds, projectBpm)
+  if (!Number.isFinite(nativeDurationTicks) || nativeDurationTicks <= 0) {
+    throw new Error('The Magic sample duration could not be converted to project ticks')
+  }
+  const durationTicks = mappedDurationTicks(nativeDurationTicks, percent)
+  const regionDurationTicks =
+    regionDurationTicksOverride ?? region.fields.region.fields.durationTicks.value
+  const terminalEvent = getExpectedPlaybackTerminalEvent(t, region)
+  if (!terminalEvent) {
+    const replacement = replaceSourceRegionWithNativeTiming(
+      t,
+      region,
+      durationTicks,
+      guardedIds,
+      regionDurationTicks,
+    )
+    return { durationTicks, replacementRegion: replacement.region }
+  }
+
+  if (
+    regionDurationTicksOverride !== undefined
+    && region.fields.region.fields.durationTicks.value !== regionDurationTicksOverride
+  ) {
+    t.update(region.fields.region.fields.durationTicks, regionDurationTicksOverride)
+  }
+  t.update(region.fields.region.fields.loopDurationTicks, durationTicks)
+  t.update(terminalEvent.fields.positionTicks, durationTicks)
+  t.update(region.fields.timestretchMode, 2)
   return { durationTicks, replacementRegion: null }
 }
 
@@ -1354,14 +1657,166 @@ function rebindSourceTimingReplacements(
     deck.contentSubscriptions = []
     deck.regionEntity = replacement.region
     deck.automationCollectionEntity = replacement.automationCollection
-    watchSourceDeckContent(
-      replacement.deckIndex,
-      projectDocument,
-      replacement.region,
-      expectedSession,
-    )
-    updateDeckBpmLabel(replacement.deckIndex)
-    updateManualBpmReportUi(replacement.deckIndex)
+    if (replacement.deckIndex < 2) {
+      watchSourceDeckContent(
+        replacement.deckIndex as 0 | 1,
+        projectDocument,
+        replacement.region,
+        expectedSession,
+      )
+    } else {
+      watchMagicDeckContent(projectDocument, replacement.region, expectedSession)
+    }
+    renderTempoControls(replacement.deckIndex)
+    if (replacement.deckIndex < 2) {
+      updateManualBpmReportUi(replacement.deckIndex as 0 | 1)
+    }
+  })
+}
+
+async function applyDeckTempoUpdate(
+  deckIndex: WaveformDeckIndex,
+  percent: number,
+  expectedSession: number,
+) {
+  return serializeSourceTiming(async () => {
+    const deck = decks[deckIndex]
+    const projectDocument = nexus
+    const regionId = deck.regionEntity?.id
+    const sampleDurationSeconds = deck.sampleMeta?.durationSeconds
+    const sourceBpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+    const projectBpm = normalizeBpm(currentProjectBpm)
+    if (
+      !projectDocument
+      || !projectConnected
+      || !regionId
+      || !sampleDurationSeconds
+      || !isSupportedBpm(sourceBpm)
+      || !isSupportedBpm(projectBpm)
+    ) throw new Error('The synchronized deck timing is no longer available')
+
+    const guardedIds: string[] = []
+    try {
+      const transactionResult = await projectDocument.modify((t) => {
+        const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+        if (!region) throw new Error('The project region is no longer available')
+        const timingResult = deckIndex < 2
+          ? applyNativeSourceTiming(
+              t,
+              region,
+              sampleDurationSeconds,
+              projectBpm,
+              guardedIds,
+              percent,
+            )
+          : applyMagicTempoTiming(
+              t,
+              region,
+              sampleDurationSeconds,
+              projectBpm,
+              guardedIds,
+              percent,
+            )
+        const replacements: SourceTimingReplacement[] = []
+        if (timingResult.replacementRegion) {
+          const automationCollection = t.entities
+            .ofTypes('automationCollection')
+            .getEntity(timingResult.replacementRegion.fields.playbackAutomationCollection.value.entityId)
+          if (!automationCollection) throw new Error('Replacement automation collection was not found')
+          replacements.push({
+            deckIndex,
+            previousRegionId: regionId,
+            region: timingResult.replacementRegion,
+            automationCollection,
+          })
+        }
+        if (deckIndex < 2) {
+          updateMagicLoopDurationInTransaction(
+            t,
+            new Map([[regionId, timingResult.durationTicks]]),
+          )
+        }
+        return {
+          replacements,
+          mappedDurationTicks: timingResult.durationTicks,
+          regionDurationTicks: deckIndex < 2
+            ? timingResult.durationTicks
+            : region.fields.region.fields.durationTicks.value,
+        }
+      })
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+        || deck.regionEntity?.id !== regionId
+      ) throw new Error('The project connection or region changed during the tempo update')
+
+      rebindSourceTimingReplacements(
+        transactionResult.replacements,
+        projectDocument,
+        expectedSession,
+      )
+      const appliedPlaybackRate = tempoPercentToPlaybackRate(percent)
+      if (deck.pendingTempoPercent === null) {
+        deck.tempoPercent = percent
+        deck.playbackRate = appliedPlaybackRate
+      }
+      deck.lastAppliedTiming = {
+        projectBpm,
+        sourceBpm,
+        percent,
+        playbackRate: appliedPlaybackRate,
+        mappedDurationTicks: transactionResult.mappedDurationTicks,
+        regionDurationTicks: transactionResult.regionDurationTicks,
+      }
+      renderTempoControls(deckIndex)
+    } finally {
+      guardedIds.forEach((regionIdToRelease) => guardedRegionRemovalIds.delete(regionIdToRelease))
+    }
+  })
+}
+
+function queueDeckTempoUpdate(deckIndex: WaveformDeckIndex, percent: number) {
+  const deck = decks[deckIndex]
+  deck.pendingTempoPercent = percent
+  if (deck.tempoWorker) return
+  const expectedSession = tempoSessionId
+  deck.tempoUpdatePending = true
+  renderTempoControls(deckIndex)
+
+  const worker = (async () => {
+    while (
+      expectedSession === tempoSessionId
+      && nexus !== null
+      && deck.pendingTempoPercent !== null
+    ) {
+      const nextPercent = deck.pendingTempoPercent
+      deck.pendingTempoPercent = null
+      try {
+        await applyDeckTempoUpdate(deckIndex, nextPercent, expectedSession)
+        clearTempoError(deckIndex)
+      } catch (error) {
+        if (expectedSession !== tempoSessionId) return
+        deck.pendingTempoPercent = null
+        reconstructDeckTempoFromSynchronizedRegion(deckIndex)
+        const message = error instanceof Error ? error.message : String(error)
+        setTempoError(deckIndex, `UPDATE FAILED: ${message}`)
+        setStatus('error', `DECK ${deckIndex + 1}: TEMPO UPDATE FAILED — ${message}`)
+        return
+      }
+    }
+  })()
+  deck.tempoWorker = worker
+  void worker.finally(() => {
+    if (deck.tempoWorker !== worker) return
+    deck.tempoWorker = null
+    deck.tempoUpdatePending = false
+    renderTempoControls(deckIndex)
+    if (
+      deck.pendingTempoPercent !== null
+      && expectedSession === tempoSessionId
+      && nexus !== null
+    ) queueDeckTempoUpdate(deckIndex, deck.pendingTempoPercent)
   })
 }
 
@@ -1389,36 +1844,81 @@ async function remapLoadedSourceRegions(
   projectBpm: number,
   expectedSession: number,
 ) {
-  const sources = decks.slice(0, 2).flatMap((deck, deckIndex) =>
-    deck.regionEntity && deck.sampleMeta
-      ? [{
-          deckIndex: deckIndex as 0 | 1,
-          regionId: deck.regionEntity.id,
-          sampleDurationSeconds: deck.sampleMeta.durationSeconds,
-        }]
-      : [],
-  )
+  const rejected: WaveformDeckIndex[] = []
+  const sources = decks.flatMap((deck, deckIndexValue) => {
+    const deckIndex = deckIndexValue as WaveformDeckIndex
+    if (!deck.regionEntity || !deck.sampleMeta) return []
+    const sourceBpm = normalizeBpm(deck.sampleBpm ?? deck.baseBpm)
+    if (!isSupportedBpm(sourceBpm)) return []
+    const desiredPercent = deck.tempoSync
+      ? tempoPercentForBpm(sourceBpm, projectBpm)
+      : deck.tempoPercent
+    if (smallestTempoRange(desiredPercent) === null) {
+      if (deck.tempoSync) rejected.push(deckIndex)
+      return []
+    }
+    return [{
+      deckIndex,
+      regionId: deck.regionEntity.id,
+      sampleDurationSeconds: deck.sampleMeta.durationSeconds,
+      sourceBpm,
+      desiredPercent,
+    }]
+  })
   const guardedIds: string[] = []
   try {
     const transactionResult = await projectDocument.modify((t) => {
       const config = t.entities.ofTypes('config').get()[0]
       const currentTempo = Number(config?.fields.tempoBpm.value)
       if (!Number.isFinite(currentTempo) || Math.abs(currentTempo - projectBpm) > 0.0001) {
-        return { applied: false, replacements: [] as SourceTimingReplacement[] }
+        return {
+          applied: false,
+          replacements: [] as SourceTimingReplacement[],
+          timings: [] as Array<{
+            deckIndex: WaveformDeckIndex
+            mappedDurationTicks: number
+            regionDurationTicks: number
+          }>,
+        }
       }
       const nextReplacements: SourceTimingReplacement[] = []
+      const timings: Array<{
+        deckIndex: WaveformDeckIndex
+        mappedDurationTicks: number
+        regionDurationTicks: number
+      }> = []
       const durationOverrides = new Map<string, number>()
       sources.forEach((source) => {
         const region = t.entities.ofTypes('audioRegion').getEntity(source.regionId)
         if (!region) throw new Error(`Deck ${source.deckIndex + 1} project region was not found`)
-        const result = applyNativeSourceTiming(
-          t,
-          region,
-          source.sampleDurationSeconds,
-          projectBpm,
-          guardedIds,
-        )
-        durationOverrides.set(source.regionId, result.durationTicks)
+        const result = source.deckIndex < 2
+          ? applyNativeSourceTiming(
+              t,
+              region,
+              source.sampleDurationSeconds,
+              projectBpm,
+              guardedIds,
+              source.desiredPercent,
+            )
+          : applyMagicTempoTiming(
+              t,
+              region,
+              source.sampleDurationSeconds,
+              projectBpm,
+              guardedIds,
+              source.desiredPercent,
+              getMagicLoopDurationTicks(t, durationOverrides),
+            )
+        if (source.deckIndex < 2) {
+          durationOverrides.set(source.regionId, result.durationTicks)
+        }
+        timings.push({
+          deckIndex: source.deckIndex,
+          mappedDurationTicks: result.durationTicks,
+          regionDurationTicks: source.deckIndex < 2
+            ? result.durationTicks
+            : getMagicLoopDurationTicks(t, durationOverrides),
+        })
         if (result.replacementRegion) {
           const automationCollection = t.entities
             .ofTypes('automationCollection')
@@ -1433,9 +1933,9 @@ async function remapLoadedSourceRegions(
         }
       })
       updateMagicLoopDurationInTransaction(t, durationOverrides)
-      return { applied: true, replacements: nextReplacements }
+      return { applied: true, replacements: nextReplacements, timings }
     })
-    if (!transactionResult.applied) return false
+    if (!transactionResult.applied) return { applied: false, rejected }
     if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
       throw new Error('The project connection changed during the tempo remap')
     }
@@ -1444,7 +1944,27 @@ async function remapLoadedSourceRegions(
       projectDocument,
       expectedSession,
     )
-    return true
+    transactionResult.timings.forEach((timing) => {
+      const source = sources.find((candidate) => candidate.deckIndex === timing.deckIndex)
+      if (!source) return
+      const deck = decks[timing.deckIndex]
+      deck.tempoPercent = source.desiredPercent
+      deck.playbackRate = tempoPercentToPlaybackRate(source.desiredPercent)
+      if (deck.tempoSync) {
+        deck.tempoRange = smallestTempoRange(source.desiredPercent) ?? deck.tempoRange
+      }
+      deck.lastAppliedTiming = {
+        projectBpm,
+        sourceBpm: source.sourceBpm,
+        percent: source.desiredPercent,
+        playbackRate: deck.playbackRate,
+        mappedDurationTicks: timing.mappedDurationTicks,
+        regionDurationTicks: timing.regionDurationTicks,
+      }
+      clearTempoError(timing.deckIndex)
+      renderTempoControls(timing.deckIndex)
+    })
+    return { applied: true, rejected }
   } finally {
     guardedIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
   }
@@ -1484,6 +2004,12 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
         if (projectTempoUpdated) {
           t.update(config.fields.tempoBpm, correctedBpm)
         }
+        const desiredPercent = deck.tempoSync
+          ? tempoPercentForBpm(correctedBpm, effectiveProjectBpm)
+          : deck.tempoPercent
+        if (smallestTempoRange(desiredPercent) === null) {
+          throw new Error('The corrected BPM requires a tempo change beyond ±50%')
+        }
 
         const timingResult = applyNativeSourceTiming(
           t,
@@ -1491,6 +2017,7 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
           sampleDurationSeconds,
           effectiveProjectBpm,
           guardedIds,
+          desiredPercent,
         )
         const replacements: SourceTimingReplacement[] = []
         if (timingResult.replacementRegion) {
@@ -1509,7 +2036,13 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
           t,
           new Map([[regionId, timingResult.durationTicks]]),
         )
-        return { projectTempoUpdated, replacements }
+        return {
+          projectTempoUpdated,
+          replacements,
+          desiredPercent,
+          mappedDurationTicks: timingResult.durationTicks,
+          projectBpm: effectiveProjectBpm,
+        }
       })
 
       if (
@@ -1528,10 +2061,24 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
       )
       deck.sampleBpm = correctedBpm
       deck.baseBpm = correctedBpm
+      deck.tempoPercent = transactionResult.desiredPercent
+      deck.playbackRate = tempoPercentToPlaybackRate(transactionResult.desiredPercent)
+      if (deck.tempoSync) {
+        deck.tempoRange =
+          smallestTempoRange(transactionResult.desiredPercent) ?? deck.tempoRange
+      }
+      deck.lastAppliedTiming = {
+        projectBpm: transactionResult.projectBpm,
+        sourceBpm: correctedBpm,
+        percent: transactionResult.desiredPercent,
+        playbackRate: deck.playbackRate,
+        mappedDurationTicks: transactionResult.mappedDurationTicks,
+        regionDurationTicks: transactionResult.mappedDurationTicks,
+      }
       if (transactionResult.projectTempoUpdated) {
         updateDeckBpmLabels(correctedBpm)
       } else {
-        updateDeckBpmLabel(deckIndex)
+        renderTempoControls(deckIndex)
       }
       return transactionResult.projectTempoUpdated
     } finally {
@@ -1924,11 +2471,19 @@ function watchSourceDeckContent(
   expectedSession: number,
 ) {
   const deck = decks[deckIndex]
+  const terminalEvent = getExpectedPlaybackTerminalEvent(
+    { entities: projectDocument.queryEntities },
+    region,
+  )
   deck.contentSubscriptions.push(
     projectDocument.events.onUpdate(region.fields.region.fields.durationTicks, () => {
       if (deck.regionEntity?.id === region.id) {
+        scheduleDeckTimingReconstruction(deckIndex)
         void syncMagicLoopDuration(projectDocument, expectedSession)
       }
+    }),
+    projectDocument.events.onUpdate(region.fields.region.fields.loopDurationTicks, () => {
+      if (deck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(deckIndex)
     }),
     projectDocument.events.onRemove(region, () => {
       if (deck.regionEntity?.id !== region.id) return
@@ -1936,6 +2491,13 @@ function watchSourceDeckContent(
       handleExternalSourceContentRemoval(deckIndex, projectDocument, expectedSession)
     }),
   )
+  if (terminalEvent) {
+    deck.contentSubscriptions.push(
+      projectDocument.events.onUpdate(terminalEvent.fields.positionTicks, () => {
+        if (deck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(deckIndex)
+      }),
+    )
+  }
 }
 
 function watchMagicDeckContent(
@@ -1944,16 +2506,31 @@ function watchMagicDeckContent(
   expectedSession: number,
 ) {
   const magicDeck = decks[2]
+  const terminalEvent = getExpectedPlaybackTerminalEvent(
+    { entities: projectDocument.queryEntities },
+    region,
+  )
   magicDeck.contentSubscriptions.push(
+    projectDocument.events.onUpdate(region.fields.region.fields.loopDurationTicks, () => {
+      if (magicDeck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(2)
+    }),
     projectDocument.events.onRemove(region, () => {
       if (
         nexus !== projectDocument
         || expectedSession !== tempoSessionId
         || magicDeck.regionEntity?.id !== region.id
+        || guardedRegionRemovalIds.has(region.id)
       ) return
       handleExternalMagicContentRemoval()
     }),
   )
+  if (terminalEvent) {
+    magicDeck.contentSubscriptions.push(
+      projectDocument.events.onUpdate(terminalEvent.fields.positionTicks, () => {
+        if (magicDeck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(2)
+      }),
+    )
+  }
 }
 
 function bindDeckRoutingGraph(
@@ -2001,6 +2578,7 @@ function bindDeckContentGraph(
   } else {
     watchMagicDeckContent(projectDocument, content.region, expectedSession)
   }
+  scheduleDeckTimingReconstruction(deckIndex)
 }
 
 async function insertSampleIntoProject(
@@ -2070,7 +2648,7 @@ async function insertSampleIntoProject(
       displayName,
     })
     if (isSourceDeck) {
-      t.update(region.fields.timestretchMode, 1)
+      t.update(region.fields.timestretchMode, 2)
     } else if (forceMagicLoop) {
       t.update(region.fields.timestretchMode, 2)
     }
@@ -2098,6 +2676,7 @@ async function insertSampleIntoProject(
   deck.sampleBpm = bpm
   deck.baseBpm = bpm
   deck.sampleMeta = sample
+  resetDeckTempoState(deckIndex)
   bindDeckContentGraph(
     deckIndex,
     projectDocument,
@@ -3258,6 +3837,9 @@ function initApp() {
   resetBpmDialogue(1)
   setupManualBpmReport(0)
   setupManualBpmReport(1)
+  setupTempoControls(0)
+  setupTempoControls(1)
+  setupTempoControls(2)
   btnConnect.onclick = () => connectProject()
   btnDisconnect.onclick = () => disconnectAll()
   btnOpenAudiotool.onclick = () => openAudiotoolProjectTab()
