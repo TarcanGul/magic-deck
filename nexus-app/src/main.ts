@@ -156,7 +156,6 @@ let nexus: SyncedDocument | null = null
 let projectConnected = false
 let currentProjectId: string | null = null
 let currentProjectBpm: number | null = null
-let tempoMasterEstablished = false
 let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let placementModalQueue: Promise<void> = Promise.resolve()
@@ -569,7 +568,6 @@ function resetTempoMasterSession() {
   tempoSessionId += 1
   projectConnected = false
   currentProjectId = null
-  tempoMasterEstablished = false
   currentProjectBpm = null
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
@@ -924,8 +922,6 @@ async function restoreSourceDecksFromProject(
     bindDeckContentGraph(deckIndex, projectDocument, selected.content, expectedSession)
     updateSourceDeckUi(deckIndex)
   }
-
-  tempoMasterEstablished = isSourceDeckSynchronized(0) || isSourceDeckSynchronized(1)
 }
 
 function cleanMagicDeckDisplayName(displayName: string) {
@@ -1372,14 +1368,19 @@ function rebindSourceTimingReplacements(
 function updateMagicLoopDurationInTransaction(
   t: SafeTransactionBuilder,
   durationOverrides?: ReadonlyMap<string, number>,
+  durationTicksOverride?: number,
 ) {
   const magicRegionId = decks[2].regionEntity?.id
   if (!magicRegionId) return
   const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
   if (!magicRegion) return
-  const durationTicks = getMagicLoopDurationTicks(t, durationOverrides)
+  const durationTicks = durationTicksOverride
+    ?? getMagicLoopDurationTicks(t, durationOverrides)
   if (magicRegion.fields.region.fields.durationTicks.value !== durationTicks) {
     t.update(magicRegion.fields.region.fields.durationTicks, durationTicks)
+  }
+  if (magicRegion.fields.timestretchMode.value !== 2) {
+    t.update(magicRegion.fields.timestretchMode, 2)
   }
 }
 
@@ -1813,14 +1814,7 @@ function getMagicLoopDurationTicks(
 async function syncMagicLoopDuration(projectDocument: SyncedDocument, expectedSession: number) {
   if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
   await projectDocument.modify((t) => {
-    const magicRegionId = decks[2].regionEntity?.id
-    if (!magicRegionId) return
-    const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
-    if (!magicRegion) return
-    const durationTicks = getMagicLoopDurationTicks(t)
-    if (magicRegion.fields.region.fields.durationTicks.value !== durationTicks) {
-      t.update(magicRegion.fields.region.fields.durationTicks, durationTicks)
-    }
+    updateMagicLoopDurationInTransaction(t)
   })
 }
 
@@ -2027,7 +2021,6 @@ async function insertSampleIntoProject(
   const sampleBpm = normalizeBpm(sample.bpm)
   const bpm = normalizeBpm(timing?.bpm ?? resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
   if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
-  const establishesMaster = deckNum <= 2 && !tempoMasterEstablished
   const selected = await ensureDeckRoutingGraph(projectDocument, deckIndex, expectedSession)
   if (
     nexus !== projectDocument
@@ -2042,8 +2035,9 @@ async function insertSampleIntoProject(
     const targetTrack = t.entities.ofTypes('audioTrack').getEntity(targetTrackId)
     if (!targetTrack) throw new Error('Provisioned deck track is no longer available')
     const isSourceDeck = deckNum <= 2
+    const establishedTempo = isSourceDeck && loadedSourceDeckCount(t) === 0
     if (isSourceDeck && !config) throw new Error('Project tempo configuration was not found')
-    const effectiveProjectBpm = establishesMaster
+    const effectiveProjectBpm = establishedTempo
       ? bpm
       : Number(config?.fields.tempoBpm.value ?? currentProjectBpm)
     if (
@@ -2056,7 +2050,7 @@ async function insertSampleIntoProject(
     ) {
       throw new Error('Project tempo is outside the supported range')
     }
-    if (establishesMaster && config) {
+    if (establishedTempo && config) {
       t.update(config.fields.tempoBpm, bpm)
     }
     const sourceDurationTicks = isSourceDeck
@@ -2080,8 +2074,15 @@ async function insertSampleIntoProject(
     } else if (forceMagicLoop) {
       t.update(region.fields.timestretchMode, 2)
     }
+    if (establishedTempo && sourceDurationTicks !== undefined) {
+      updateMagicLoopDurationInTransaction(
+        t,
+        undefined,
+        Math.max(Ticks.Bars(MAGIC_DURATION_BARS), sourceDurationTicks),
+      )
+    }
     const entities = resolveInsertedProjectEntities(region, t)
-    return { region, ...entities }
+    return { region, ...entities, establishedTempo }
   })
   const inserted = deckNum <= 2
     ? await serializeSourceTiming(insertTransaction)
@@ -2090,8 +2091,7 @@ async function insertSampleIntoProject(
     throw new Error('Project connection changed during insertion')
   }
 
-  if (establishesMaster) {
-    tempoMasterEstablished = true
+  if (inserted.establishedTempo) {
     currentProjectBpm = bpm
   }
 
@@ -2169,8 +2169,7 @@ async function uploadToNexus(
       setMagicStatus('generating', 'REPLACING PREVIOUS MAGIC DECK')
       await removeMagicDeckProjectContent(expectedSession)
     }
-    const selectingMaster = deckNum <= 2 && !tempoMasterEstablished
-    await insertSampleIntoProject(
+    const inserted = await insertSampleIntoProject(
       deckNum,
       sample,
       projectDisplayName,
@@ -2181,7 +2180,7 @@ async function uploadToNexus(
       options.timing,
     )
     if (deckNum <= 2) {
-      setStatus('connected', selectingMaster
+      setStatus('connected', inserted.establishedTempo
         ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — NATIVE SPEED PRESERVED ✓`
         : `DECK ${deckNum}: ${file.name} — NATIVE SPEED PRESERVED ✓`)
     } else {
