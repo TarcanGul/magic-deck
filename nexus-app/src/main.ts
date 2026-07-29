@@ -125,6 +125,7 @@ interface AubioBpmResult {
 interface DeckOperationState {
   pendingCount: number
   activeKind: 'loading' | 'replacing' | 'unloading' | 'launching' | 'cancelling' | 'stopping' | 'generating' | null
+  uploading: boolean
   suppressProjectRemovalSync: boolean
 }
 interface ManualBpmReportState {
@@ -205,9 +206,9 @@ const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
 ]
 const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
-  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
 ]
 
 const decks: [DeckState, DeckState, DeckState] = [
@@ -1334,10 +1335,13 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const metadataBpm = el<HTMLElement>(`drop${deckIndex + 1}-bpm`)
   const metadataDuration = el<HTMLElement>(`drop${deckIndex + 1}-duration`)
   const unload = el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`)
+  const uploadIndicator = el<HTMLDivElement>(`deck${deckIndex + 1}-upload-indicator`)
 
   zone.classList.toggle('loaded', loaded)
   zone.classList.toggle('pending', pending)
   zone.setAttribute('aria-busy', String(pending))
+  el(`deck-${deckIndex + 1}`).setAttribute('aria-busy', String(operation.uploading))
+  uploadIndicator.hidden = !operation.uploading
   filename.textContent = loaded ? deck.fileName ?? '' : ''
   const bpm = loaded ? normalizeBpm(deck.sampleBpm ?? deck.baseBpm) : null
   metadataBpm.textContent = bpm === null ? '—' : String(bpm)
@@ -3461,12 +3465,22 @@ async function uploadToNexus(
   try {
     const sampleDisplayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
     const projectDisplayName = deckNum === 3 ? 'MAGIC DECK' : sampleDisplayName
+    const sourceDeckIndex = deckNum <= 2 ? (deckNum - 1) as 0 | 1 : null
+    if (sourceDeckIndex !== null) {
+      deckOperationStates[sourceDeckIndex].uploading = true
+      updateSourceDeckUi(sourceDeckIndex)
+    }
     const sample = await uploadSample(
       file,
       sampleDisplayName,
       options.timing?.bpm,
       options.sampleDescription,
     )
+      .finally(() => {
+        if (sourceDeckIndex === null) return
+        deckOperationStates[sourceDeckIndex].uploading = false
+        updateSourceDeckUi(sourceDeckIndex)
+      })
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during upload')
     const resolution = deckNum <= 2 ? await resolveSampleBpm(sample, file, deckNum, expectedSession) : undefined
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during BPM selection')
