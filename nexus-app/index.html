@@ -59,6 +59,7 @@
         <div class="deck-header">
           <span class="deck-num">01</span>
           <span class="deck-title">DECK A — PLAYER</span>
+          <button class="assistant-fx-trigger" data-deck-fx="0" type="button" aria-label="Open Deck A effects">FX</button>
           <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
         </div>
         <div class="deck-body">
@@ -199,6 +200,7 @@
         <div class="deck-header">
           <span class="deck-num">02</span>
           <span class="deck-title">DECK B — PLAYER</span>
+          <button class="assistant-fx-trigger" data-deck-fx="1" type="button" aria-label="Open Deck B effects">FX</button>
           <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
         </div>
         <div class="deck-body">
@@ -335,6 +337,7 @@
         <div class="deck-header magic-header">
           <span class="deck-num magic-num">03</span>
           <span class="deck-title magic-title">MAGIC DECK</span>
+          <button class="assistant-fx-trigger" data-deck-fx="2" type="button" aria-label="Open Magic Deck effects">FX</button>
           <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck3-bpm">—</span></div>
           <div class="magic-status">
             <span class="status-dot-magic" id="magic-dot"></span>
@@ -514,6 +517,46 @@
     <div class="modal-actions">
       <button id="placement-modal-cancel" class="btn-danger" type="button">⬡ CANCEL LOAD</button>
       <button id="placement-modal-confirm" class="btn-primary" type="button">⬡ PLACE AT BAR</button>
+    </div>
+  </div>
+</div>
+
+<!-- Deck Assistant project-synchronized effects -->
+<div id="fx-modal" class="modal-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="fx-modal-title">
+  <div class="modal fx-modal">
+    <div class="modal-header">
+      <span class="modal-kicker">DECK ASSISTANT · FX</span>
+      <h2 class="modal-title" id="fx-modal-title">Deck Effects</h2>
+    </div>
+    <div class="modal-body">
+      <p class="modal-copy">These controls update Audiotool devices in this deck's synchronized project signal path.</p>
+      <div class="fx-knob-grid">
+        <div class="fx-knob-wrap">
+          <canvas class="fx-knob" id="fx-delay" width="72" height="72" data-value="0" data-fx="delay"></canvas>
+          <span class="fx-label">DELAY</span>
+          <output class="fx-value" id="fx-delay-value">0%</output>
+        </div>
+        <div class="fx-knob-wrap">
+          <canvas class="fx-knob" id="fx-reverb" width="72" height="72" data-value="0" data-fx="reverb"></canvas>
+          <span class="fx-label">REVERB</span>
+          <output class="fx-value" id="fx-reverb-value">0%</output>
+        </div>
+        <div class="fx-knob-wrap">
+          <canvas class="fx-knob" id="fx-distortion" width="72" height="72" data-value="0" data-fx="distortion"></canvas>
+          <span class="fx-label">DISTORTION</span>
+          <output class="fx-value" id="fx-distortion-value">0%</output>
+        </div>
+        <div class="fx-knob-wrap">
+          <canvas class="fx-knob" id="fx-flanger" width="72" height="72" data-value="0" data-fx="flanger"></canvas>
+          <span class="fx-label">FLANGER</span>
+          <output class="fx-value" id="fx-flanger-value">0%</output>
+        </div>
+      </div>
+      <p class="fx-note">FLANGER uses Audiotool's chorus device.</p>
+      <div class="modal-error" id="fx-modal-error" aria-live="polite"></div>
+    </div>
+    <div class="modal-actions">
+      <button id="fx-modal-close" class="btn-primary" type="button">⬡ DONE</button>
     </div>
   </div>
 </div>

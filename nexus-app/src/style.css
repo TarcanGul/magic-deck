@@ -200,6 +200,26 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .deck-bpm { display: flex; flex: 0 0 auto; flex-direction: column; align-items: flex-end; }
 .bpm-label { font-family: var(--font-data); font-size: 9px; color: var(--grey-text); letter-spacing: 2px; }
 .bpm-value { font-family: var(--font-live); font-size: 22px; color: var(--red); letter-spacing: 1px; line-height: 1; }
+.assistant-fx-trigger {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid var(--red);
+  border-radius: 3px;
+  background: rgba(0,0,0,0.55);
+  color: var(--white);
+  font-family: var(--font-header);
+  font-size: 13px;
+  letter-spacing: 2px;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+.assistant-fx-trigger:hover:not(:disabled),
+.assistant-fx-trigger:focus-visible {
+  background: var(--red);
+  box-shadow: 0 0 10px var(--red-glow);
+  outline: none;
+}
+.assistant-fx-trigger:disabled { cursor: not-allowed; opacity: 0.38; }
 .deck-body { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 
 /* ============================  DROP ZONE  ============================ */
@@ -1029,8 +1049,52 @@ input[type="range"]:not(.v-fader):not(.tempo-fader)::-moz-range-thumb {
 
 .modal-actions-wrap { flex-wrap: wrap; }
 
-.eq-knob:focus-visible {
+.eq-knob:focus-visible,
+.fx-knob:focus-visible {
   outline: 2px solid var(--red);
   outline-offset: 3px;
   border-radius: 50%;
+}
+
+.fx-modal { width: min(620px, 100%); }
+.fx-knob-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.fx-knob-wrap {
+  min-width: 0;
+  padding: 14px 8px 10px;
+  border: 1px solid var(--grey-light);
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.58), rgba(20,20,20,0.8));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+.fx-knob { width: 72px; height: 72px; max-width: 100%; cursor: ns-resize; }
+.fx-label {
+  color: var(--white);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 1px;
+}
+.fx-value {
+  color: var(--red);
+  font-family: var(--font-live);
+  font-size: 12px;
+}
+.fx-note {
+  margin-top: 8px;
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  text-align: right;
+}
+
+@media (max-width: 560px) {
+  .fx-knob-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
