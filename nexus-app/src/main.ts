@@ -35,6 +35,7 @@ import {
 import type { TempoRange } from './tempo-utils.js'
 import { staleOAuthCallbackUrl } from './auth-utils.js'
 import {
+  buildIndependentAudioRegionCopy,
   cuePositionsFromSegments,
   planAudioRegionSplit,
   planResizedCueOffsets,
@@ -2019,11 +2020,33 @@ async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
       t.update(containingRegion.fields.fadeInDurationTicks, leftFadeInTicks)
       t.update(containingRegion.fields.fadeOutDurationTicks, 0)
       t.update(regionFields.durationTicks, split.leftDurationTicks)
-      t.clone<'audioRegion'>(containingRegion, {
+      t.create('audioRegion', buildIndependentAudioRegionCopy({
+        region: {
+          positionTicks: regionFields.positionTicks.value,
+          durationTicks: regionFields.durationTicks.value,
+          collectionOffsetTicks: regionFields.collectionOffsetTicks.value,
+          loopOffsetTicks: regionFields.loopOffsetTicks.value,
+          loopDurationTicks: regionFields.loopDurationTicks.value,
+          isEnabled: regionFields.isEnabled.value,
+          colorIndex: regionFields.colorIndex.value,
+          displayName: regionFields.displayName.value,
+        },
+        track: containingRegion.fields.track.value,
+        playbackAutomationCollection:
+          containingRegion.fields.playbackAutomationCollection.value,
+        sample: containingRegion.fields.sample.value,
+        gain: containingRegion.fields.gain.value,
+        fadeInDurationTicks: containingRegion.fields.fadeInDurationTicks.value,
+        fadeInSlope: containingRegion.fields.fadeInSlope.value,
+        fadeOutDurationTicks: originalFadeOutTicks,
+        fadeOutSlope: containingRegion.fields.fadeOutSlope.value,
+        timestretchMode: containingRegion.fields.timestretchMode.value,
+        pitchShiftSemitones: containingRegion.fields.pitchShiftSemitones.value,
+      }, {
         region: split.right,
         fadeInDurationTicks: 0,
         fadeOutDurationTicks: rightFadeOutTicks,
-      })
+      }))
       return { cuePosition: (cutTicks - firstPositionTicks) / fullDurationTicks }
     }))
     if (
