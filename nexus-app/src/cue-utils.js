@@ -28,6 +28,37 @@ export function planAudioRegionSplit(region, cutTicks) {
   }
 }
 
+export function buildIndependentAudioRegionCopy(source, overwrites = {}) {
+  const regionOverwrites = overwrites.region ?? {}
+  return {
+    region: {
+      positionTicks: regionOverwrites.positionTicks ?? source.region.positionTicks,
+      durationTicks: regionOverwrites.durationTicks ?? source.region.durationTicks,
+      collectionOffsetTicks:
+        regionOverwrites.collectionOffsetTicks ?? source.region.collectionOffsetTicks,
+      loopOffsetTicks: regionOverwrites.loopOffsetTicks ?? source.region.loopOffsetTicks,
+      loopDurationTicks:
+        regionOverwrites.loopDurationTicks ?? source.region.loopDurationTicks,
+      isEnabled: regionOverwrites.isEnabled ?? source.region.isEnabled,
+      colorIndex: regionOverwrites.colorIndex ?? source.region.colorIndex,
+      displayName: regionOverwrites.displayName ?? source.region.displayName,
+    },
+    track: source.track,
+    playbackAutomationCollection: source.playbackAutomationCollection,
+    sample: source.sample,
+    gain: overwrites.gain ?? source.gain,
+    fadeInDurationTicks:
+      overwrites.fadeInDurationTicks ?? source.fadeInDurationTicks,
+    fadeInSlope: overwrites.fadeInSlope ?? source.fadeInSlope,
+    fadeOutDurationTicks:
+      overwrites.fadeOutDurationTicks ?? source.fadeOutDurationTicks,
+    fadeOutSlope: overwrites.fadeOutSlope ?? source.fadeOutSlope,
+    timestretchMode: overwrites.timestretchMode ?? source.timestretchMode,
+    pitchShiftSemitones:
+      overwrites.pitchShiftSemitones ?? source.pitchShiftSemitones,
+  }
+}
+
 export function cuePositionsFromSegments(segments) {
   if (segments.length < 2) return []
   const sorted = [...segments].sort((a, b) =>
