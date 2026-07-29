@@ -204,6 +204,7 @@ let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let placementModalQueue: Promise<void> = Promise.resolve()
 let activeFxDeckIndex: WaveformDeckIndex | null = null
+let activeFxTrigger: HTMLButtonElement | null = null
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -3369,6 +3370,28 @@ function watchDeckRouting(
       }
     }),
   )
+  if (routing.fxGraph) {
+    const { delay, reverb, distortion, chorus } = routing.fxGraph
+    const hydrateIfCurrent = () => {
+      if (
+        nexus !== projectDocument
+        || expectedSession !== tempoSessionId
+        || activeFxDeckIndex !== deckIndex
+        || decks[deckIndex].fxGraph?.delay.id !== delay.id
+      ) return
+      hydrateDeckFxControls(routing.fxGraph!)
+    }
+    deck.routingSubscriptions.push(
+      projectDocument.events.onUpdate(delay.fields.mix, hydrateIfCurrent),
+      projectDocument.events.onUpdate(delay.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(reverb.fields.mix, hydrateIfCurrent),
+      projectDocument.events.onUpdate(reverb.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(distortion.fields.drive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(distortion.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(chorus.fields.lfoModulationDepth, hydrateIfCurrent),
+      projectDocument.events.onUpdate(chorus.fields.isActive, hydrateIfCurrent),
+    )
+  }
 }
 
 function watchSourceDeckContent(
@@ -3940,18 +3963,28 @@ async function applyDeckFx(
 ) {
   const projectDocument = nexus
   const fxGraph = decks[deckIndex].fxGraph
+  const expectedSession = tempoSessionId
   if (!projectDocument || !projectConnected || !fxGraph) return
   const normalizedValue = clampUnit(value)
 
   try {
     await projectDocument.modify((t) => {
-      const delay = t.entities.ofTypes('stompboxDelay').getEntity(fxGraph.delay.id)
-      const reverb = t.entities.ofTypes('stompboxReverb').getEntity(fxGraph.reverb.id)
-      const distortion = t.entities.ofTypes('stompboxTube').getEntity(fxGraph.distortion.id)
-      const chorus = t.entities.ofTypes('stompboxChorus').getEntity(fxGraph.chorus.id)
-      if (!delay || !reverb || !distortion || !chorus) {
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+      ) throw new Error('Project connection changed during FX update')
+      const currentGraph = reusableDeckGraphs(t.entities, deckIndex)[0]?.routing.fxGraph
+      if (
+        !currentGraph
+        || currentGraph.delay.id !== fxGraph.delay.id
+        || currentGraph.reverb.id !== fxGraph.reverb.id
+        || currentGraph.distortion.id !== fxGraph.distortion.id
+        || currentGraph.chorus.id !== fxGraph.chorus.id
+      ) {
         throw new Error('The synchronized FX chain changed')
       }
+      const { delay, reverb, distortion, chorus } = currentGraph
       const enabled = normalizedValue > 0
       if (kind === 'delay') {
         t.update(delay.fields.mix, normalizedValue)
@@ -3971,8 +4004,18 @@ async function applyDeckFx(
         t.update(chorus.fields.isActive, enabled)
       }
     })
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) return
     el<HTMLDivElement>('fx-modal-error').textContent = ''
   } catch (error) {
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) return
     const message = error instanceof Error ? error.message : String(error)
     el<HTMLDivElement>('fx-modal-error').textContent = `FX UPDATE FAILED: ${message.toUpperCase()}`
     setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX UPDATE FAILED — ${message}`)
@@ -3980,9 +4023,12 @@ async function applyDeckFx(
 }
 
 function closeDeckFxAssistant() {
+  const trigger = activeFxTrigger
   activeFxDeckIndex = null
+  activeFxTrigger = null
   el<HTMLDivElement>('fx-modal').classList.add('is-hidden')
   document.removeEventListener('keydown', handleDeckFxModalKey)
+  if (trigger && !trigger.disabled && trigger.isConnected) trigger.focus()
 }
 
 function handleDeckFxModalKey(event: KeyboardEvent) {
@@ -4010,6 +4056,7 @@ async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
     ) throw new Error('Project connection changed while opening FX')
     bindDeckFxRoutingGraph(deckIndex, projectDocument, routing, expectedSession)
     activeFxDeckIndex = deckIndex
+    activeFxTrigger = trigger ?? null
     hydrateDeckFxControls(routing.fxGraph)
     el<HTMLHeadingElement>('fx-modal-title').textContent = `${placementDeckLabel(deckIndex)} Effects`
     el<HTMLDivElement>('fx-modal-error').textContent = ''
