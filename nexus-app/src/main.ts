@@ -33,11 +33,13 @@ import {
   tempoPercentToPlaybackRate,
 } from './tempo-utils.js'
 import type { TempoRange } from './tempo-utils.js'
+import { staleOAuthCallbackUrl } from './auth-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
 const REDIRECT_URL = 'http://127.0.0.1:5173/'
 const SCOPE = 'project:write sample:write'
+const OAUTH_STATE_STORAGE_KEY = `oidc_${CLIENT_ID}_oidc_state`
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface DeckState {
@@ -451,11 +453,21 @@ async function captureDeckInsertionPlacement(
 }
 
 // ── AUTH — based on the minimal example ──────────────────────────────────────
+function cleanStaleOAuthCallback() {
+  const expectedState = localStorage.getItem(OAUTH_STATE_STORAGE_KEY)
+  const cleanedUrl = staleOAuthCallbackUrl(window.location.href, expectedState)
+  if (cleanedUrl === null) return
+
+  console.warn('[AUTH] Removing stale OAuth callback parameters')
+  window.history.replaceState(window.history.state, document.title, cleanedUrl)
+}
+
 async function init() {
   setStatus('connecting', 'CHECKING AUTH STATE…')
   console.log('[INIT] Calling audiotool()…')
 
   try {
+    cleanStaleOAuthCallback()
     const result = await audiotool({
       clientId: CLIENT_ID,
       redirectUrl: REDIRECT_URL,
@@ -473,9 +485,6 @@ async function init() {
       audioCaptureRow.style.display = 'flex'
       btnConnect.disabled = false
       btnDisconnect.disabled = false
-      if (window.location.search.includes('code=')) {
-        window.history.replaceState({}, '', '/')
-      }
       if (inputProjectUrl.value.trim()) {
         await connectProject()
       }
