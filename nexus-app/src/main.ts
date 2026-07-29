@@ -1063,10 +1063,22 @@ function isDeckGraphCurrent(
 
 function hydrateRestoredProjectControls(
   deckIndex: WaveformDeckIndex,
+  entities: EntityQuery,
   mixerChannel: NexusEntity<'mixerChannel'>,
 ) {
   const deck = decks[deckIndex]
-  deck.volume = Math.max(0, Math.min(1, mixerChannel.fields.faderParameters.fields.postGain.value))
+  const automatedVolume = getOwnedDeckVolumeAutomationValue(
+    entities,
+    deckIndex,
+    mixerChannel,
+  )
+  deck.volume = Math.max(
+    0,
+    Math.min(
+      1,
+      automatedVolume ?? mixerChannel.fields.faderParameters.fields.postGain.value,
+    ),
+  )
   deck.gainTrim = Math.max(1, Math.min(2, mixerChannel.fields.preGain.value / PROJECT_PRE_GAIN_BASE))
 
   const volumeSlider = el<HTMLInputElement>(`d${deckIndex + 1}-vol`)
@@ -2685,6 +2697,160 @@ function crossfadeAutomationName(deckIndex: WaveformDeckIndex) {
   return `MAGIC DECK CROSSFADE ${deckIndex === 0 ? 'A' : deckIndex === 1 ? 'B' : 'MAGIC'}`
 }
 
+function deckVolumeAutomationName(deckIndex: WaveformDeckIndex) {
+  return `MAGIC DECK VOLUME ${deckIndex === 0 ? 'A' : deckIndex === 1 ? 'B' : 'MAGIC'}`
+}
+
+function inspectDeckVolumeAutomation(
+  entities: EntityQuery,
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+) {
+  const expectedName = deckVolumeAutomationName(deckIndex)
+  const target = mixerChannel.fields.faderParameters.fields.postGain.location
+  const targetTracks = entities
+    .ofTypes('automationTrack')
+    .get()
+    .filter((track) => track.fields.automatedParameter.value.equals(target))
+  const ownedTracks = targetTracks.filter((track) => {
+    const regions = entities
+      .ofTypes('automationRegion')
+      .get()
+      .filter((region) => region.fields.track.value.entityId === track.id)
+    return regions.length > 0 && regions.every((region) =>
+      region.fields.region.fields.displayName.value === expectedName,
+    )
+  })
+  return {
+    conflict: targetTracks.length > 1
+      || (targetTracks.length === 1 && ownedTracks.length !== 1),
+    ownedTrack: ownedTracks.length === 1 ? ownedTracks[0] : null,
+  }
+}
+
+function getOwnedDeckVolumeAutomationValue(
+  entities: EntityQuery,
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+) {
+  const inspection = inspectDeckVolumeAutomation(entities, deckIndex, mixerChannel)
+  if (inspection.conflict || !inspection.ownedTrack) return null
+  const expectedName = deckVolumeAutomationName(deckIndex)
+  const regions = entities
+    .ofTypes('automationRegion')
+    .get()
+    .filter((region) =>
+      region.fields.track.value.entityId === inspection.ownedTrack!.id
+      && region.fields.region.fields.displayName.value === expectedName
+      && region.fields.region.fields.positionTicks.value === 0,
+    )
+  if (regions.length !== 1) return null
+  const collectionId = regions[0].fields.collection.value.entityId
+  const startEvents = entities
+    .ofTypes('automationEvent')
+    .get()
+    .filter((event) =>
+      event.fields.collection.value.entityId === collectionId
+      && event.fields.positionTicks.value === 0,
+    )
+  return startEvents.length === 1 ? startEvents[0].fields.value.value : null
+}
+
+function replaceDeckVolumeAutomation(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+  region: NexusEntity<'audioRegion'>,
+  value: number,
+) {
+  const inspection = inspectDeckVolumeAutomation(t.entities, deckIndex, mixerChannel)
+  if (inspection.conflict) {
+    throw new Error(
+      `${placementDeckLabel(deckIndex)} volume already has user automation; volume recording is unavailable`,
+    )
+  }
+  const displayName = deckVolumeAutomationName(deckIndex)
+  const target = mixerChannel.fields.faderParameters.fields.postGain
+  const track = inspection.ownedTrack ?? t.create('automationTrack', {
+    orderAmongTracks: nextTrackOrder(t.entities),
+    automatedParameter: target.location,
+  })
+  const ownedRegions = t.entities
+    .ofTypes('automationRegion')
+    .get()
+    .filter((candidate) =>
+      candidate.fields.track.value.entityId === track.id
+      && candidate.fields.region.fields.displayName.value === displayName,
+    )
+  const regionEndTicks =
+    region.fields.region.fields.positionTicks.value
+    + region.fields.region.fields.durationTicks.value
+  if (!Number.isSafeInteger(regionEndTicks)) {
+    throw new Error('Deck volume automation exceeds the safe tick range')
+  }
+  const durationTicks = Math.max(Ticks.Bars(1), regionEndTicks)
+  if (ownedRegions.length === 1) {
+    const ownedRegion = ownedRegions[0]
+    const collectionId = ownedRegion.fields.collection.value.entityId
+    const events = t.entities
+      .ofTypes('automationEvent')
+      .get()
+      .filter((event) => event.fields.collection.value.entityId === collectionId)
+    const startEvents = events.filter((event) => event.fields.positionTicks.value === 0)
+    const terminalEvents = events.filter((event) => event.fields.positionTicks.value > 0)
+    if (startEvents.length === 1 && terminalEvents.length === 1) {
+      t.update(ownedRegion.fields.region.fields.positionTicks, 0)
+      t.update(ownedRegion.fields.region.fields.durationTicks, durationTicks)
+      t.update(ownedRegion.fields.region.fields.loopDurationTicks, durationTicks)
+      t.update(ownedRegion.fields.region.fields.isEnabled, true)
+      t.update(startEvents[0].fields.value, value)
+      t.update(startEvents[0].fields.interpolation, 1)
+      t.update(terminalEvents[0].fields.positionTicks, durationTicks)
+      t.update(terminalEvents[0].fields.value, value)
+      t.update(terminalEvents[0].fields.interpolation, 1)
+      t.update(target, value)
+      return
+    }
+  }
+  ownedRegions.forEach((ownedRegion) => {
+    const collectionId = ownedRegion.fields.collection.value.entityId
+    const collection = t.entities.ofTypes('automationCollection').getEntity(collectionId)
+    const events = t.entities
+      .ofTypes('automationEvent')
+      .get()
+      .filter((event) => event.fields.collection.value.entityId === collectionId)
+    t.remove(ownedRegion)
+    events.forEach((event) => t.remove(event))
+    if (collection) t.remove(collection)
+  })
+
+  const collection = t.create('automationCollection', {})
+  t.create('automationEvent', {
+    collection: collection.location,
+    positionTicks: 0,
+    value,
+    interpolation: 1,
+  })
+  t.create('automationEvent', {
+    collection: collection.location,
+    positionTicks: durationTicks,
+    value,
+    interpolation: 1,
+  })
+  t.create('automationRegion', {
+    collection: collection.location,
+    track: track.location,
+    region: {
+      positionTicks: 0,
+      durationTicks,
+      loopDurationTicks: durationTicks,
+      displayName,
+      isEnabled: true,
+    },
+  })
+  t.update(target, value)
+}
+
 function inspectGainAutomation(
   entities: EntityQuery,
   deckIndex: WaveformDeckIndex,
@@ -3152,6 +3318,19 @@ function watchDeckRouting(
 ) {
   const deck = decks[deckIndex]
   deck.routingSubscriptions.push(
+    projectDocument.events.onUpdate(
+      routing.mixerChannel.fields.faderParameters.fields.postGain,
+      (volume) => {
+        if (
+          nexus !== projectDocument
+          || expectedSession !== tempoSessionId
+          || deck.mixerChannelEntity?.id !== routing.mixerChannel.id
+        ) return
+        deck.volume = Math.max(0, Math.min(1, volume))
+        el<HTMLInputElement>(`d${deckIndex + 1}-vol`).value = String(deck.volume)
+        el(`d${deckIndex + 1}-vol-val`).textContent = String(Math.round(deck.volume * 100))
+      },
+    ),
     projectDocument.events.onRemove(routing.track, () => {
       if (
         nexus !== projectDocument
@@ -3293,7 +3472,7 @@ function bindDeckRoutingGraph(
   deck.audioDeviceEntity = routing.audioDevice
   deck.mixerChannelEntity = routing.mixerChannel
   deck.cableEntity = routing.cable
-  hydrateRestoredProjectControls(deckIndex, routing.mixerChannel)
+  hydrateRestoredProjectControls(deckIndex, projectDocument.queryEntities, routing.mixerChannel)
   watchDeckRouting(deckIndex, projectDocument, routing, expectedSession)
 }
 
@@ -3671,7 +3850,10 @@ function applyCurrentDeckEq(deckIndex: WaveformDeckIndex) {
   })
 }
 
-async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
+async function applyDeckProjectLevels(
+  deckIndex: WaveformDeckIndex,
+  recordVolumeAutomation = false,
+) {
   const deck = decks[deckIndex]
   if (!nexus || !deck.mixerChannelEntity) {
     setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT LEVELS`)
@@ -3681,7 +3863,14 @@ async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
   try {
     await nexus.modify((t) => {
       const channel = t.entities.ofTypes('mixerChannel').getEntity(deck.mixerChannelEntity!.id) ?? deck.mixerChannelEntity!
-      t.update(channel.fields.faderParameters.fields.postGain, deck.volume)
+      const region = deck.regionEntity
+        ? t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
+        : null
+      if (recordVolumeAutomation && region) {
+        replaceDeckVolumeAutomation(t, deckIndex, channel, region, deck.volume)
+      } else {
+        t.update(channel.fields.faderParameters.fields.postGain, deck.volume)
+      }
       t.update(channel.fields.preGain, PROJECT_PRE_GAIN_BASE * deck.gainTrim)
     })
   } catch (e) {
@@ -3691,7 +3880,7 @@ async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
 }
 
 function applyCurrentDeckLevels(deckIndex: WaveformDeckIndex) {
-  return applyDeckProjectLevels(deckIndex)
+  return applyDeckProjectLevels(deckIndex, true)
 }
 
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
@@ -4526,7 +4715,7 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   volSlider?.addEventListener('input', () => {
     deck.volume = parseFloat(volSlider.value)
     if (volVal) volVal.textContent = String(Math.round(deck.volume * 100))
-    void applyDeckProjectLevels(deckIndex)
+    void applyDeckProjectLevels(deckIndex, true)
   })
 
   gainSlider?.addEventListener('input', () => {
