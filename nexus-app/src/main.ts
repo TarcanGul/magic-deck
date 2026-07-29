@@ -44,6 +44,8 @@ const OAUTH_STATE_STORAGE_KEY = `oidc_${CLIENT_ID}_oidc_state`
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface DeckState {
   audioCtx: AudioContext | null; audioBuffer: AudioBuffer | null
+  cuePreviewSource: AudioBufferSourceNode | null; cuePreviewGain: GainNode | null; cueLoadId: number
+  audioFootprint: string | null; cuePoints: CuePointSlots; cuePosition: number; cueLoading: boolean
   fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
   tempoPercent: number; tempoRange: TempoRange; tempoSync: boolean
@@ -64,6 +66,12 @@ type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
 type EqBand = 'hi' | 'mid' | 'low'
 type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
+type CuePointSlots = [number | null, number | null, number | null, number | null, number | null]
+interface StoredCuePoints {
+  version: 1
+  audioFootprint: string
+  points: CuePointSlots
+}
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -180,6 +188,8 @@ const MAX_SUPPORTED_BPM = 240
 const AUBIO_AUTO_ACCEPT_CONFIDENCE = 0.8
 const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 const DECK_PROJECT_NAMES = ['DECK 1', 'DECK 2', 'MAGIC DECK'] as const
+const CUE_STORAGE_PREFIX = 'magic-deck:cues:v1:'
+const CUE_PREVIEW_SECONDS = 4
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
@@ -214,9 +224,9 @@ const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperatio
 ]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cuePreviewGain: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cuePreviewGain: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cuePreviewGain: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -515,6 +525,7 @@ async function disconnectAll() {
   if (nexus) { try { await nexus.stop() } catch (_) {}; nexus = null }
   projectConnected = false
   if (at) { try { at.logout() } catch (_) {}; at = null }
+  decks.forEach((_, deckIndex) => stopCuePreview(deckIndex as WaveformDeckIndex))
   decks.forEach(clearDeckProjectEntities)
   clearMagicDeckLocalMedia()
   updateSourceDeckUi(0)
@@ -1155,6 +1166,7 @@ async function restoreSourceDecksFromProject(
     deck.sampleMeta = sampleMeta
     bindDeckContentGraph(deckIndex, projectDocument, selected.content, expectedSession)
     updateSourceDeckUi(deckIndex)
+    void initializeDeckCues(deckIndex, sampleMeta)
   }
 }
 
@@ -1252,6 +1264,7 @@ async function restoreMagicDeckFromProject(
   magicWaveformPeaks = peaks
   bindDeckContentGraph(2, projectDocument, selected.content, expectedSession)
   updateDeckBpmLabel(2)
+  void initializeDeckCues(2, sampleMeta)
   if (peaks) {
     drawMagicPeakWaveform(peaks)
     setMagicStatus(
@@ -1334,6 +1347,295 @@ function formatDuration(seconds: number | null | undefined) {
   return `${minutes}:${String(roundedSeconds % 60).padStart(2, '0')}`
 }
 
+function emptyCuePoints(): CuePointSlots {
+  return [null, null, null, null, null]
+}
+
+function cueStorageKey(audioFootprint: string) {
+  return `${CUE_STORAGE_PREFIX}${audioFootprint}`
+}
+
+function validCuePosition(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 1
+}
+
+function loadStoredCuePoints(audioFootprint: string): CuePointSlots {
+  try {
+    const raw = sessionStorage.getItem(cueStorageKey(audioFootprint))
+    if (!raw) return emptyCuePoints()
+    const stored = JSON.parse(raw) as Partial<StoredCuePoints>
+    if (
+      stored.version !== 1
+      || stored.audioFootprint !== audioFootprint
+      || !Array.isArray(stored.points)
+      || stored.points.length !== 5
+      || !stored.points.every((point) => point === null || validCuePosition(point))
+    ) return emptyCuePoints()
+    return [...stored.points] as CuePointSlots
+  } catch (error) {
+    console.warn('[CUES] session restore:', error)
+    return emptyCuePoints()
+  }
+}
+
+function persistCuePoints(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  if (!deck.audioFootprint) return
+  const stored: StoredCuePoints = {
+    version: 1,
+    audioFootprint: deck.audioFootprint,
+    points: [...deck.cuePoints] as CuePointSlots,
+  }
+  try {
+    sessionStorage.setItem(cueStorageKey(deck.audioFootprint), JSON.stringify(stored))
+  } catch (error) {
+    console.warn('[CUES] session save:', error)
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUES COULD NOT BE SAVED IN THIS SESSION`)
+  }
+}
+
+function fallbackAudioHash(bytes: ArrayBuffer) {
+  const values = new Uint8Array(bytes)
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (const value of values) {
+    first = Math.imul(first ^ value, 0x01000193)
+    second = Math.imul(second ^ value, 0x85ebca6b)
+    second = (second << 13) | (second >>> 19)
+  }
+  const hex = (value: number) => (value >>> 0).toString(16).padStart(8, '0')
+  return `fallback-${values.byteLength.toString(16)}-${hex(first)}${hex(second)}`
+}
+
+async function hashAudioFootprint(bytes: ArrayBuffer) {
+  try {
+    const subtle = globalThis.crypto?.subtle
+    if (!subtle) return fallbackAudioHash(bytes)
+    const digest = await subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  } catch (error) {
+    console.warn('[CUES] SHA-256 unavailable, using deterministic fallback:', error)
+    return fallbackAudioHash(bytes)
+  }
+}
+
+async function sampleAudioFootprint(sampleMeta: SampleMeta) {
+  try {
+    const response = await fetch(sampleMeta.mp3Url)
+    if (!response.ok) throw new Error(`Audio request failed (${response.status})`)
+    const bytes = await response.arrayBuffer()
+    return { audioFootprint: await hashAudioFootprint(bytes), audioBytes: bytes }
+  } catch (audioError) {
+    console.warn('[CUES] audio fingerprint:', audioError)
+    const response = await fetch(sampleMeta.getWaveformUrl({ resolution: 3840, channel: 'both' }))
+    if (!response.ok) throw new Error(`Audio footprint request failed (${response.status})`)
+    const waveform = await response.text()
+    const canonical = new TextEncoder().encode(
+      `${sampleMeta.durationSeconds.toFixed(9)}\n${waveform}`,
+    )
+    return {
+      audioFootprint: await hashAudioFootprint(canonical.buffer as ArrayBuffer),
+      audioBytes: null,
+    }
+  }
+}
+
+function stopCuePreview(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const source = deck.cuePreviewSource
+  const gain = deck.cuePreviewGain
+  deck.cuePreviewSource = null
+  deck.cuePreviewGain = null
+  if (!source) {
+    gain?.disconnect()
+    return
+  }
+  source.onended = null
+  try {
+    source.stop()
+  } catch {
+    // The source may already have ended.
+  }
+  source.disconnect()
+  gain?.disconnect()
+}
+
+function resetDeckCueState(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  deck.cueLoadId += 1
+  stopCuePreview(deckIndex)
+  deck.audioFootprint = null
+  deck.cuePoints = emptyCuePoints()
+  deck.cuePosition = 0
+  deck.cueLoading = false
+  renderCueControls(deckIndex)
+}
+
+function formatCueTime(deckIndex: WaveformDeckIndex, position: number) {
+  const durationSeconds = decks[deckIndex].sampleMeta?.durationSeconds
+  if (!durationSeconds || !Number.isFinite(durationSeconds)) return '—'
+  return formatDuration(Math.min(durationSeconds, Math.max(0, position * durationSeconds)))
+}
+
+function getCueElements(deckIndex: WaveformDeckIndex) {
+  const prefix = `d${deckIndex + 1}-cue`
+  return {
+    module: el<HTMLDivElement>(`${prefix}-module`),
+    slider: el<HTMLInputElement>(`${prefix}-position`),
+    position: el<HTMLOutputElement>(`${prefix}-position-value`),
+    status: el<HTMLSpanElement>(`${prefix}-status`),
+    pads: Array.from({ length: 5 }, (_, slot) => ({
+      trigger: el<HTMLButtonElement>(`${prefix}-${slot + 1}`),
+      clear: el<HTMLButtonElement>(`${prefix}-${slot + 1}-clear`),
+    })),
+  }
+}
+
+function isCueDeckLoaded(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  return deck.sampleMeta !== null && deck.regionEntity !== null
+}
+
+function renderCueControls(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const controls = getCueElements(deckIndex)
+  const loaded = isCueDeckLoaded(deckIndex)
+  const ready = loaded && deck.audioFootprint !== null && !deck.cueLoading
+  controls.module.classList.toggle('is-disabled', !loaded)
+  controls.slider.disabled = !ready
+  controls.slider.value = String(Math.round(deck.cuePosition * 1000))
+  controls.position.value = formatCueTime(deckIndex, deck.cuePosition)
+  controls.status.textContent = deck.cueLoading
+    ? 'READING AUDIO FOOTPRINT…'
+    : ready
+      ? deck.audioBuffer
+        ? 'SET EMPTY PAD · SAVED PAD PREVIEWS LOCALLY'
+        : 'SET EMPTY PAD · PREVIEW UNAVAILABLE'
+      : loaded
+        ? 'CUES UNAVAILABLE'
+        : 'LOAD A TRACK TO ADD CUES'
+  controls.pads.forEach(({ trigger, clear }, slot) => {
+    const point = deck.cuePoints[slot]
+    trigger.disabled = !ready
+    trigger.classList.toggle('is-set', point !== null)
+    trigger.textContent = point === null
+      ? `CUE ${slot + 1}\nSET`
+      : `CUE ${slot + 1}\n${formatCueTime(deckIndex, point)}`
+    trigger.setAttribute(
+      'aria-label',
+      point === null
+        ? `Set cue ${slot + 1} at ${formatCueTime(deckIndex, deck.cuePosition)}`
+        : `Preview cue ${slot + 1} at ${formatCueTime(deckIndex, point)}`,
+    )
+    clear.disabled = !ready || point === null
+    clear.classList.toggle('is-hidden', point === null)
+  })
+}
+
+async function initializeDeckCues(
+  deckIndex: WaveformDeckIndex,
+  sampleMeta: SampleMeta,
+  providedBuffer: AudioBuffer | null = null,
+) {
+  const deck = decks[deckIndex]
+  const loadId = ++deck.cueLoadId
+  stopCuePreview(deckIndex)
+  deck.audioFootprint = null
+  deck.cuePoints = emptyCuePoints()
+  deck.cuePosition = 0
+  deck.cueLoading = true
+  if (providedBuffer) deck.audioBuffer = providedBuffer
+  renderCueControls(deckIndex)
+  try {
+    const footprint = await sampleAudioFootprint(sampleMeta)
+    if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
+    if (!deck.audioBuffer && footprint.audioBytes) {
+      ensureCtx(deck)
+      deck.audioBuffer = await deck.audioCtx!.decodeAudioData(footprint.audioBytes.slice(0))
+    }
+    if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
+    deck.audioFootprint = footprint.audioFootprint
+    deck.cuePoints = loadStoredCuePoints(footprint.audioFootprint)
+  } catch (error) {
+    if (loadId !== deck.cueLoadId) return
+    console.warn(`[CUES] ${placementDeckLabel(deckIndex)} initialization:`, error)
+  } finally {
+    if (loadId === deck.cueLoadId) {
+      deck.cueLoading = false
+      renderCueControls(deckIndex)
+    }
+  }
+}
+
+async function previewCue(deckIndex: WaveformDeckIndex, position: number) {
+  const deck = decks[deckIndex]
+  if (!deck.audioBuffer) {
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: LOCAL CUE PREVIEW IS UNAVAILABLE`)
+    return
+  }
+  ensureCtx(deck)
+  await deck.audioCtx!.resume()
+  stopCuePreview(deckIndex)
+  const source = deck.audioCtx!.createBufferSource()
+  const gain = deck.audioCtx!.createGain()
+  gain.gain.value = Math.min(0.5, deck.volume * deck.gainTrim * 0.35)
+  source.buffer = deck.audioBuffer
+  source.playbackRate.value = deck.playbackRate
+  source.connect(gain).connect(deck.audioCtx!.destination)
+  source.onended = () => {
+    if (deck.cuePreviewSource === source) deck.cuePreviewSource = null
+    if (deck.cuePreviewGain === gain) deck.cuePreviewGain = null
+    source.disconnect()
+    gain.disconnect()
+  }
+  deck.cuePreviewSource = source
+  deck.cuePreviewGain = gain
+  const offsetSeconds = Math.min(
+    deck.audioBuffer.duration - 0.001,
+    position * deck.audioBuffer.duration,
+  )
+  source.start(
+    0,
+    offsetSeconds,
+    Math.min(CUE_PREVIEW_SECONDS, deck.audioBuffer.duration - offsetSeconds),
+  )
+  setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE PREVIEW ${formatCueTime(deckIndex, position)}`)
+}
+
+function setupCueControls(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const controls = getCueElements(deckIndex)
+  controls.slider.addEventListener('input', () => {
+    deck.cuePosition = Number(controls.slider.value) / 1000
+    renderCueControls(deckIndex)
+  })
+  controls.pads.forEach(({ trigger, clear }, slot) => {
+    trigger.addEventListener('click', () => {
+      const point = deck.cuePoints[slot]
+      if (point === null) {
+        deck.cuePoints[slot] = deck.cuePosition
+        persistCuePoints(deckIndex)
+        renderCueControls(deckIndex)
+        setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SAVED AT ${formatCueTime(deckIndex, deck.cuePosition)}`)
+        return
+      }
+      deck.cuePosition = point
+      renderCueControls(deckIndex)
+      void previewCue(deckIndex, point).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE PREVIEW FAILED — ${message}`)
+      })
+    })
+    clear.addEventListener('click', () => {
+      deck.cuePoints[slot] = null
+      persistCuePoints(deckIndex)
+      renderCueControls(deckIndex)
+      setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CLEARED`)
+    })
+  })
+  renderCueControls(deckIndex)
+}
+
 function updateSourceDeckUi(deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
   const operation = deckOperationStates[deckIndex]
@@ -1359,11 +1661,13 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   unload.disabled = pending || !projectConnected
   renderTempoControls(deckIndex)
   renderDeckTransport(deckIndex)
+  renderCueControls(deckIndex)
   updateManualBpmReportUi(deckIndex)
 }
 
 function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
+  resetDeckCueState(deckIndex)
   deck.audioBuffer = null
   deck.fileName = null
   deck.baseBpm = null
@@ -1372,6 +1676,7 @@ function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
 
 function clearMagicDeckLocalMedia() {
   const magicDeck = decks[2]
+  resetDeckCueState(2)
   magicDeck.audioBuffer = null
   magicDeck.fileName = null
   magicDeck.baseBpm = null
@@ -3530,6 +3835,7 @@ async function uploadToNexus(
       options.timing,
     )
     if (deckNum <= 2) {
+      void initializeDeckCues(deckIndex, sample)
       setStatus('connected', inserted.establishedTempo
         ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — NATIVE SPEED PRESERVED ✓`
         : `DECK ${deckNum}: ${file.name} — NATIVE SPEED PRESERVED ✓`)
@@ -4420,6 +4726,7 @@ async function generateMagicAudio() {
     magicWaveformPeaks = null
     drawMagicWaveform(generatedBuffer)
     renderDeckTransport(2)
+    void initializeDeckCues(2, magicDeck.sampleMeta!, generatedBuffer)
 
     if (timingWarning || timingStatus !== 'aligned') {
       const warning = timingWarning || `Timing status: ${timingStatus}`
@@ -4589,6 +4896,9 @@ function initApp() {
   setupDropZone('drop-2', 1)
   setupUnloadButton(0)
   setupUnloadButton(1)
+  setupCueControls(0)
+  setupCueControls(1)
+  setupCueControls(2)
   updateSourceDeckUi(0)
   updateSourceDeckUi(1)
   wireTransport('d1', 0)
