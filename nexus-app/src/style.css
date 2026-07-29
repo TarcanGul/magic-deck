@@ -298,7 +298,12 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   cursor: pointer;
 }
 .cue-clear:hover:not(:disabled),
-.cue-clear:focus-visible { color: var(--red); outline: none; }
+.cue-clear:focus-visible { color: var(--red); }
+.cue-clear:focus-visible {
+  border-radius: 2px;
+  outline: 1px solid var(--white);
+  outline-offset: 1px;
+}
 
 /* ============================  TRANSPORT  ============================ */
 .transport { display: flex; align-items: center; gap: 6px; }

@@ -42,7 +42,7 @@ const SCOPE = 'project:write sample:write'
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface DeckState {
   audioCtx: AudioContext | null; audioBuffer: AudioBuffer | null
-  cuePreviewSource: AudioBufferSourceNode | null; cueLoadId: number
+  cuePreviewSource: AudioBufferSourceNode | null; cuePreviewGain: GainNode | null; cueLoadId: number
   audioFootprint: string | null; cuePoints: CuePointSlots; cuePosition: number; cueLoading: boolean
   fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
@@ -221,9 +221,9 @@ const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperatio
 ]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cuePreviewGain: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cuePreviewGain: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cuePreviewSource: null, cuePreviewGain: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -1384,9 +1384,29 @@ function persistCuePoints(deckIndex: WaveformDeckIndex) {
   }
 }
 
-async function sha256Hex(bytes: ArrayBuffer) {
-  const digest = await crypto.subtle.digest('SHA-256', bytes)
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+function fallbackAudioHash(bytes: ArrayBuffer) {
+  const values = new Uint8Array(bytes)
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (const value of values) {
+    first = Math.imul(first ^ value, 0x01000193)
+    second = Math.imul(second ^ value, 0x85ebca6b)
+    second = (second << 13) | (second >>> 19)
+  }
+  const hex = (value: number) => (value >>> 0).toString(16).padStart(8, '0')
+  return `fallback-${values.byteLength.toString(16)}-${hex(first)}${hex(second)}`
+}
+
+async function hashAudioFootprint(bytes: ArrayBuffer) {
+  try {
+    const subtle = globalThis.crypto?.subtle
+    if (!subtle) return fallbackAudioHash(bytes)
+    const digest = await subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  } catch (error) {
+    console.warn('[CUES] SHA-256 unavailable, using deterministic fallback:', error)
+    return fallbackAudioHash(bytes)
+  }
 }
 
 async function sampleAudioFootprint(sampleMeta: SampleMeta) {
@@ -1394,17 +1414,17 @@ async function sampleAudioFootprint(sampleMeta: SampleMeta) {
     const response = await fetch(sampleMeta.mp3Url)
     if (!response.ok) throw new Error(`Audio request failed (${response.status})`)
     const bytes = await response.arrayBuffer()
-    return { audioFootprint: await sha256Hex(bytes), audioBytes: bytes }
+    return { audioFootprint: await hashAudioFootprint(bytes), audioBytes: bytes }
   } catch (audioError) {
     console.warn('[CUES] audio fingerprint:', audioError)
     const response = await fetch(sampleMeta.getWaveformUrl({ resolution: 3840, channel: 'both' }))
     if (!response.ok) throw new Error(`Audio footprint request failed (${response.status})`)
     const waveform = await response.text()
     const canonical = new TextEncoder().encode(
-      `${sampleMeta.name}\n${sampleMeta.durationSeconds.toFixed(9)}\n${waveform}`,
+      `${sampleMeta.durationSeconds.toFixed(9)}\n${waveform}`,
     )
     return {
-      audioFootprint: await sha256Hex(canonical.buffer as ArrayBuffer),
+      audioFootprint: await hashAudioFootprint(canonical.buffer as ArrayBuffer),
       audioBytes: null,
     }
   }
@@ -1412,15 +1432,22 @@ async function sampleAudioFootprint(sampleMeta: SampleMeta) {
 
 function stopCuePreview(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
-  if (!deck.cuePreviewSource) return
-  deck.cuePreviewSource.onended = null
+  const source = deck.cuePreviewSource
+  const gain = deck.cuePreviewGain
+  deck.cuePreviewSource = null
+  deck.cuePreviewGain = null
+  if (!source) {
+    gain?.disconnect()
+    return
+  }
+  source.onended = null
   try {
-    deck.cuePreviewSource.stop()
+    source.stop()
   } catch {
     // The source may already have ended.
   }
-  deck.cuePreviewSource.disconnect()
-  deck.cuePreviewSource = null
+  source.disconnect()
+  gain?.disconnect()
 }
 
 function resetDeckCueState(deckIndex: WaveformDeckIndex) {
@@ -1511,12 +1538,12 @@ async function initializeDeckCues(
   renderCueControls(deckIndex)
   try {
     const footprint = await sampleAudioFootprint(sampleMeta)
-    if (loadId !== deck.cueLoadId || deck.sampleMeta?.name !== sampleMeta.name) return
+    if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
     if (!deck.audioBuffer && footprint.audioBytes) {
       ensureCtx(deck)
       deck.audioBuffer = await deck.audioCtx!.decodeAudioData(footprint.audioBytes.slice(0))
     }
-    if (loadId !== deck.cueLoadId || deck.sampleMeta?.name !== sampleMeta.name) return
+    if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
     deck.audioFootprint = footprint.audioFootprint
     deck.cuePoints = loadStoredCuePoints(footprint.audioFootprint)
   } catch (error) {
@@ -1547,10 +1574,12 @@ async function previewCue(deckIndex: WaveformDeckIndex, position: number) {
   source.connect(gain).connect(deck.audioCtx!.destination)
   source.onended = () => {
     if (deck.cuePreviewSource === source) deck.cuePreviewSource = null
+    if (deck.cuePreviewGain === gain) deck.cuePreviewGain = null
     source.disconnect()
     gain.disconnect()
   }
   deck.cuePreviewSource = source
+  deck.cuePreviewGain = gain
   const offsetSeconds = Math.min(
     deck.audioBuffer.duration - 0.001,
     position * deck.audioBuffer.duration,
