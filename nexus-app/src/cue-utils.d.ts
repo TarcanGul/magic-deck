@@ -21,3 +21,18 @@ export function planAudioRegionSplit(
 }
 
 export function cuePositionsFromSegments(segments: CueRegionSegment[]): number[]
+
+export interface CueOffsetResizeInput {
+  firstCollectionOffsetTicks: number
+  firstLoopOffsetTicks: number
+  loopDurationTicks: number
+  previousContentDurationTicks: number
+  nextContentDurationTicks: number
+  nextStartTicks: number
+}
+
+export function planResizedCueOffsets(input: CueOffsetResizeInput): {
+  collectionOffsetTicks: number
+  loopOffsetTicks: number
+  loopDurationTicks: number
+}

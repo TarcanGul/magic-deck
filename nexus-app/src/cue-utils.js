@@ -47,3 +47,25 @@ export function cuePositionsFromSegments(segments) {
   }
   return positions
 }
+
+export function planResizedCueOffsets({
+  firstCollectionOffsetTicks,
+  firstLoopOffsetTicks,
+  loopDurationTicks,
+  previousContentDurationTicks,
+  nextContentDurationTicks,
+  nextStartTicks,
+}) {
+  if (
+    previousContentDurationTicks <= 0
+    || nextContentDurationTicks <= 0
+    || nextStartTicks < 0
+  ) throw new Error('Cue offset resize requires positive durations and a non-negative start')
+  const scale = (ticks) =>
+    Math.round((ticks / previousContentDurationTicks) * nextContentDurationTicks)
+  return {
+    collectionOffsetTicks: scale(firstCollectionOffsetTicks) + nextStartTicks,
+    loopOffsetTicks: scale(firstLoopOffsetTicks),
+    loopDurationTicks: scale(loopDurationTicks),
+  }
+}

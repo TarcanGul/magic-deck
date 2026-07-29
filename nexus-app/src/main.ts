@@ -36,6 +36,7 @@ import type { TempoRange } from './tempo-utils.js'
 import {
   cuePositionsFromSegments,
   planAudioRegionSplit,
+  planResizedCueOffsets,
 } from './cue-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
@@ -1429,6 +1430,28 @@ async function sampleAudioFootprint(sampleMeta: SampleMeta) {
   }
 }
 
+function formsCueCutBoundary(
+  left: NexusEntity<'audioRegion'>,
+  right: NexusEntity<'audioRegion'>,
+) {
+  const leftRegion = left.fields.region.fields
+  const rightRegion = right.fields.region.fields
+  return leftRegion.positionTicks.value + leftRegion.durationTicks.value
+      === rightRegion.positionTicks.value
+    && leftRegion.collectionOffsetTicks.value + leftRegion.durationTicks.value
+      === rightRegion.collectionOffsetTicks.value
+    && leftRegion.loopOffsetTicks.value === rightRegion.loopOffsetTicks.value
+    && leftRegion.loopDurationTicks.value === rightRegion.loopDurationTicks.value
+    && leftRegion.isEnabled.value === rightRegion.isEnabled.value
+    && leftRegion.colorIndex.value === rightRegion.colorIndex.value
+    && leftRegion.displayName.value === rightRegion.displayName.value
+    && left.fields.gain.value === right.fields.gain.value
+    && left.fields.timestretchMode.value === right.fields.timestretchMode.value
+    && left.fields.pitchShiftSemitones.value === right.fields.pitchShiftSemitones.value
+    && left.fields.fadeOutDurationTicks.value === 0
+    && right.fields.fadeInDurationTicks.value === 0
+}
+
 function contiguousAudioRegions(
   entities: EntityQuery,
   anchor: NexusEntity<'audioRegion'>,
@@ -1454,20 +1477,14 @@ function contiguousAudioRegions(
   while (firstIndex > 0) {
     const previous = candidates[firstIndex - 1]
     const current = candidates[firstIndex]
-    const previousEnd =
-      previous.fields.region.fields.positionTicks.value
-      + previous.fields.region.fields.durationTicks.value
-    if (previousEnd !== current.fields.region.fields.positionTicks.value) break
+    if (!formsCueCutBoundary(previous, current)) break
     firstIndex -= 1
   }
   let lastIndex = anchorIndex
   while (lastIndex < candidates.length - 1) {
     const current = candidates[lastIndex]
     const next = candidates[lastIndex + 1]
-    const currentEnd =
-      current.fields.region.fields.positionTicks.value
-      + current.fields.region.fields.durationTicks.value
-    if (currentEnd !== next.fields.region.fields.positionTicks.value) break
+    if (!formsCueCutBoundary(current, next)) break
     lastIndex += 1
   }
   return candidates.slice(firstIndex, lastIndex + 1)
@@ -1479,6 +1496,7 @@ function resizeContiguousAudioRegions(
   previousContentDurationTicks: number,
   nextContentDurationTicks: number,
   nextRegionDurationTicks = nextContentDurationTicks,
+  nextFirstPositionTicks?: number,
 ) {
   if (
     regions.length === 0
@@ -1487,6 +1505,7 @@ function resizeContiguousAudioRegions(
     || nextRegionDurationTicks <= 0
   ) throw new Error('Cue-cut timing could not be resized')
   const firstPositionTicks = regions[0].fields.region.fields.positionTicks.value
+  const resolvedFirstPositionTicks = nextFirstPositionTicks ?? firstPositionTicks
   const last = regions.at(-1)!
   const previousRegionDurationTicks =
     last.fields.region.fields.positionTicks.value
@@ -1494,8 +1513,9 @@ function resizeContiguousAudioRegions(
     - firstPositionTicks
   const scaleRegionTicks = (ticks: number) =>
     Math.round((ticks / previousRegionDurationTicks) * nextRegionDurationTicks)
-  const scaleContentTicks = (ticks: number) =>
-    Math.round((ticks / previousContentDurationTicks) * nextContentDurationTicks)
+  const firstRegionFields = regions[0].fields.region.fields
+  const firstCollectionOffsetTicks = firstRegionFields.collectionOffsetTicks.value
+  const firstLoopOffsetTicks = firstRegionFields.loopOffsetTicks.value
 
   regions.forEach((region, index) => {
     const fields = region.fields.region.fields
@@ -1508,15 +1528,67 @@ function resizeContiguousAudioRegions(
     if (nextEndTicks <= nextStartTicks) {
       throw new Error('Tempo change would collapse a cue-cut region')
     }
-    t.update(fields.positionTicks, firstPositionTicks + nextStartTicks)
+    t.update(fields.positionTicks, resolvedFirstPositionTicks + nextStartTicks)
     t.update(fields.durationTicks, nextEndTicks - nextStartTicks)
-    t.update(
-      fields.collectionOffsetTicks,
-      scaleContentTicks(fields.collectionOffsetTicks.value),
-    )
-    t.update(fields.loopOffsetTicks, scaleContentTicks(fields.loopOffsetTicks.value))
-    t.update(fields.loopDurationTicks, scaleContentTicks(fields.loopDurationTicks.value))
+    const offsets = planResizedCueOffsets({
+      firstCollectionOffsetTicks,
+      firstLoopOffsetTicks,
+      loopDurationTicks: fields.loopDurationTicks.value,
+      previousContentDurationTicks,
+      nextContentDurationTicks,
+      nextStartTicks,
+    })
+    t.update(fields.collectionOffsetTicks, offsets.collectionOffsetTicks)
+    t.update(fields.loopOffsetTicks, offsets.loopOffsetTicks)
+    t.update(fields.loopDurationTicks, offsets.loopDurationTicks)
   })
+}
+
+function audioRegionChainDuration(regions: NexusEntity<'audioRegion'>[]) {
+  const first = regions[0]
+  const last = regions.at(-1)
+  if (!first || !last) return 0
+  return last.fields.region.fields.positionTicks.value
+    + last.fields.region.fields.durationTicks.value
+    - first.fields.region.fields.positionTicks.value
+}
+
+function updateAudioRegionChainEnabled(
+  t: SafeTransactionBuilder,
+  regions: NexusEntity<'audioRegion'>[],
+  isEnabled: boolean,
+) {
+  regions.forEach((region) => {
+    if (region.fields.region.fields.isEnabled.value !== isEnabled) {
+      t.update(region.fields.region.fields.isEnabled, isEnabled)
+    }
+  })
+}
+
+function updateDeckRegionChainTiming(
+  t: SafeTransactionBuilder,
+  anchor: NexusEntity<'audioRegion'>,
+  nextPositionTicks: number,
+  nextDurationTicks: number,
+) {
+  const regions = contiguousAudioRegions(t.entities, anchor)
+  if (regions.length <= 1) {
+    t.update(anchor.fields.region.fields.positionTicks, nextPositionTicks)
+    t.update(anchor.fields.region.fields.durationTicks, nextDurationTicks)
+    return regions.length === 1 ? regions : [anchor]
+  }
+  const terminalEvent = getExpectedPlaybackTerminalEvent(t, anchor)
+  const contentDurationTicks = terminalEvent?.fields.positionTicks.value
+    ?? anchor.fields.region.fields.loopDurationTicks.value
+  resizeContiguousAudioRegions(
+    t,
+    regions,
+    contentDurationTicks,
+    contentDurationTicks,
+    nextDurationTicks,
+    nextPositionTicks,
+  )
+  return regions
 }
 
 function deckCueRegions(entities: EntityQuery, deckIndex: WaveformDeckIndex) {
@@ -1542,7 +1614,12 @@ function reconcileCueSlots(
   const remaining = [...authoritativePoints]
   storedPoints.forEach((storedPoint, slot) => {
     if (storedPoint === null) return
-    const matchIndex = remaining.findIndex((point) => Math.abs(point - storedPoint) < 0.000_001)
+    const closest = remaining
+      .map((point, index) => ({ difference: Math.abs(point - storedPoint), index }))
+      .sort((a, b) => a.difference - b.difference)[0]
+    const matchIndex = closest && closest.difference < 0.000_5
+      ? closest.index
+      : -1
     if (matchIndex < 0) return
     reconciled[slot] = remaining.splice(matchIndex, 1)[0]
   })
@@ -1662,6 +1739,7 @@ async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
   if (!projectDocument || !projectConnected || !regionId) {
     throw new Error('The synchronized Audiotool region is required')
   }
+  const operationId = ++deck.cueLoadId
   const requestedPosition = deck.cuePosition
   deck.cueLoading = true
   renderCueControls(deckIndex)
@@ -1672,6 +1750,7 @@ async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
         || !projectConnected
         || expectedSession !== tempoSessionId
         || deck.regionEntity?.id !== regionId
+        || deck.cueLoadId !== operationId
       ) throw new Error('Project connection changed before the cue cut')
       const regions = deckCueRegions(t.entities, deckIndex)
       if (regions.length === 0) throw new Error('The Audiotool region is no longer available')
@@ -1727,14 +1806,17 @@ async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
       nexus !== projectDocument
       || expectedSession !== tempoSessionId
       || deck.regionEntity?.id !== regionId
+      || deck.cueLoadId !== operationId
     ) return
     deck.cuePoints[slot] = result.cuePosition
     deck.cuePosition = result.cuePosition
     persistCuePoints(deckIndex)
     setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT IN AUDIOTOOL AT ${formatCueTime(deckIndex, result.cuePosition)}`)
   } finally {
-    deck.cueLoading = false
-    renderCueControls(deckIndex)
+    if (deck.cueLoadId === operationId) {
+      deck.cueLoading = false
+      renderCueControls(deckIndex)
+    }
   }
 }
 
@@ -1747,6 +1829,7 @@ async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
   if (!projectDocument || !projectConnected || !regionId || cuePosition === null) {
     throw new Error('The synchronized Audiotool cut is no longer available')
   }
+  const operationId = ++deck.cueLoadId
   deck.cueLoading = true
   renderCueControls(deckIndex)
   try {
@@ -1756,6 +1839,7 @@ async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
         || !projectConnected
         || expectedSession !== tempoSessionId
         || deck.regionEntity?.id !== regionId
+        || deck.cueLoadId !== operationId
       ) throw new Error('Project connection changed before joining the cue cut')
       const regions = deckCueRegions(t.entities, deckIndex)
       const firstPositionTicks = regions[0]?.fields.region.fields.positionTicks.value
@@ -1766,10 +1850,21 @@ async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
       const endPositionTicks =
         last.fields.region.fields.positionTicks.value
         + last.fields.region.fields.durationTicks.value
-      const cutTicks =
-        firstPositionTicks + Math.round(cuePosition * (endPositionTicks - firstPositionTicks))
-      const rightIndex = regions.findIndex((region) =>
-        region.fields.region.fields.positionTicks.value === cutTicks)
+      const fullDurationTicks = endPositionTicks - firstPositionTicks
+      const closestCut = regions
+        .slice(1)
+        .map((region, index) => ({
+          difference: Math.abs(
+            (region.fields.region.fields.positionTicks.value - firstPositionTicks)
+              / fullDurationTicks
+              - cuePosition,
+          ),
+          rightIndex: index + 1,
+        }))
+        .sort((a, b) => a.difference - b.difference)[0]
+      const rightIndex = closestCut && closestCut.difference < 0.000_5
+        ? closestCut.rightIndex
+        : -1
       if (rightIndex <= 0) throw new Error('The Audiotool cut was changed or removed')
       const left = regions[rightIndex - 1]
       const right = regions[rightIndex]
@@ -1795,14 +1890,17 @@ async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
       nexus !== projectDocument
       || expectedSession !== tempoSessionId
       || deck.regionEntity?.id !== regionId
+      || deck.cueLoadId !== operationId
     ) return
     deck.cuePoints[slot] = null
     deck.cuePoints = reconcileCueSlots(deck.cuePoints, authoritativePoints)
     persistCuePoints(deckIndex)
     setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT JOINED IN AUDIOTOOL`)
   } finally {
-    deck.cueLoading = false
-    renderCueControls(deckIndex)
+    if (deck.cueLoadId === operationId) {
+      deck.cueLoading = false
+      renderCueControls(deckIndex)
+    }
   }
 }
 
@@ -2445,18 +2543,28 @@ function updateMagicLoopDurationInTransaction(
   if (!magicRegion) return
   const durationTicks = durationTicksOverride
     ?? getMagicLoopDurationTicks(t, durationOverrides)
+  const magicRegions = contiguousAudioRegions(t.entities, magicRegion)
+  const currentRegionDurationTicks = audioRegionChainDuration(magicRegions)
   const regionDurationTicks = preservedStopEndTicks === null || preservedStopEndTicks === undefined
     ? durationTicks
     : Math.min(
         durationTicks,
         Math.max(0, preservedStopEndTicks - magicRegion.fields.region.fields.positionTicks.value),
       )
-  if (magicRegion.fields.region.fields.durationTicks.value !== regionDurationTicks) {
-    t.update(magicRegion.fields.region.fields.durationTicks, regionDurationTicks)
+  if (currentRegionDurationTicks !== regionDurationTicks) {
+    updateDeckRegionChainTiming(
+      t,
+      magicRegion,
+      magicRegions[0]?.fields.region.fields.positionTicks.value
+        ?? magicRegion.fields.region.fields.positionTicks.value,
+      regionDurationTicks,
+    )
   }
-  if (magicRegion.fields.timestretchMode.value !== 2) {
-    t.update(magicRegion.fields.timestretchMode, 2)
-  }
+  magicRegions.forEach((region) => {
+    if (region.fields.timestretchMode.value !== 2) {
+      t.update(region.fields.timestretchMode, 2)
+    }
+  })
 }
 
 function getMagicScheduledStopEndTicks(t: SafeTransactionBuilder) {
@@ -2464,10 +2572,12 @@ function getMagicScheduledStopEndTicks(t: SafeTransactionBuilder) {
   if (!magicRegionId) return null
   const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
   if (!magicRegion || !magicRegion.fields.region.fields.isEnabled.value) return null
+  const magicRegions = contiguousAudioRegions(t.entities, magicRegion)
   const fullDurationTicks = getMagicLoopDurationTicks(t)
-  const durationTicks = magicRegion.fields.region.fields.durationTicks.value
+  const durationTicks = audioRegionChainDuration(magicRegions)
   return durationTicks < fullDurationTicks
-    ? magicRegion.fields.region.fields.positionTicks.value + durationTicks
+    ? (magicRegions[0]?.fields.region.fields.positionTicks.value
+        ?? magicRegion.fields.region.fields.positionTicks.value) + durationTicks
     : null
 }
 
@@ -3093,8 +3203,12 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
     controls.status.textContent = 'READY'
     return
   }
-  const positionTicks = region.fields.region.fields.positionTicks.value
-  const durationTicks = region.fields.region.fields.durationTicks.value
+  const regions = nexus
+    ? contiguousAudioRegions(nexus.queryEntities, region)
+    : [region]
+  const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
+    ?? region.fields.region.fields.positionTicks.value
+  const durationTicks = audioRegionChainDuration(regions)
   const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
   if (fullDurationTicks !== null && durationTicks < fullDurationTicks) {
     controls.status.textContent = `STOP · BAR ${tickToBar(positionTicks + durationTicks, Ticks.Bars(1))}`
@@ -3416,15 +3530,23 @@ async function mutateDeckCrossfade(
       getDeckFullDurationTicks(t, incomingDeckIndex, incomingRegion),
       targetTicks,
     )
-    t.update(incomingRegion.fields.region.fields.durationTicks, incomingPlan.durationTicks)
-    t.update(incomingRegion.fields.region.fields.positionTicks, incomingPlan.positionTicks)
-    t.update(incomingRegion.fields.region.fields.isEnabled, incomingPlan.isEnabled)
+    const incomingRegions = updateDeckRegionChainTiming(
+      t,
+      incomingRegion,
+      incomingPlan.positionTicks,
+      incomingPlan.durationTicks,
+    )
+    updateAudioRegionChainEnabled(t, incomingRegions, incomingPlan.isEnabled)
 
     const fadeEndTicks = targetTicks + fadeDurationTicks
     if (!Number.isSafeInteger(fadeEndTicks)) throw new Error('Crossfade boundary exceeds the safe tick range')
+    const outgoingRegions = contiguousAudioRegions(t.entities, outgoingRegion)
+    const outgoingPositionTicks =
+      outgoingRegions[0]?.fields.region.fields.positionTicks.value
+      ?? outgoingRegion.fields.region.fields.positionTicks.value
     const outgoingPlan = planRegionStop(
-      outgoingRegion.fields.region.fields.positionTicks.value,
-      outgoingRegion.fields.region.fields.durationTicks.value,
+      outgoingPositionTicks,
+      audioRegionChainDuration(outgoingRegions),
       getDeckFullDurationTicks(t, outgoingDeckIndex, outgoingRegion),
       true,
       targetTicks,
@@ -3434,7 +3556,12 @@ async function mutateDeckCrossfade(
       throw new Error('The outgoing deck has not begun by the crossfade boundary')
     }
     if (outgoingPlan.kind === 'stop') {
-      t.update(outgoingRegion.fields.region.fields.durationTicks, outgoingPlan.durationTicks)
+      updateDeckRegionChainTiming(
+        t,
+        outgoingRegion,
+        outgoingPositionTicks,
+        outgoingPlan.durationTicks,
+      )
     }
     replaceCrossfadeAutomation(
       t,
@@ -3505,9 +3632,13 @@ async function mutateDeckLaunch(
       getDeckFullDurationTicks(t, deckIndex, region),
       targetTicks,
     )
-    t.update(region.fields.region.fields.durationTicks, plan.durationTicks)
-    t.update(region.fields.region.fields.positionTicks, plan.positionTicks)
-    t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+    const regions = updateDeckRegionChainTiming(
+      t,
+      region,
+      plan.positionTicks,
+      plan.durationTicks,
+    )
+    updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
   }))
   return true
 }
@@ -3536,11 +3667,14 @@ async function mutateDeckCancel(deckIndex: WaveformDeckIndex, expectedSession: n
     if (!region || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region changed before cancellation')
     }
-    const plan = planRegionCancel(region.fields.region.fields.positionTicks.value, guardedTicks)
+    const regions = contiguousAudioRegions(t.entities, region)
+    const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
+      ?? region.fields.region.fields.positionTicks.value
+    const plan = planRegionCancel(positionTicks, guardedTicks)
     if (plan.kind === 'refuse') {
       throw new Error('Launch boundary reached — use Stop Next Bar')
     }
-    t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+    updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
   }))
   return true
 }
@@ -3569,18 +3703,21 @@ async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: num
     if (!region || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region changed before stop scheduling')
     }
+    const regions = contiguousAudioRegions(t.entities, region)
+    const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
+      ?? region.fields.region.fields.positionTicks.value
     const plan = planRegionStop(
-      region.fields.region.fields.positionTicks.value,
-      region.fields.region.fields.durationTicks.value,
+      positionTicks,
+      audioRegionChainDuration(regions),
       getDeckFullDurationTicks(t, deckIndex, region),
       region.fields.region.fields.isEnabled.value,
       transport.guardedTicks,
       transport.targetTicks,
     )
     if (plan.kind === 'cancel') {
-      t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+      updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
     } else if (plan.kind === 'stop') {
-      t.update(region.fields.region.fields.durationTicks, plan.durationTicks)
+      updateDeckRegionChainTiming(t, region, positionTicks, plan.durationTicks)
     }
   }))
   return true

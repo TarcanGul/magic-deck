@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   cuePositionsFromSegments,
   planAudioRegionSplit,
+  planResizedCueOffsets,
 } from '../src/cue-utils.js'
 
 test('plans adjacent audio regions without changing playback alignment', () => {
@@ -56,4 +57,31 @@ test('does not infer cues from project regions with gaps', () => {
     { id: 'left', positionTicks: 0, durationTicks: 2_000 },
     { id: 'right', positionTicks: 2_001, durationTicks: 1_999 },
   ]), [])
+})
+
+test('keeps cue-cut source alignment when region and loop durations scale differently', () => {
+  const left = planResizedCueOffsets({
+    firstCollectionOffsetTicks: 120,
+    firstLoopOffsetTicks: 40,
+    loopDurationTicks: 4_000,
+    previousContentDurationTicks: 4_000,
+    nextContentDurationTicks: 5_000,
+    nextStartTicks: 0,
+  })
+  const right = planResizedCueOffsets({
+    firstCollectionOffsetTicks: 120,
+    firstLoopOffsetTicks: 40,
+    loopDurationTicks: 4_000,
+    previousContentDurationTicks: 4_000,
+    nextContentDurationTicks: 5_000,
+    nextStartTicks: 3_000,
+  })
+
+  assert.equal(right.collectionOffsetTicks, left.collectionOffsetTicks + 3_000)
+  assert.equal(right.loopOffsetTicks, left.loopOffsetTicks)
+  assert.equal(right.loopDurationTicks, left.loopDurationTicks)
+  assert.equal(
+    left.loopOffsetTicks - left.collectionOffsetTicks,
+    3_000 + right.loopOffsetTicks - right.collectionOffsetTicks,
+  )
 })
