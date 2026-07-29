@@ -55,12 +55,14 @@ interface DeckState {
   mixerChannelEntity: NexusEntity<'mixerChannel'> | null; sampleEntity: NexusEntity<'sample'> | null
   automationCollectionEntity: NexusEntity<'automationCollection'> | null
   cableEntity: NexusEntity<'desktopAudioCable'> | null
+  fxGraph: DeckFxGraph | null
   contentSubscriptions: Terminable[]
   routingSubscriptions: Terminable[]
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
 type EqBand = 'hi' | 'mid' | 'low'
+type DeckFxKind = 'delay' | 'reverb' | 'distortion' | 'flanger'
 type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
 interface ReferenceAudio {
   blob: Blob
@@ -155,7 +157,21 @@ interface ResolvedDeckRoutingGraph {
   audioDevice: NexusEntity<'audioDevice'>
   mixerChannel: NexusEntity<'mixerChannel'>
   cable: NexusEntity<'desktopAudioCable'>
+  fxGraph: DeckFxGraph | null
   displayName: string
+}
+interface DeckFxGraph {
+  delay: NexusEntity<'stompboxDelay'>
+  reverb: NexusEntity<'stompboxReverb'>
+  distortion: NexusEntity<'stompboxTube'>
+  chorus: NexusEntity<'stompboxChorus'>
+  cables: [
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+  ]
 }
 interface ResolvedDeckContentGraph {
   region: NexusEntity<'audioRegion'>
@@ -187,6 +203,7 @@ let currentProjectBpm: number | null = null
 let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let placementModalQueue: Promise<void> = Promise.resolve()
+let activeFxDeckIndex: WaveformDeckIndex | null = null
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -211,9 +228,9 @@ const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperatio
 ]
 
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -614,6 +631,7 @@ async function connectProject() {
         updateSourceDeckUi(0)
         updateSourceDeckUi(1)
       }
+      renderDeckFxAvailability()
       decks.forEach((_, deckIndex) => renderTempoControls(deckIndex as WaveformDeckIndex))
       decks.forEach((_, deckIndex) => renderDeckTransport(deckIndex as WaveformDeckIndex))
       setStatus(connected ? 'connected' : 'error', connected ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…')
@@ -623,6 +641,7 @@ async function connectProject() {
     if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
     projectConnected = projectDocument.connected.getValue()
     if (!projectConnected) throw new Error('Project connection was lost after initial sync')
+    renderDeckFxAvailability()
     await reconcileDecksFromProject(projectDocument, expectedSession)
     updateSourceDeckUi(0)
     updateSourceDeckUi(1)
@@ -634,6 +653,7 @@ async function connectProject() {
     projectConnected = false
     currentProjectId = null
     btnConnect.disabled = false
+    renderDeckFxAvailability()
   }
 }
 
@@ -642,6 +662,7 @@ function resetTempoMasterSession() {
   projectConnected = false
   currentProjectId = null
   currentProjectBpm = null
+  renderDeckFxAvailability()
   decks.forEach((_, deckIndex) => resetDeckTempoState(deckIndex as WaveformDeckIndex))
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
@@ -902,9 +923,8 @@ function resolveDeckRoutingGraphs(
   entities: EntityQuery,
   audioDevice: NexusEntity<'audioDevice'>,
 ): ResolvedDeckRoutingGraph[] {
-  const cableAndMixer = entities
-    .ofTypes('desktopAudioCable')
-    .get()
+  const cables = entities.ofTypes('desktopAudioCable').get()
+  const directCableAndMixer = cables
     .filter((candidate) =>
       candidate.fields.fromSocket.value.equals(audioDevice.fields.audioOutput.location))
     .map((cable) => ({
@@ -914,8 +934,80 @@ function resolveDeckRoutingGraphs(
         .getEntity(cable.fields.toSocket.value.entityId),
     }))
     .find((candidate) => candidate.mixerChannel !== undefined)
-  if (!cableAndMixer?.mixerChannel) return []
-  const { cable, mixerChannel } = cableAndMixer
+
+  let cableAndMixer: {
+    cable: NexusEntity<'desktopAudioCable'>
+    mixerChannel: NexusEntity<'mixerChannel'>
+    fxGraph: DeckFxGraph | null
+  } | null = directCableAndMixer?.mixerChannel
+    ? {
+      cable: directCableAndMixer.cable,
+      mixerChannel: directCableAndMixer.mixerChannel,
+      fxGraph: null,
+    }
+    : null
+
+  const inputCable = cables.find((candidate) =>
+    candidate.fields.fromSocket.value.equals(audioDevice.fields.audioOutput.location))
+  const delay = inputCable
+    ? entities.ofTypes('stompboxDelay').getEntity(inputCable.fields.toSocket.value.entityId)
+    : undefined
+  const delayCable = delay
+    ? cables.find((candidate) =>
+      candidate.fields.fromSocket.value.equals(delay.fields.audioOutput.location))
+    : undefined
+  const reverb = delayCable
+    ? entities.ofTypes('stompboxReverb').getEntity(delayCable.fields.toSocket.value.entityId)
+    : undefined
+  const reverbCable = reverb
+    ? cables.find((candidate) =>
+      candidate.fields.fromSocket.value.equals(reverb.fields.audioOutput.location))
+    : undefined
+  const distortion = reverbCable
+    ? entities.ofTypes('stompboxTube').getEntity(reverbCable.fields.toSocket.value.entityId)
+    : undefined
+  const distortionCable = distortion
+    ? cables.find((candidate) =>
+      candidate.fields.fromSocket.value.equals(distortion.fields.audioOutput.location))
+    : undefined
+  const chorus = distortionCable
+    ? entities.ofTypes('stompboxChorus').getEntity(distortionCable.fields.toSocket.value.entityId)
+    : undefined
+  const outputCable = chorus
+    ? cables.find((candidate) =>
+      candidate.fields.fromSocket.value.equals(chorus.fields.audioOutput.location))
+    : undefined
+  const fxMixerChannel = outputCable
+    ? entities.ofTypes('mixerChannel').getEntity(outputCable.fields.toSocket.value.entityId)
+    : undefined
+
+  if (
+    inputCable
+    && delay
+    && delayCable
+    && reverb
+    && reverbCable
+    && distortion
+    && distortionCable
+    && chorus
+    && outputCable
+    && fxMixerChannel
+  ) {
+    cableAndMixer = {
+      cable: outputCable,
+      mixerChannel: fxMixerChannel,
+      fxGraph: {
+        delay,
+        reverb,
+        distortion,
+        chorus,
+        cables: [inputCable, delayCable, reverbCable, distortionCable, outputCable],
+      },
+    }
+  }
+
+  if (!cableAndMixer) return []
+  const { cable, mixerChannel, fxGraph } = cableAndMixer
 
   return entities
     .ofTypes('audioTrack')
@@ -926,8 +1018,97 @@ function resolveDeckRoutingGraphs(
       audioDevice,
       mixerChannel,
       cable,
+      fxGraph,
       displayName: audioDevice.fields.displayName.value,
     }))
+}
+
+function createDeckFxGraph(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  routing: ResolvedDeckRoutingGraph,
+): ResolvedDeckRoutingGraph {
+  const displayName = DECK_PROJECT_NAMES[deckIndex]
+  const delay = t.create('stompboxDelay', {
+    displayName: `${displayName} FX · DELAY`,
+    mix: 0,
+    isActive: false,
+  })
+  const reverb = t.create('stompboxReverb', {
+    displayName: `${displayName} FX · REVERB`,
+    mix: 0,
+    isActive: false,
+  })
+  const distortion = t.create('stompboxTube', {
+    displayName: `${displayName} FX · DISTORTION`,
+    drive: 0.1,
+    isActive: false,
+  })
+  const chorus = t.create('stompboxChorus', {
+    displayName: `${displayName} FX · FLANGER (CHORUS)`,
+    delayTimeMs: 20,
+    feedbackFactor: 0,
+    lfoFrequencyHz: 0.1,
+    lfoModulationDepth: 0,
+    spreadFactor: 0,
+    isActive: false,
+  })
+  const inputCable = t.create('desktopAudioCable', {
+    fromSocket: routing.audioDevice.fields.audioOutput.location,
+    toSocket: delay.fields.audioInput.location,
+  })
+  const delayCable = t.create('desktopAudioCable', {
+    fromSocket: delay.fields.audioOutput.location,
+    toSocket: reverb.fields.audioInput.location,
+  })
+  const reverbCable = t.create('desktopAudioCable', {
+    fromSocket: reverb.fields.audioOutput.location,
+    toSocket: distortion.fields.audioInput.location,
+  })
+  const distortionCable = t.create('desktopAudioCable', {
+    fromSocket: distortion.fields.audioOutput.location,
+    toSocket: chorus.fields.audioInput.location,
+  })
+  const outputCable = t.create('desktopAudioCable', {
+    fromSocket: chorus.fields.audioOutput.location,
+    toSocket: routing.mixerChannel.fields.audioInput.location,
+  })
+  t.remove(routing.cable)
+
+  return {
+    ...routing,
+    cable: outputCable,
+    fxGraph: {
+      delay,
+      reverb,
+      distortion,
+      chorus,
+      cables: [inputCable, delayCable, reverbCable, distortionCable, outputCable],
+    },
+  }
+}
+
+async function ensureDeckFxGraph(
+  projectDocument: SyncedDocument,
+  deckIndex: WaveformDeckIndex,
+  expectedSession: number,
+) {
+  if (
+    nexus !== projectDocument
+    || !projectConnected
+    || expectedSession !== tempoSessionId
+  ) throw new Error('Connect an Audiotool project before opening FX')
+
+  return projectDocument.modify((t) => {
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) throw new Error('Project connection changed while opening FX')
+    const routing = reusableDeckGraphs(t.entities, deckIndex)[0]?.routing
+    if (!routing) throw new Error(`${placementDeckLabel(deckIndex)} routing is unavailable`)
+    return routing.fxGraph ? routing : createDeckFxGraph(t, deckIndex, routing)
+  })
 }
 
 function resolveDeckContentGraph(
@@ -1021,7 +1202,7 @@ function createDeckRoutingGraph(
     fromSocket: audioDevice.fields.audioOutput.location,
     toSocket: mixerChannel.fields.audioInput.location,
   })
-  return { track, audioDevice, mixerChannel, cable, displayName }
+  return { track, audioDevice, mixerChannel, cable, fxGraph: null, displayName }
 }
 
 async function ensureDeckRoutingGraph(
@@ -1292,6 +1473,7 @@ function clearDeckRoutingEntities(deck: DeckState) {
   deck.audioDeviceEntity = null
   deck.mixerChannelEntity = null
   deck.cableEntity = null
+  deck.fxGraph = null
 }
 
 function clearDeckProjectEntities(deck: DeckState) {
@@ -3293,6 +3475,24 @@ function bindDeckRoutingGraph(
   deck.audioDeviceEntity = routing.audioDevice
   deck.mixerChannelEntity = routing.mixerChannel
   deck.cableEntity = routing.cable
+  deck.fxGraph = routing.fxGraph
+  hydrateRestoredProjectControls(deckIndex, routing.mixerChannel)
+  watchDeckRouting(deckIndex, projectDocument, routing, expectedSession)
+}
+
+function bindDeckFxRoutingGraph(
+  deckIndex: WaveformDeckIndex,
+  projectDocument: SyncedDocument,
+  routing: ResolvedDeckRoutingGraph,
+  expectedSession: number,
+) {
+  const deck = decks[deckIndex]
+  clearDeckRoutingEntities(deck)
+  deck.trackEntity = routing.track
+  deck.audioDeviceEntity = routing.audioDevice
+  deck.mixerChannelEntity = routing.mixerChannel
+  deck.cableEntity = routing.cable
+  deck.fxGraph = routing.fxGraph
   hydrateRestoredProjectControls(deckIndex, routing.mixerChannel)
   watchDeckRouting(deckIndex, projectDocument, routing, expectedSession)
 }
@@ -3694,6 +3894,144 @@ function applyCurrentDeckLevels(deckIndex: WaveformDeckIndex) {
   return applyDeckProjectLevels(deckIndex)
 }
 
+function clampUnit(value: number) {
+  return Math.max(0, Math.min(1, value))
+}
+
+function deckFxValues(fxGraph: DeckFxGraph): Record<DeckFxKind, number> {
+  return {
+    delay: fxGraph.delay.fields.isActive.value
+      ? clampUnit(fxGraph.delay.fields.mix.value)
+      : 0,
+    reverb: fxGraph.reverb.fields.isActive.value
+      ? clampUnit(fxGraph.reverb.fields.mix.value)
+      : 0,
+    distortion: fxGraph.distortion.fields.isActive.value
+      ? clampUnit((fxGraph.distortion.fields.drive.value - 0.1) / 11.9)
+      : 0,
+    flanger: fxGraph.chorus.fields.isActive.value
+      ? clampUnit(fxGraph.chorus.fields.lfoModulationDepth.value)
+      : 0,
+  }
+}
+
+function setDeckFxKnobValue(kind: DeckFxKind, value: number) {
+  const canvas = el<HTMLCanvasElement>(`fx-${kind}`)
+  const state = knobState.get(canvas)
+  if (!state) return
+  state.value = clampUnit(value)
+  drawKnob(canvas, state.value)
+  canvas.setAttribute('aria-valuenow', String(Math.round(state.value * 100)))
+  el<HTMLOutputElement>(`fx-${kind}-value`).value = `${Math.round(state.value * 100)}%`
+}
+
+function hydrateDeckFxControls(fxGraph: DeckFxGraph) {
+  const values = deckFxValues(fxGraph)
+  const kinds = Object.keys(values) as DeckFxKind[]
+  kinds.forEach((kind) => {
+    setDeckFxKnobValue(kind, values[kind])
+  })
+}
+
+async function applyDeckFx(
+  deckIndex: WaveformDeckIndex,
+  kind: DeckFxKind,
+  value: number,
+) {
+  const projectDocument = nexus
+  const fxGraph = decks[deckIndex].fxGraph
+  if (!projectDocument || !projectConnected || !fxGraph) return
+  const normalizedValue = clampUnit(value)
+
+  try {
+    await projectDocument.modify((t) => {
+      const delay = t.entities.ofTypes('stompboxDelay').getEntity(fxGraph.delay.id)
+      const reverb = t.entities.ofTypes('stompboxReverb').getEntity(fxGraph.reverb.id)
+      const distortion = t.entities.ofTypes('stompboxTube').getEntity(fxGraph.distortion.id)
+      const chorus = t.entities.ofTypes('stompboxChorus').getEntity(fxGraph.chorus.id)
+      if (!delay || !reverb || !distortion || !chorus) {
+        throw new Error('The synchronized FX chain changed')
+      }
+      const enabled = normalizedValue > 0
+      if (kind === 'delay') {
+        t.update(delay.fields.mix, normalizedValue)
+        t.update(delay.fields.isActive, enabled)
+      } else if (kind === 'reverb') {
+        t.update(reverb.fields.mix, normalizedValue)
+        t.update(reverb.fields.isActive, enabled)
+      } else if (kind === 'distortion') {
+        t.update(distortion.fields.drive, 0.1 + normalizedValue * 11.9)
+        t.update(distortion.fields.isActive, enabled)
+      } else {
+        t.update(chorus.fields.delayTimeMs, 20 + normalizedValue * 20)
+        t.update(chorus.fields.feedbackFactor, normalizedValue * 0.75)
+        t.update(chorus.fields.lfoFrequencyHz, 0.1 + normalizedValue * 1.9)
+        t.update(chorus.fields.lfoModulationDepth, normalizedValue)
+        t.update(chorus.fields.spreadFactor, normalizedValue)
+        t.update(chorus.fields.isActive, enabled)
+      }
+    })
+    el<HTMLDivElement>('fx-modal-error').textContent = ''
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    el<HTMLDivElement>('fx-modal-error').textContent = `FX UPDATE FAILED: ${message.toUpperCase()}`
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX UPDATE FAILED — ${message}`)
+  }
+}
+
+function closeDeckFxAssistant() {
+  activeFxDeckIndex = null
+  el<HTMLDivElement>('fx-modal').classList.add('is-hidden')
+  document.removeEventListener('keydown', handleDeckFxModalKey)
+}
+
+function handleDeckFxModalKey(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeDeckFxAssistant()
+}
+
+async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
+  const projectDocument = nexus
+  const expectedSession = tempoSessionId
+  if (!projectDocument || !projectConnected) {
+    setStatus('error', 'CONNECT AN AUDIOTOOL PROJECT TO OPEN DECK FX')
+    return
+  }
+  const trigger = document.querySelector<HTMLButtonElement>(`[data-deck-fx="${deckIndex}"]`)
+  if (trigger) trigger.disabled = true
+  setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: PREPARING PROJECT FX…`)
+
+  try {
+    const routing = await ensureDeckFxGraph(projectDocument, deckIndex, expectedSession)
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+      || !routing.fxGraph
+    ) throw new Error('Project connection changed while opening FX')
+    bindDeckFxRoutingGraph(deckIndex, projectDocument, routing, expectedSession)
+    activeFxDeckIndex = deckIndex
+    hydrateDeckFxControls(routing.fxGraph)
+    el<HTMLHeadingElement>('fx-modal-title').textContent = `${placementDeckLabel(deckIndex)} Effects`
+    el<HTMLDivElement>('fx-modal-error').textContent = ''
+    el<HTMLDivElement>('fx-modal').classList.remove('is-hidden')
+    document.addEventListener('keydown', handleDeckFxModalKey)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: FX READY ↔ PROJECT SYNCED`)
+    el<HTMLCanvasElement>('fx-delay').focus()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX FAILED — ${message}`)
+  } finally {
+    if (trigger) trigger.disabled = !projectConnected
+  }
+}
+
+function renderDeckFxAvailability() {
+  document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
+    button.disabled = !projectConnected || nexus === null
+  })
+  if (!projectConnected && activeFxDeckIndex !== null) closeDeckFxAssistant()
+}
+
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
 function ensureCtx(deck: DeckState) {
   if (!deck.audioCtx) deck.audioCtx = new AudioContext()
@@ -3861,6 +4199,15 @@ function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: WaveformDeckI
   if (!match) return null
   return { deckIndex: Number(match[1]) - 1 as WaveformDeckIndex, band: match[2] as EqBand }
 }
+function getDeckFxControl(canvas: HTMLCanvasElement): DeckFxKind | null {
+  const kind = canvas.dataset.fx
+  return kind === 'delay'
+    || kind === 'reverb'
+    || kind === 'distortion'
+    || kind === 'flanger'
+    ? kind
+    : null
+}
 function initKnob(canvas: HTMLCanvasElement) {
   const init = parseFloat(canvas.dataset.value ?? '0.5')
   knobState.set(canvas, { value: init, dragging: false, startY: 0, startVal: init })
@@ -3874,6 +4221,8 @@ function initKnob(canvas: HTMLCanvasElement) {
   canvas.setAttribute('aria-valuenow', String(Math.round(init * 100)))
   const label = canvas.id.match(/^d(\d)-(hi|mid|low)$/)
   if (label) canvas.setAttribute('aria-label', `Deck ${label[1]} ${label[2].toUpperCase()} EQ`)
+  const fxKind = getDeckFxControl(canvas)
+  if (fxKind) canvas.setAttribute('aria-label', `${fxKind} effect amount`)
 
   const updateValue = (newValue: number) => {
     const s = knobState.get(canvas)!
@@ -3882,6 +4231,11 @@ function initKnob(canvas: HTMLCanvasElement) {
     canvas.setAttribute('aria-valuenow', String(Math.round(s.value * 100)))
     const control = getDeckEqControl?.(canvas)
     if (control) void applyDeckEq?.(control.deckIndex, control.band, s.value)
+    const effect = getDeckFxControl(canvas)
+    if (effect && activeFxDeckIndex !== null) {
+      el<HTMLOutputElement>(`fx-${effect}-value`).value = `${Math.round(s.value * 100)}%`
+      void applyDeckFx(activeFxDeckIndex, effect, s.value)
+    }
   }
 
   // Mouse drag
@@ -4573,7 +4927,13 @@ function initApp() {
   wireTransport('d1', 0)
   wireTransport('d2', 1)
   wireTransport('d3', 2)
-  document.querySelectorAll<HTMLCanvasElement>('.eq-knob').forEach(initKnob)
+  document.querySelectorAll<HTMLCanvasElement>('.eq-knob, .fx-knob').forEach(initKnob)
+  document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
+    const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
+    button.addEventListener('click', () => { void showDeckFxAssistant(deckIndex) })
+  })
+  el<HTMLButtonElement>('fx-modal-close').addEventListener('click', closeDeckFxAssistant)
+  renderDeckFxAvailability()
 
   btnGenerate.addEventListener('click', generateMagicAudio)
   drawMagicIdle()
