@@ -164,7 +164,7 @@ interface DeckFxGraph {
   delay: NexusEntity<'stompboxDelay'>
   reverb: NexusEntity<'stompboxReverb'>
   distortion: NexusEntity<'stompboxTube'>
-  chorus: NexusEntity<'stompboxChorus'>
+  flanger: NexusEntity<'stompboxFlanger'> | NexusEntity<'stompboxChorus'>
   cables: [
     NexusEntity<'desktopAudioCable'>,
     NexusEntity<'desktopAudioCable'>,
@@ -971,12 +971,13 @@ function resolveDeckRoutingGraphs(
     ? cables.find((candidate) =>
       candidate.fields.fromSocket.value.equals(distortion.fields.audioOutput.location))
     : undefined
-  const chorus = distortionCable
-    ? entities.ofTypes('stompboxChorus').getEntity(distortionCable.fields.toSocket.value.entityId)
+  const flanger = distortionCable
+    ? entities.ofTypes('stompboxFlanger').getEntity(distortionCable.fields.toSocket.value.entityId)
+      ?? entities.ofTypes('stompboxChorus').getEntity(distortionCable.fields.toSocket.value.entityId)
     : undefined
-  const outputCable = chorus
+  const outputCable = flanger
     ? cables.find((candidate) =>
-      candidate.fields.fromSocket.value.equals(chorus.fields.audioOutput.location))
+      candidate.fields.fromSocket.value.equals(flanger.fields.audioOutput.location))
     : undefined
   const fxMixerChannel = outputCable
     ? entities.ofTypes('mixerChannel').getEntity(outputCable.fields.toSocket.value.entityId)
@@ -990,7 +991,7 @@ function resolveDeckRoutingGraphs(
     && reverbCable
     && distortion
     && distortionCable
-    && chorus
+    && flanger
     && outputCable
     && fxMixerChannel
   ) {
@@ -1001,7 +1002,7 @@ function resolveDeckRoutingGraphs(
         delay,
         reverb,
         distortion,
-        chorus,
+        flanger,
         cables: [inputCable, delayCable, reverbCable, distortionCable, outputCable],
       },
     }
@@ -1024,11 +1025,12 @@ function resolveDeckRoutingGraphs(
     }))
 }
 
-function createDeckFxGraph(
+function createDeckFxDevices(
   t: SafeTransactionBuilder,
   deckIndex: WaveformDeckIndex,
-  routing: ResolvedDeckRoutingGraph,
-): ResolvedDeckRoutingGraph {
+  audioDevice: NexusEntity<'audioDevice'>,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+): { cable: NexusEntity<'desktopAudioCable'>; fxGraph: DeckFxGraph } {
   const displayName = DECK_PROJECT_NAMES[deckIndex]
   const delay = t.create('stompboxDelay', {
     displayName: `${displayName} FX · DELAY`,
@@ -1045,17 +1047,16 @@ function createDeckFxGraph(
     drive: 0.1,
     isActive: false,
   })
-  const chorus = t.create('stompboxChorus', {
-    displayName: `${displayName} FX · FLANGER (CHORUS)`,
-    delayTimeMs: 20,
+  const flanger = t.create('stompboxFlanger', {
+    displayName: `${displayName} FX · FLANGER`,
+    delayTimeMs: 3,
     feedbackFactor: 0,
-    lfoFrequencyHz: 0.1,
+    lfoFrequencyHz: 0.04,
     lfoModulationDepth: 0,
-    spreadFactor: 0,
     isActive: false,
   })
   const inputCable = t.create('desktopAudioCable', {
-    fromSocket: routing.audioDevice.fields.audioOutput.location,
+    fromSocket: audioDevice.fields.audioOutput.location,
     toSocket: delay.fields.audioInput.location,
   })
   const delayCable = t.create('desktopAudioCable', {
@@ -1068,25 +1069,38 @@ function createDeckFxGraph(
   })
   const distortionCable = t.create('desktopAudioCable', {
     fromSocket: distortion.fields.audioOutput.location,
-    toSocket: chorus.fields.audioInput.location,
+    toSocket: flanger.fields.audioInput.location,
   })
   const outputCable = t.create('desktopAudioCable', {
-    fromSocket: chorus.fields.audioOutput.location,
-    toSocket: routing.mixerChannel.fields.audioInput.location,
+    fromSocket: flanger.fields.audioOutput.location,
+    toSocket: mixerChannel.fields.audioInput.location,
   })
-  t.remove(routing.cable)
 
   return {
-    ...routing,
     cable: outputCable,
     fxGraph: {
       delay,
       reverb,
       distortion,
-      chorus,
+      flanger,
       cables: [inputCable, delayCable, reverbCable, distortionCable, outputCable],
     },
   }
+}
+
+function createDeckFxGraph(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  routing: ResolvedDeckRoutingGraph,
+): ResolvedDeckRoutingGraph {
+  const fxRouting = createDeckFxDevices(
+    t,
+    deckIndex,
+    routing.audioDevice,
+    routing.mixerChannel,
+  )
+  t.remove(routing.cable)
+  return { ...routing, ...fxRouting }
 }
 
 async function ensureDeckFxGraph(
@@ -1199,11 +1213,8 @@ function createDeckRoutingGraph(
       orderAmongStrips: nextMixerChannelOrder(t.entities),
     },
   })
-  const cable = t.create('desktopAudioCable', {
-    fromSocket: audioDevice.fields.audioOutput.location,
-    toSocket: mixerChannel.fields.audioInput.location,
-  })
-  return { track, audioDevice, mixerChannel, cable, fxGraph: null, displayName }
+  const fxRouting = createDeckFxDevices(t, deckIndex, audioDevice, mixerChannel)
+  return { track, audioDevice, mixerChannel, ...fxRouting, displayName }
 }
 
 async function ensureDeckRoutingGraph(
@@ -1223,8 +1234,16 @@ async function ensureDeckRoutingGraph(
       || !projectConnected
       || expectedSession !== tempoSessionId
     ) throw new Error('Project connection changed during deck provisioning')
-    return reusableDeckGraphs(t.entities, deckIndex)[0]
-      ?? { routing: createDeckRoutingGraph(t, deckIndex), content: null }
+    const reusable = reusableDeckGraphs(t.entities, deckIndex)[0]
+    if (!reusable) {
+      return { routing: createDeckRoutingGraph(t, deckIndex), content: null }
+    }
+    return reusable.routing.fxGraph
+      ? reusable
+      : {
+        ...reusable,
+        routing: createDeckFxGraph(t, deckIndex, reusable.routing),
+      }
   })
 }
 
@@ -3371,7 +3390,7 @@ function watchDeckRouting(
     }),
   )
   if (routing.fxGraph) {
-    const { delay, reverb, distortion, chorus } = routing.fxGraph
+    const { delay, reverb, distortion, flanger } = routing.fxGraph
     const hydrateIfCurrent = () => {
       if (
         nexus !== projectDocument
@@ -3388,8 +3407,8 @@ function watchDeckRouting(
       projectDocument.events.onUpdate(reverb.fields.isActive, hydrateIfCurrent),
       projectDocument.events.onUpdate(distortion.fields.drive, hydrateIfCurrent),
       projectDocument.events.onUpdate(distortion.fields.isActive, hydrateIfCurrent),
-      projectDocument.events.onUpdate(chorus.fields.lfoModulationDepth, hydrateIfCurrent),
-      projectDocument.events.onUpdate(chorus.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(flanger.fields.lfoModulationDepth, hydrateIfCurrent),
+      projectDocument.events.onUpdate(flanger.fields.isActive, hydrateIfCurrent),
     )
   }
 }
@@ -3932,8 +3951,8 @@ function deckFxValues(fxGraph: DeckFxGraph): Record<DeckFxKind, number> {
     distortion: fxGraph.distortion.fields.isActive.value
       ? clampUnit((fxGraph.distortion.fields.drive.value - 0.1) / 11.9)
       : 0,
-    flanger: fxGraph.chorus.fields.isActive.value
-      ? clampUnit(fxGraph.chorus.fields.lfoModulationDepth.value)
+    flanger: fxGraph.flanger.fields.isActive.value
+      ? clampUnit(fxGraph.flanger.fields.lfoModulationDepth.value)
       : 0,
   }
 }
@@ -3980,11 +3999,11 @@ async function applyDeckFx(
         || currentGraph.delay.id !== fxGraph.delay.id
         || currentGraph.reverb.id !== fxGraph.reverb.id
         || currentGraph.distortion.id !== fxGraph.distortion.id
-        || currentGraph.chorus.id !== fxGraph.chorus.id
+        || currentGraph.flanger.id !== fxGraph.flanger.id
       ) {
         throw new Error('The synchronized FX chain changed')
       }
-      const { delay, reverb, distortion, chorus } = currentGraph
+      const { delay, reverb, distortion, flanger } = currentGraph
       const enabled = normalizedValue > 0
       if (kind === 'delay') {
         t.update(delay.fields.mix, normalizedValue)
@@ -3996,12 +4015,10 @@ async function applyDeckFx(
         t.update(distortion.fields.drive, 0.1 + normalizedValue * 11.9)
         t.update(distortion.fields.isActive, enabled)
       } else {
-        t.update(chorus.fields.delayTimeMs, 20 + normalizedValue * 20)
-        t.update(chorus.fields.feedbackFactor, normalizedValue * 0.75)
-        t.update(chorus.fields.lfoFrequencyHz, 0.1 + normalizedValue * 1.9)
-        t.update(chorus.fields.lfoModulationDepth, normalizedValue)
-        t.update(chorus.fields.spreadFactor, normalizedValue)
-        t.update(chorus.fields.isActive, enabled)
+        t.update(flanger.fields.feedbackFactor, normalizedValue * 0.75)
+        t.update(flanger.fields.lfoFrequencyHz, 0.1 + normalizedValue * 1.9)
+        t.update(flanger.fields.lfoModulationDepth, normalizedValue)
+        t.update(flanger.fields.isActive, enabled)
       }
     })
     if (

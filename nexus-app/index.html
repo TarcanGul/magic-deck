@@ -55,7 +55,6 @@
         <div class="deck-header">
           <span class="deck-num">01</span>
           <span class="deck-title">DECK A — PLAYER</span>
-          <button class="assistant-fx-trigger" data-deck-fx="0" type="button" aria-label="Open Deck A effects">FX</button>
           <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck1-bpm">—</span></div>
         </div>
         <div class="deck-body">
@@ -143,9 +142,11 @@
             </div>
             <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
               <div class="bpm-dialogue-header">
-                <div class="bpm-dialogue-header-actions">
+                <div class="bpm-dialogue-header-actions" aria-label="Deck A assistant actions">
+                  <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                   <button class="deck-unload is-hidden" id="deck1-unload" type="button" aria-label="Unload Deck A">UNLOAD</button>
                   <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+                  <button class="assistant-fx-trigger" data-deck-fx="0" type="button" aria-label="Open Deck A effects">FX</button>
                 </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
               </div>
@@ -177,7 +178,6 @@
         <div class="deck-header">
           <span class="deck-num">02</span>
           <span class="deck-title">DECK B — PLAYER</span>
-          <button class="assistant-fx-trigger" data-deck-fx="1" type="button" aria-label="Open Deck B effects">FX</button>
           <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck2-bpm">—</span></div>
         </div>
         <div class="deck-body">
@@ -265,9 +265,11 @@
             </div>
             <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
               <div class="bpm-dialogue-header">
-                <div class="bpm-dialogue-header-actions">
+                <div class="bpm-dialogue-header-actions" aria-label="Deck B assistant actions">
+                  <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                   <button class="deck-unload is-hidden" id="deck2-unload" type="button" aria-label="Unload Deck B">UNLOAD</button>
                   <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+                  <button class="assistant-fx-trigger" data-deck-fx="1" type="button" aria-label="Open Deck B effects">FX</button>
                 </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
               </div>
@@ -299,7 +301,6 @@
         <div class="deck-header magic-header">
           <span class="deck-num magic-num">03</span>
           <span class="deck-title magic-title">MAGIC DECK</span>
-          <button class="assistant-fx-trigger" data-deck-fx="2" type="button" aria-label="Open Magic Deck effects">FX</button>
           <div class="deck-bpm"><span class="bpm-label">EFFECTIVE BPM</span><span class="bpm-value" id="deck3-bpm">—</span></div>
           <div class="magic-status">
             <span class="status-dot-magic" id="magic-dot"></span>
@@ -408,6 +409,15 @@
                 </div>
                 <div class="tempo-error" id="d3-tempo-error" aria-live="polite"></div>
               </div>
+              <div class="bpm-dialogue magic-deck-assistant" aria-label="Magic Deck assistant actions">
+                <div class="bpm-dialogue-header">
+                  <div class="bpm-dialogue-header-actions">
+                    <span class="deck-assistant-kicker">DECK ASSISTANT</span>
+                    <button class="assistant-fx-trigger" data-deck-fx="2" type="button" aria-label="Open Magic Deck effects">FX</button>
+                  </div>
+                  <div class="bpm-dialogue-title bpm-dialogue-title-idle">CONTROL MAGIC DECK PROJECT EFFECTS</div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -497,7 +507,7 @@
           <output class="fx-value" id="fx-flanger-value">0%</output>
         </div>
       </div>
-      <p class="fx-note">FLANGER uses Audiotool's chorus device.</p>
+      <p class="fx-note">CONTROLS AUDIOTOOL STOCK EFFECT DEVICES.</p>
       <div class="modal-error" id="fx-modal-error" aria-live="polite"></div>
     </div>
     <div class="modal-actions">
