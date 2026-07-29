@@ -4046,10 +4046,8 @@ function handleCaptureWorkletMessage(event: MessageEvent<CaptureWorkletMessage>)
     const now = performance.now()
     if (now - recording.lastProgressUpdate >= 250 || recording.capturedFrames === recording.targetFrames) {
       recording.lastProgressUpdate = now
-      const progress = Math.min(1, recording.capturedFrames / recording.targetFrames)
-      const barsRecorded = (progress * MAGIC_CAPTURE_BARS).toFixed(1)
-      setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
-      setMagicStatus('generating', `RECORDING ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
+      setAudioCaptureStatus('connecting', 'LOADING…')
+      setMagicStatus('generating', 'LOADING…')
     }
     return
   }
@@ -4077,8 +4075,8 @@ async function recordNextFiveBars(bpm: number) {
   const targetFrames = requiredLiveAudioFrames(bpm)
   const timeoutMs = Math.ceil((targetFrames / liveAudioContext.sampleRate) * 1000) + 5000
 
-  setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
-  setMagicStatus('generating', `RECORDING 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
+  setAudioCaptureStatus('connecting', 'LOADING…')
+  setMagicStatus('generating', 'LOADING…')
   return new Promise<CaptureChunk>((resolve, reject) => {
     const recordingId = ++liveAudioRecordingId
     const timeoutId = window.setTimeout(() => {
