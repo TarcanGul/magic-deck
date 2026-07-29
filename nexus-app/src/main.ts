@@ -3855,16 +3855,26 @@ async function applyDeckProjectLevels(
   recordVolumeAutomation = false,
 ) {
   const deck = decks[deckIndex]
-  if (!nexus || !deck.mixerChannelEntity) {
+  const projectDocument = nexus
+  const mixerChannelId = deck.mixerChannelEntity?.id
+  if (!projectDocument || !mixerChannelId) {
     setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT LEVELS`)
     return
   }
 
   try {
-    await nexus.modify((t) => {
-      const channel = t.entities.ofTypes('mixerChannel').getEntity(deck.mixerChannelEntity!.id) ?? deck.mixerChannelEntity!
-      const region = deck.regionEntity
-        ? t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
+    await projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || deck.mixerChannelEntity?.id !== mixerChannelId
+      ) {
+        throw new Error('Project routing changed before the level update')
+      }
+      const channel = t.entities.ofTypes('mixerChannel').getEntity(mixerChannelId)
+      if (!channel) throw new Error('Deck mixer channel is no longer available')
+      const regionId = deck.regionEntity?.id
+      const region = regionId
+        ? t.entities.ofTypes('audioRegion').getEntity(regionId)
         : null
       if (recordVolumeAutomation && region) {
         replaceDeckVolumeAutomation(t, deckIndex, channel, region, deck.volume)
