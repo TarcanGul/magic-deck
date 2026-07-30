@@ -1118,13 +1118,14 @@ function createDeckFxGraph(
   deckIndex: WaveformDeckIndex,
   routing: ResolvedDeckRoutingGraph,
 ): ResolvedDeckRoutingGraph {
+  // Nexus validates each cable immediately, so free the single-input socket first.
+  t.remove(routing.cable)
   const fxRouting = createDeckFxDevices(
     t,
     deckIndex,
     routing.audioDevice,
     routing.mixerChannel,
   )
-  t.remove(routing.cable)
   return { ...routing, ...fxRouting }
 }
 
@@ -1348,12 +1349,13 @@ async function restoreSourceDecksFromProject(
   if (isSupportedBpm(projectBpm)) currentProjectBpm = projectBpm
 
   for (const deckIndex of [0, 1] as const) {
-    const selected = await ensureDeckRoutingGraph(projectDocument, deckIndex, expectedSession)
+    const selected = reusableDeckGraphs(projectDocument.queryEntities, deckIndex)[0]
     if (
       nexus !== projectDocument
       || !projectConnected
       || expectedSession !== tempoSessionId
     ) return
+    if (!selected) continue
     bindDeckRoutingGraph(deckIndex, projectDocument, selected.routing, expectedSession)
     if (!selected.content) continue
 
@@ -1438,12 +1440,13 @@ async function restoreMagicDeckFromProject(
     || expectedSession !== tempoSessionId
   ) return
 
-  const selected = await ensureDeckRoutingGraph(projectDocument, 2, expectedSession)
+  const selected = reusableDeckGraphs(projectDocument.queryEntities, 2)[0]
   if (
     nexus !== projectDocument
     || !projectConnected
     || expectedSession !== tempoSessionId
   ) return
+  if (!selected) return
   bindDeckRoutingGraph(2, projectDocument, selected.routing, expectedSession)
   if (!selected.content) return
 
@@ -3330,16 +3333,11 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   const audioDevice = t.entities.ofTypes('audioDevice').getEntity(audioDeviceId)
   if (!audioDevice) throw new Error('Inserted audio device was not found')
 
-  const cable = t.entities
-    .ofTypes('desktopAudioCable')
-    .get()
-    .find((candidate) => candidate.fields.fromSocket.value.equals(audioDevice.fields.audioOutput.location))
-  if (!cable) throw new Error('Inserted mixer cable was not found')
+  const routing = resolveDeckRoutingGraphs(t.entities, audioDevice)
+    .find((candidate) => candidate.track.id === track.id)
+  if (!routing) throw new Error('Inserted deck routing was not found')
 
-  const mixerChannel = t.entities.ofTypes('mixerChannel').getEntity(cable.fields.toSocket.value.entityId)
-  if (!mixerChannel) throw new Error('Inserted mixer channel was not found')
-
-  return { track, audioDevice, mixerChannel, sample, automationCollection, cable }
+  return { ...routing, sample, automationCollection }
 }
 
 function getMagicLoopDurationTicks(
