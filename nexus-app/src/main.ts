@@ -9,6 +9,7 @@ import {
   TRANSPORT_REQUEST_TIMEOUT_MS,
   barToPositionTicks,
   guardedTransportTicks,
+  moveLaunchPosition,
   planRegionCancel,
   planRegionLaunch,
   planRegionStop,
@@ -18,7 +19,7 @@ import {
   validateTransportResponse,
 } from '../transport-extension/transport-utils.js'
 import type {
-  LaunchQuantization,
+  LaunchPositionAction,
   TransportRequest,
   TransportPosition,
   TransportResponse,
@@ -193,6 +194,7 @@ let currentProjectBpm: number | null = null
 let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let barAssistantQueue: Promise<void> = Promise.resolve()
+let sessionLaunchPositionTicks: number | null = null
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -309,7 +311,7 @@ function requestExtensionTransportPosition(
   })
 }
 
-type BarAssistantPurpose = 'placement' | 'launch' | 'exact-launch' | 'stop' | 'cancel-check'
+type BarAssistantPurpose = 'placement' | 'launch' | 'reenter-launch' | 'stop' | 'cancel-check'
 
 function showBarAssistantNow(
   deckIndex: WaveformDeckIndex,
@@ -337,15 +339,15 @@ function showBarAssistantNow(
         cancel: 'CANCEL LOAD',
       },
       launch: {
-        title: `Choose ${label} Launch Bar`,
-        copy: 'Automatic transport capture is unavailable. Enter the future whole-number bar where this deck should launch.',
-        confirm: 'LAUNCH AT BAR',
+        title: `Choose Session Launch Bar`,
+        copy: `Enter the first whole-number bar for this project session. ${label} will launch there, and later launch choices will move this remembered position without asking again.`,
+        confirm: 'REMEMBER & LAUNCH',
         cancel: 'CANCEL',
       },
-      'exact-launch': {
-        title: `Choose ${label} Launch Bar`,
-        copy: 'Enter the future whole-number Audiotool bar where this deck should launch.',
-        confirm: 'USE BAR',
+      'reenter-launch': {
+        title: `Re-enter ${label} Launch Bar`,
+        copy: 'Enter a new whole-number Audiotool bar. This replaces the remembered session launch position.',
+        confirm: 'REPLACE & LAUNCH',
         cancel: 'CANCEL',
       },
       stop: {
@@ -366,7 +368,9 @@ function showBarAssistantNow(
     copy.textContent = content.copy
     confirm.textContent = content.confirm
     cancel.textContent = content.cancel
-    input.value = '1'
+    input.value = sessionLaunchPositionTicks === null
+      ? '1'
+      : String(tickToBar(sessionLaunchPositionTicks, Ticks.Bars(1)))
     error.textContent = ''
     assistant.classList.remove('is-hidden')
     assistant.classList.add('bar-assistant-active')
@@ -431,6 +435,10 @@ function projectHasLoadedTimelineContent(projectDocument: SyncedDocument) {
   return projectHasTimelineContent(projectDocument.queryEntities)
 }
 
+function rememberInitialSessionLaunchPosition(positionTicks: number) {
+  if (sessionLaunchPositionTicks === null) sessionLaunchPositionTicks = positionTicks
+}
+
 async function captureDeckInsertionPlacement(
   deckIndex: WaveformDeckIndex,
 ): Promise<DeckInsertionPlacement | null> {
@@ -439,13 +447,15 @@ async function captureDeckInsertionPlacement(
     throw new Error('Connect an Audiotool project before loading audio')
   }
   if (!projectHasLoadedTimelineContent(projectDocument)) {
-    return {
+    const placement: DeckInsertionPlacement = {
       deckIndex,
       bar: 1,
       positionTicks: Ticks.Bars(0),
       source: 'project-start',
       capturedAt: Date.now(),
     }
+    rememberInitialSessionLaunchPosition(placement.positionTicks)
+    return placement
   }
   const projectId = currentProjectId
   const extensionCapture = projectId
@@ -459,13 +469,15 @@ async function captureDeckInsertionPlacement(
   if (nexus !== projectDocument || !projectConnected) {
     throw new Error('Project connection changed during manual placement')
   }
-  return {
+  const placement: DeckInsertionPlacement = {
     deckIndex,
     bar,
     positionTicks: barToPositionTicks(bar, Ticks.Bars(1)),
     source: extensionCapture ? 'extension' : 'manual',
     capturedAt: extensionCapture?.capturedAt ?? Date.now(),
   }
+  rememberInitialSessionLaunchPosition(placement.positionTicks)
+  return placement
 }
 
 // ── AUTH — based on the minimal example ──────────────────────────────────────
@@ -660,6 +672,7 @@ function resetTempoMasterSession() {
   projectConnected = false
   currentProjectId = null
   currentProjectBpm = null
+  sessionLaunchPositionTicks = null
   decks.forEach((_, deckIndex) => resetDeckTempoState(deckIndex as WaveformDeckIndex))
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
@@ -2631,33 +2644,32 @@ async function automaticGuardedTransportTicks(
 
 async function resolveDeckLaunchTarget(
   deckIndex: WaveformDeckIndex,
-  quantization: LaunchQuantization,
+  action: LaunchPositionAction,
   projectDocument: SyncedDocument,
   expectedSession: number,
 ) {
-  const exactBar = quantization === 'exact-bar'
-    ? await showBarAssistant(deckIndex, 'exact-launch')
-    : undefined
-  if (quantization === 'exact-bar' && exactBar === null) return null
-  const guardedTicks = await automaticGuardedTransportTicks(
-    deckIndex,
-    projectDocument,
-    expectedSession,
-  )
-  if (guardedTicks === null) {
-    const targetBar = exactBar ?? await showBarAssistant(deckIndex, 'launch')
-    return targetBar === null ? null : barToPositionTicks(targetBar, Ticks.Bars(1))
+  if (action === 'reenter-bar' || sessionLaunchPositionTicks === null) {
+    const targetBar = await showBarAssistant(
+      deckIndex,
+      action === 'reenter-bar' ? 'reenter-launch' : 'launch',
+    )
+    if (targetBar === null) return null
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) {
+      throw new Error('Project connection changed during launch position entry')
+    }
+    return barToPositionTicks(targetBar, Ticks.Bars(1))
   }
-  const targetTicks = resolveLaunchTick(
-    quantization,
-    guardedTicks,
+
+  return moveLaunchPosition(
+    sessionLaunchPositionTicks,
+    action,
+    Ticks.Beat,
     Ticks.Bars(1),
-    exactBar ?? undefined,
   )
-  if (targetTicks === null) {
-    throw new Error(`Bar ${exactBar} is no longer beyond the guarded transport position`)
-  }
-  return targetTicks
 }
 
 async function resolveDeckStopTarget(
@@ -2821,7 +2833,7 @@ function replaceCrossfadeAutomation(
 async function mutateDeckCrossfade(
   incomingDeckIndex: WaveformDeckIndex,
   outgoingDeckIndex: WaveformDeckIndex,
-  quantization: LaunchQuantization,
+  action: LaunchPositionAction,
   fadeBars: number,
   expectedSession: number,
 ) {
@@ -2849,7 +2861,7 @@ async function mutateDeckCrossfade(
   }
   const targetTicks = await resolveDeckLaunchTarget(
     incomingDeckIndex,
-    quantization,
+    action,
     projectDocument,
     expectedSession,
   )
@@ -2925,12 +2937,16 @@ async function mutateDeckCrossfade(
       0,
     )
   }))
+  if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
+    throw new Error('Project connection changed after crossfade scheduling')
+  }
+  sessionLaunchPositionTicks = targetTicks
   return true
 }
 
 async function mutateDeckLaunch(
   deckIndex: WaveformDeckIndex,
-  quantization: LaunchQuantization,
+  action: LaunchPositionAction,
   expectedSession: number,
 ) {
   const projectDocument = nexus
@@ -2943,7 +2959,7 @@ async function mutateDeckLaunch(
   }
   const targetTicks = await resolveDeckLaunchTarget(
     deckIndex,
-    quantization,
+    action,
     projectDocument,
     expectedSession,
   )
@@ -2979,6 +2995,10 @@ async function mutateDeckLaunch(
     t.update(region.fields.region.fields.positionTicks, plan.positionTicks)
     t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
   }))
+  if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
+    throw new Error('Project connection changed after launch scheduling')
+  }
+  sessionLaunchPositionTicks = targetTicks
   return true
 }
 
@@ -4552,18 +4572,22 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const gainVal = document.getElementById(`${prefix}-gain-val`) as HTMLSpanElement | null
 
   transport.launch.addEventListener('click', () => {
-    const quantization = transport.quantization.value as LaunchQuantization
+    const action = transport.quantization.value as LaunchPositionAction
     if (
-      quantization !== 'next-bar'
-      && quantization !== 'next-phrase'
-      && quantization !== 'exact-bar'
+      action !== 'previous-beat'
+      && action !== 'next-beat'
+      && action !== 'previous-bar'
+      && action !== 'next-bar'
+      && action !== 'previous-four-bars'
+      && action !== 'next-four-bars'
+      && action !== 'reenter-bar'
     ) return
     const outgoingValue = transport.crossfadeFrom.value
     if (outgoingValue === '') {
       queueDeckTransportOperation(
         deckIndex,
         'launching',
-        (expectedSession) => mutateDeckLaunch(deckIndex, quantization, expectedSession),
+        (expectedSession) => mutateDeckLaunch(deckIndex, action, expectedSession),
       )
       return
     }
@@ -4575,7 +4599,7 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
       (expectedSession) => mutateDeckCrossfade(
         deckIndex,
         outgoingDeckIndex,
-        quantization,
+        action,
         fadeBars,
         expectedSession,
       ),

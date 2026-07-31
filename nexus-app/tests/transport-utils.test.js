@@ -7,6 +7,7 @@ import {
   guardedTransportTicks,
   matchProjectTabs,
   mergeTransportPositions,
+  moveLaunchPosition,
   parseTransportPosition,
   planRegionCancel,
   planRegionLaunch,
@@ -233,6 +234,41 @@ test('rounds to safe next-bar and four-bar phrase boundaries', () => {
   assert.throws(
     () => resolveLaunchTick('next-bar', Number.MAX_SAFE_INTEGER, bar),
     /safe tick range|boundary/,
+  )
+})
+
+test('moves a remembered launch position by beats, bars, and four-bar blocks', () => {
+  const beat = Ticks.Beat
+  const bar = Ticks.Bars(1)
+  const remembered = bar * 8 + beat * 2
+  assert.equal(moveLaunchPosition(remembered, 'previous-beat', beat, bar), remembered - beat)
+  assert.equal(moveLaunchPosition(remembered, 'next-beat', beat, bar), remembered + beat)
+  assert.equal(moveLaunchPosition(remembered, 'previous-bar', beat, bar), remembered - bar)
+  assert.equal(moveLaunchPosition(remembered, 'next-bar', beat, bar), remembered + bar)
+  assert.equal(
+    moveLaunchPosition(remembered, 'previous-four-bars', beat, bar),
+    remembered - bar * 4,
+  )
+  assert.equal(
+    moveLaunchPosition(remembered, 'next-four-bars', beat, bar),
+    remembered + bar * 4,
+  )
+})
+
+test('rejects remembered launch movement before bar 1 or beyond safe ticks', () => {
+  const beat = Ticks.Beat
+  const bar = Ticks.Bars(1)
+  assert.throws(
+    () => moveLaunchPosition(0, 'previous-beat', beat, bar),
+    /before bar 1/,
+  )
+  assert.throws(
+    () => moveLaunchPosition(Number.MAX_SAFE_INTEGER, 'next-beat', beat, bar),
+    /safe tick range/,
+  )
+  assert.throws(
+    () => moveLaunchPosition(bar, 'reenter-bar', beat, bar),
+    /Unknown launch position action/,
   )
 })
 

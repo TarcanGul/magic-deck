@@ -5,6 +5,14 @@ export const NEXUS_DELIVERY_GUARD_MS: 750
 export const TRANSPORT_TICKS_PER_BEAT: 3840
 
 export type LaunchQuantization = 'next-bar' | 'next-phrase' | 'exact-bar'
+export type LaunchPositionAction =
+  | 'previous-beat'
+  | 'next-beat'
+  | 'previous-bar'
+  | 'next-bar'
+  | 'previous-four-bars'
+  | 'next-four-bars'
+  | 'reenter-bar'
 
 export interface TransportPosition {
   bar: number
@@ -85,6 +93,12 @@ export function resolveLaunchTick(
   ticksPerBar: number,
   exactBar?: number,
 ): number | null
+export function moveLaunchPosition(
+  positionTicks: number,
+  action: Exclude<LaunchPositionAction, 'reenter-bar'>,
+  ticksPerBeat: number,
+  ticksPerBar: number,
+): number
 export function tickToBar(tick: number, ticksPerBar: number): number
 
 export type RegionLaunchPlan = {

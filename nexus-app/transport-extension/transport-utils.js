@@ -259,6 +259,35 @@ export function resolveLaunchTick(
   return target
 }
 
+export function moveLaunchPosition(
+  positionTicks,
+  action,
+  ticksPerBeat,
+  ticksPerBar,
+) {
+  if (!Number.isSafeInteger(positionTicks) || positionTicks < 0) {
+    throw new RangeError('Remembered launch ticks must be a non-negative whole number')
+  }
+  if (!Number.isSafeInteger(ticksPerBeat) || ticksPerBeat <= 0) {
+    throw new RangeError('Ticks per beat must be a positive whole number')
+  }
+  if (!Number.isSafeInteger(ticksPerBar) || ticksPerBar !== ticksPerBeat * 4) {
+    throw new RangeError('Ticks per bar must equal four beats')
+  }
+  const delta = {
+    'previous-beat': -ticksPerBeat,
+    'next-beat': ticksPerBeat,
+    'previous-bar': -ticksPerBar,
+    'next-bar': ticksPerBar,
+    'previous-four-bars': -ticksPerBar * 4,
+    'next-four-bars': ticksPerBar * 4,
+  }[action]
+  if (delta === undefined) throw new RangeError('Unknown launch position action')
+  const target = checkedAdd(positionTicks, delta, 'Launch position exceeds the safe tick range')
+  if (target < 0) throw new RangeError('Launch position cannot move before bar 1')
+  return target
+}
+
 export function tickToBar(tick, ticksPerBar) {
   if (!Number.isSafeInteger(tick) || tick < 0 || !Number.isSafeInteger(ticksPerBar) || ticksPerBar <= 0) {
     throw new RangeError('Tick and bar size must be safe non-negative values')
