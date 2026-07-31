@@ -35,21 +35,30 @@ import {
 } from './tempo-utils.js'
 import type { TempoRange } from './tempo-utils.js'
 import {
-  logicalRegionChainIds,
   planForwardTimelineInsertion,
   selectCanonicalRouting,
   selectLatestLogicalRegion,
 } from './deck-project-utils.js'
 import type { TimelineRegionSnapshot } from './deck-project-utils.js'
+import { staleOAuthCallbackUrl } from './auth-utils.js'
+import {
+  buildIndependentAudioRegionCopy,
+  cuePositionsFromSegments,
+  planAudioRegionSplit,
+  planResizedCueOffsets,
+} from './cue-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
 const REDIRECT_URL = 'http://127.0.0.1:5173/'
 const SCOPE = 'project:write sample:write'
+const OAUTH_STATE_STORAGE_KEY = `oidc_${CLIENT_ID}_oidc_state`
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface DeckState {
   audioCtx: AudioContext | null; audioBuffer: AudioBuffer | null
+  cueLoadId: number
+  audioFootprint: string | null; cuePoints: CuePointSlots; cuePosition: number; cueLoading: boolean
   fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
   tempoPercent: number; tempoRange: TempoRange; tempoSync: boolean
@@ -63,13 +72,21 @@ interface DeckState {
   mixerChannelEntity: NexusEntity<'mixerChannel'> | null; sampleEntity: NexusEntity<'sample'> | null
   automationCollectionEntity: NexusEntity<'automationCollection'> | null
   cableEntity: NexusEntity<'desktopAudioCable'> | null
+  fxGraph: DeckFxGraph | null
   contentSubscriptions: Terminable[]
   routingSubscriptions: Terminable[]
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
 type EqBand = 'hi' | 'mid' | 'low'
+type DeckFxKind = 'delay' | 'reverb' | 'distortion' | 'flanger'
 type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
+type CuePointSlots = [number | null, number | null, number | null, number | null, number | null]
+interface StoredCuePoints {
+  version: 1
+  audioFootprint: string
+  points: CuePointSlots
+}
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -132,6 +149,7 @@ interface AubioBpmResult {
 interface DeckOperationState {
   pendingCount: number
   activeKind: 'loading' | 'replacing' | 'unloading' | 'launching' | 'cancelling' | 'stopping' | 'generating' | null
+  uploading: boolean
   suppressProjectRemovalSync: boolean
 }
 interface ManualBpmReportState {
@@ -162,7 +180,21 @@ interface ResolvedDeckRoutingGraph {
   audioDevice: NexusEntity<'audioDevice'>
   mixerChannel: NexusEntity<'mixerChannel'>
   cable: NexusEntity<'desktopAudioCable'>
+  fxGraph: DeckFxGraph | null
   displayName: string
+}
+interface DeckFxGraph {
+  delay: NexusEntity<'stompboxDelay'>
+  reverb: NexusEntity<'stompboxReverb'>
+  distortion: NexusEntity<'stompboxTube'>
+  flanger: NexusEntity<'stompboxFlanger'> | NexusEntity<'stompboxChorus'>
+  cables: [
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+    NexusEntity<'desktopAudioCable'>,
+  ]
 }
 interface ResolvedDeckContentGraph {
   region: NexusEntity<'audioRegion'>
@@ -184,6 +216,7 @@ const MAX_SUPPORTED_BPM = 240
 const AUBIO_AUTO_ACCEPT_CONFIDENCE = 0.8
 const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 const DECK_PROJECT_NAMES = ['DECK 1', 'DECK 2', 'MAGIC DECK'] as const
+const CUE_STORAGE_PREFIX = 'magic-deck:cues:v1:'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
@@ -195,6 +228,8 @@ let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let barAssistantQueue: Promise<void> = Promise.resolve()
 let sessionLaunchPositionTicks: number | null = null
+let activeFxDeckIndex: WaveformDeckIndex | null = null
+let activeFxTrigger: HTMLButtonElement | null = null
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -213,14 +248,14 @@ const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
 ]
 const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
-  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
 ]
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -481,11 +516,21 @@ async function captureDeckInsertionPlacement(
 }
 
 // ── AUTH — based on the minimal example ──────────────────────────────────────
+function cleanStaleOAuthCallback() {
+  const expectedState = localStorage.getItem(OAUTH_STATE_STORAGE_KEY)
+  const cleanedUrl = staleOAuthCallbackUrl(window.location.href, expectedState)
+  if (cleanedUrl === null) return
+
+  console.warn('[AUTH] Removing stale OAuth callback parameters')
+  window.history.replaceState(window.history.state, document.title, cleanedUrl)
+}
+
 async function init() {
   setStatus('connecting', 'CHECKING AUTH STATE…')
   console.log('[INIT] Calling audiotool()…')
 
   try {
+    cleanStaleOAuthCallback()
     const result = await audiotool({
       clientId: CLIENT_ID,
       redirectUrl: REDIRECT_URL,
@@ -503,9 +548,6 @@ async function init() {
       audioCaptureRow.style.display = 'flex'
       btnConnect.disabled = false
       btnDisconnect.disabled = false
-      if (window.location.search.includes('code=')) {
-        window.history.replaceState({}, '', '/')
-      }
       if (inputProjectUrl.value.trim()) {
         await connectProject()
       }
@@ -644,6 +686,7 @@ async function connectProject() {
         updateSourceDeckUi(0)
         updateSourceDeckUi(1)
       }
+      renderDeckFxAvailability()
       decks.forEach((_, deckIndex) => renderTempoControls(deckIndex as WaveformDeckIndex))
       decks.forEach((_, deckIndex) => renderDeckTransport(deckIndex as WaveformDeckIndex))
       setStatus(connected ? 'connected' : 'error', connected ? 'SYNCED ↔ PROJECT ACTIVE' : 'CONNECTION LOST…')
@@ -653,6 +696,7 @@ async function connectProject() {
     if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
     projectConnected = projectDocument.connected.getValue()
     if (!projectConnected) throw new Error('Project connection was lost after initial sync')
+    renderDeckFxAvailability()
     await reconcileDecksFromProject(projectDocument, expectedSession)
     updateSourceDeckUi(0)
     updateSourceDeckUi(1)
@@ -664,6 +708,7 @@ async function connectProject() {
     projectConnected = false
     currentProjectId = null
     btnConnect.disabled = false
+    renderDeckFxAvailability()
   }
 }
 
@@ -673,6 +718,7 @@ function resetTempoMasterSession() {
   currentProjectId = null
   currentProjectBpm = null
   sessionLaunchPositionTicks = null
+  renderDeckFxAvailability()
   decks.forEach((_, deckIndex) => resetDeckTempoState(deckIndex as WaveformDeckIndex))
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
     resolve?.(null)
@@ -933,11 +979,11 @@ function resolveDeckRoutingGraphs(
   entities: EntityQuery,
   audioDevice: NexusEntity<'audioDevice'>,
 ): ResolvedDeckRoutingGraph[] {
-  const cableAndMixers = entities
-    .ofTypes('desktopAudioCable')
-    .get()
+  const cables = entities.ofTypes('desktopAudioCable').get()
+  const outputCables = cables
     .filter((candidate) =>
       candidate.fields.fromSocket.value.equals(audioDevice.fields.audioOutput.location))
+  const directCableAndMixers = outputCables
     .map((cable) => ({
       cable,
       mixerChannel: entities
@@ -948,18 +994,180 @@ function resolveDeckRoutingGraphs(
       cable: NexusEntity<'desktopAudioCable'>
       mixerChannel: NexusEntity<'mixerChannel'>
     } => candidate.mixerChannel !== undefined)
+    .map(({ cable, mixerChannel }) => ({ cable, mixerChannel, fxGraph: null }))
+
+  const fxCableAndMixers = outputCables.flatMap((inputCable) => {
+    const delay = entities
+      .ofTypes('stompboxDelay')
+      .getEntity(inputCable.fields.toSocket.value.entityId)
+    const delayCable = delay
+      ? cables.find((candidate) =>
+        candidate.fields.fromSocket.value.equals(delay.fields.audioOutput.location))
+      : undefined
+    const reverb = delayCable
+      ? entities.ofTypes('stompboxReverb').getEntity(delayCable.fields.toSocket.value.entityId)
+      : undefined
+    const reverbCable = reverb
+      ? cables.find((candidate) =>
+        candidate.fields.fromSocket.value.equals(reverb.fields.audioOutput.location))
+      : undefined
+    const distortion = reverbCable
+      ? entities.ofTypes('stompboxTube').getEntity(reverbCable.fields.toSocket.value.entityId)
+      : undefined
+    const distortionCable = distortion
+      ? cables.find((candidate) =>
+        candidate.fields.fromSocket.value.equals(distortion.fields.audioOutput.location))
+      : undefined
+    const flanger = distortionCable
+      ? entities.ofTypes('stompboxFlanger').getEntity(distortionCable.fields.toSocket.value.entityId)
+        ?? entities.ofTypes('stompboxChorus').getEntity(distortionCable.fields.toSocket.value.entityId)
+      : undefined
+    const outputCable = flanger
+      ? cables.find((candidate) =>
+        candidate.fields.fromSocket.value.equals(flanger.fields.audioOutput.location))
+      : undefined
+    const mixerChannel = outputCable
+      ? entities.ofTypes('mixerChannel').getEntity(outputCable.fields.toSocket.value.entityId)
+      : undefined
+    if (
+      !delay
+      || !delayCable
+      || !reverb
+      || !reverbCable
+      || !distortion
+      || !distortionCable
+      || !flanger
+      || !outputCable
+      || !mixerChannel
+    ) return []
+    return [{
+      cable: outputCable,
+      mixerChannel,
+      fxGraph: {
+        delay,
+        reverb,
+        distortion,
+        flanger,
+        cables: [inputCable, delayCable, reverbCable, distortionCable, outputCable],
+      } satisfies DeckFxGraph,
+    }]
+  })
+  const cableAndMixers = [...directCableAndMixers, ...fxCableAndMixers]
 
   return entities
     .ofTypes('audioTrack')
     .get()
     .filter((candidate) => candidate.fields.player.value.entityId === audioDevice.id)
-    .flatMap((track) => cableAndMixers.map(({ cable, mixerChannel }) => ({
+    .flatMap((track) => cableAndMixers.map(({ cable, mixerChannel, fxGraph }) => ({
       track,
       audioDevice,
       mixerChannel,
       cable,
+      fxGraph,
       displayName: audioDevice.fields.displayName.value,
     })))
+}
+
+function createDeckFxDevices(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  audioDevice: NexusEntity<'audioDevice'>,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+): { cable: NexusEntity<'desktopAudioCable'>; fxGraph: DeckFxGraph } {
+  const displayName = DECK_PROJECT_NAMES[deckIndex]
+  const delay = t.create('stompboxDelay', {
+    displayName: `${displayName} FX · DELAY`,
+    mix: 0,
+    isActive: false,
+  })
+  const reverb = t.create('stompboxReverb', {
+    displayName: `${displayName} FX · REVERB`,
+    mix: 0,
+    isActive: false,
+  })
+  const distortion = t.create('stompboxTube', {
+    displayName: `${displayName} FX · DISTORTION`,
+    drive: 0.1,
+    isActive: false,
+  })
+  const flanger = t.create('stompboxFlanger', {
+    displayName: `${displayName} FX · FLANGER`,
+    delayTimeMs: 3,
+    feedbackFactor: 0,
+    lfoFrequencyHz: 0.04,
+    lfoModulationDepth: 0,
+    isActive: false,
+  })
+  const inputCable = t.create('desktopAudioCable', {
+    fromSocket: audioDevice.fields.audioOutput.location,
+    toSocket: delay.fields.audioInput.location,
+  })
+  const delayCable = t.create('desktopAudioCable', {
+    fromSocket: delay.fields.audioOutput.location,
+    toSocket: reverb.fields.audioInput.location,
+  })
+  const reverbCable = t.create('desktopAudioCable', {
+    fromSocket: reverb.fields.audioOutput.location,
+    toSocket: distortion.fields.audioInput.location,
+  })
+  const distortionCable = t.create('desktopAudioCable', {
+    fromSocket: distortion.fields.audioOutput.location,
+    toSocket: flanger.fields.audioInput.location,
+  })
+  const outputCable = t.create('desktopAudioCable', {
+    fromSocket: flanger.fields.audioOutput.location,
+    toSocket: mixerChannel.fields.audioInput.location,
+  })
+
+  return {
+    cable: outputCable,
+    fxGraph: {
+      delay,
+      reverb,
+      distortion,
+      flanger,
+      cables: [inputCable, delayCable, reverbCable, distortionCable, outputCable],
+    },
+  }
+}
+
+function createDeckFxGraph(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  routing: ResolvedDeckRoutingGraph,
+): ResolvedDeckRoutingGraph {
+  // Nexus validates each cable immediately, so free the single-input socket first.
+  t.remove(routing.cable)
+  const fxRouting = createDeckFxDevices(
+    t,
+    deckIndex,
+    routing.audioDevice,
+    routing.mixerChannel,
+  )
+  return { ...routing, ...fxRouting }
+}
+
+async function ensureDeckFxGraph(
+  projectDocument: SyncedDocument,
+  deckIndex: WaveformDeckIndex,
+  expectedSession: number,
+) {
+  if (
+    nexus !== projectDocument
+    || !projectConnected
+    || expectedSession !== tempoSessionId
+  ) throw new Error('Connect an Audiotool project before opening FX')
+
+  return projectDocument.modify((t) => {
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) throw new Error('Project connection changed while opening FX')
+    const routing = reusableDeckGraphs(t.entities, deckIndex)[0]?.routing
+    if (!routing) throw new Error(`${placementDeckLabel(deckIndex)} routing is unavailable`)
+    return routing.fxGraph ? routing : createDeckFxGraph(t, deckIndex, routing)
+  })
 }
 
 function resolveDeckContentGraph(
@@ -1053,11 +1261,8 @@ function createDeckRoutingGraph(
       orderAmongStrips: nextMixerChannelOrder(t.entities),
     },
   })
-  const cable = t.create('desktopAudioCable', {
-    fromSocket: audioDevice.fields.audioOutput.location,
-    toSocket: mixerChannel.fields.audioInput.location,
-  })
-  return { track, audioDevice, mixerChannel, cable, displayName }
+  const fxRouting = createDeckFxDevices(t, deckIndex, audioDevice, mixerChannel)
+  return { track, audioDevice, mixerChannel, ...fxRouting, displayName }
 }
 
 async function ensureDeckRoutingGraph(
@@ -1077,8 +1282,16 @@ async function ensureDeckRoutingGraph(
       || !projectConnected
       || expectedSession !== tempoSessionId
     ) throw new Error('Project connection changed during deck provisioning')
-    return reusableDeckGraphs(t.entities, deckIndex)[0]
-      ?? { routing: createDeckRoutingGraph(t, deckIndex), content: null }
+    const reusable = reusableDeckGraphs(t.entities, deckIndex)[0]
+    if (!reusable) {
+      return { routing: createDeckRoutingGraph(t, deckIndex), content: null }
+    }
+    return reusable.routing.fxGraph
+      ? reusable
+      : {
+        ...reusable,
+        routing: createDeckFxGraph(t, deckIndex, reusable.routing),
+      }
   })
 }
 
@@ -1099,10 +1312,22 @@ function isDeckGraphCurrent(
 
 function hydrateRestoredProjectControls(
   deckIndex: WaveformDeckIndex,
+  entities: EntityQuery,
   mixerChannel: NexusEntity<'mixerChannel'>,
 ) {
   const deck = decks[deckIndex]
-  deck.volume = Math.max(0, Math.min(1, mixerChannel.fields.faderParameters.fields.postGain.value))
+  const automatedVolume = getOwnedDeckVolumeAutomationValue(
+    entities,
+    deckIndex,
+    mixerChannel,
+  )
+  deck.volume = Math.max(
+    0,
+    Math.min(
+      1,
+      automatedVolume ?? mixerChannel.fields.faderParameters.fields.postGain.value,
+    ),
+  )
   deck.gainTrim = Math.max(1, Math.min(2, mixerChannel.fields.preGain.value / PROJECT_PRE_GAIN_BASE))
 
   const volumeSlider = el<HTMLInputElement>(`d${deckIndex + 1}-vol`)
@@ -1146,12 +1371,13 @@ async function restoreSourceDecksFromProject(
   if (isSupportedBpm(projectBpm)) currentProjectBpm = projectBpm
 
   for (const deckIndex of [0, 1] as const) {
-    const selected = await ensureDeckRoutingGraph(projectDocument, deckIndex, expectedSession)
+    const selected = reusableDeckGraphs(projectDocument.queryEntities, deckIndex)[0]
     if (
       nexus !== projectDocument
       || !projectConnected
       || expectedSession !== tempoSessionId
     ) return
+    if (!selected) continue
     bindDeckRoutingGraph(deckIndex, projectDocument, selected.routing, expectedSession)
     if (!selected.content) continue
 
@@ -1181,6 +1407,7 @@ async function restoreSourceDecksFromProject(
     deck.sampleMeta = sampleMeta
     bindDeckContentGraph(deckIndex, projectDocument, selected.content, expectedSession)
     updateSourceDeckUi(deckIndex)
+    void initializeDeckCues(deckIndex, sampleMeta)
   }
 }
 
@@ -1235,12 +1462,13 @@ async function restoreMagicDeckFromProject(
     || expectedSession !== tempoSessionId
   ) return
 
-  const selected = await ensureDeckRoutingGraph(projectDocument, 2, expectedSession)
+  const selected = reusableDeckGraphs(projectDocument.queryEntities, 2)[0]
   if (
     nexus !== projectDocument
     || !projectConnected
     || expectedSession !== tempoSessionId
   ) return
+  if (!selected) return
   bindDeckRoutingGraph(2, projectDocument, selected.routing, expectedSession)
   if (!selected.content) return
 
@@ -1278,6 +1506,7 @@ async function restoreMagicDeckFromProject(
   magicWaveformPeaks = peaks
   bindDeckContentGraph(2, projectDocument, selected.content, expectedSession)
   updateDeckBpmLabel(2)
+  void initializeDeckCues(2, sampleMeta)
   if (peaks) {
     drawMagicPeakWaveform(peaks)
     setMagicStatus(
@@ -1328,6 +1557,7 @@ function clearDeckRoutingEntities(deck: DeckState) {
   deck.audioDeviceEntity = null
   deck.mixerChannelEntity = null
   deck.cableEntity = null
+  deck.fxGraph = null
 }
 
 function clearDeckProjectEntities(deck: DeckState) {
@@ -1360,6 +1590,623 @@ function formatDuration(seconds: number | null | undefined) {
   return `${minutes}:${String(roundedSeconds % 60).padStart(2, '0')}`
 }
 
+function emptyCuePoints(): CuePointSlots {
+  return [null, null, null, null, null]
+}
+
+function cueStorageKey(audioFootprint: string) {
+  return `${CUE_STORAGE_PREFIX}${audioFootprint}`
+}
+
+function validCuePosition(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 1
+}
+
+function loadStoredCuePoints(audioFootprint: string): CuePointSlots {
+  try {
+    const raw = sessionStorage.getItem(cueStorageKey(audioFootprint))
+    if (!raw) return emptyCuePoints()
+    const stored = JSON.parse(raw) as Partial<StoredCuePoints>
+    if (
+      stored.version !== 1
+      || stored.audioFootprint !== audioFootprint
+      || !Array.isArray(stored.points)
+      || stored.points.length !== 5
+      || !stored.points.every((point) => point === null || validCuePosition(point))
+    ) return emptyCuePoints()
+    return [...stored.points] as CuePointSlots
+  } catch (error) {
+    console.warn('[CUES] session restore:', error)
+    return emptyCuePoints()
+  }
+}
+
+function persistCuePoints(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  if (!deck.audioFootprint) return
+  const stored: StoredCuePoints = {
+    version: 1,
+    audioFootprint: deck.audioFootprint,
+    points: [...deck.cuePoints] as CuePointSlots,
+  }
+  try {
+    sessionStorage.setItem(cueStorageKey(deck.audioFootprint), JSON.stringify(stored))
+  } catch (error) {
+    console.warn('[CUES] session save:', error)
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUES COULD NOT BE SAVED IN THIS SESSION`)
+  }
+}
+
+function fallbackAudioHash(bytes: ArrayBuffer) {
+  const values = new Uint8Array(bytes)
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (const value of values) {
+    first = Math.imul(first ^ value, 0x01000193)
+    second = Math.imul(second ^ value, 0x85ebca6b)
+    second = (second << 13) | (second >>> 19)
+  }
+  const hex = (value: number) => (value >>> 0).toString(16).padStart(8, '0')
+  return `fallback-${values.byteLength.toString(16)}-${hex(first)}${hex(second)}`
+}
+
+async function hashAudioFootprint(bytes: ArrayBuffer) {
+  try {
+    const subtle = globalThis.crypto?.subtle
+    if (!subtle) return fallbackAudioHash(bytes)
+    const digest = await subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  } catch (error) {
+    console.warn('[CUES] SHA-256 unavailable, using deterministic fallback:', error)
+    return fallbackAudioHash(bytes)
+  }
+}
+
+async function sampleAudioFootprint(sampleMeta: SampleMeta) {
+  try {
+    const response = await fetch(sampleMeta.mp3Url)
+    if (!response.ok) throw new Error(`Audio request failed (${response.status})`)
+    const bytes = await response.arrayBuffer()
+    return await hashAudioFootprint(bytes)
+  } catch (audioError) {
+    console.warn('[CUES] audio fingerprint:', audioError)
+    const response = await fetch(sampleMeta.getWaveformUrl({ resolution: 3840, channel: 'both' }))
+    if (!response.ok) throw new Error(`Audio footprint request failed (${response.status})`)
+    const waveform = await response.text()
+    const canonical = new TextEncoder().encode(
+      `${sampleMeta.durationSeconds.toFixed(9)}\n${waveform}`,
+    )
+    return hashAudioFootprint(canonical.buffer as ArrayBuffer)
+  }
+}
+
+function formsCueCutBoundary(
+  left: NexusEntity<'audioRegion'>,
+  right: NexusEntity<'audioRegion'>,
+) {
+  const leftRegion = left.fields.region.fields
+  const rightRegion = right.fields.region.fields
+  return leftRegion.positionTicks.value + leftRegion.durationTicks.value
+      === rightRegion.positionTicks.value
+    && leftRegion.collectionOffsetTicks.value + leftRegion.durationTicks.value
+      === rightRegion.collectionOffsetTicks.value
+    && leftRegion.loopOffsetTicks.value === rightRegion.loopOffsetTicks.value
+    && leftRegion.loopDurationTicks.value === rightRegion.loopDurationTicks.value
+    && leftRegion.isEnabled.value === rightRegion.isEnabled.value
+    && leftRegion.colorIndex.value === rightRegion.colorIndex.value
+    && leftRegion.displayName.value === rightRegion.displayName.value
+    && left.fields.gain.value === right.fields.gain.value
+    && left.fields.timestretchMode.value === right.fields.timestretchMode.value
+    && left.fields.pitchShiftSemitones.value === right.fields.pitchShiftSemitones.value
+    && left.fields.fadeOutDurationTicks.value === 0
+    && right.fields.fadeInDurationTicks.value === 0
+}
+
+function contiguousAudioRegions(
+  entities: EntityQuery,
+  anchor: NexusEntity<'audioRegion'>,
+) {
+  const trackId = anchor.fields.track.value.entityId
+  const sampleId = anchor.fields.sample.value.entityId
+  const collectionId = anchor.fields.playbackAutomationCollection.value.entityId
+  const candidates = entities
+    .ofTypes('audioRegion')
+    .get()
+    .filter((region) =>
+      region.fields.track.value.entityId === trackId
+      && region.fields.sample.value.entityId === sampleId
+      && region.fields.playbackAutomationCollection.value.entityId === collectionId,
+    )
+    .sort((a, b) =>
+      a.fields.region.fields.positionTicks.value - b.fields.region.fields.positionTicks.value
+      || a.id.localeCompare(b.id))
+  const anchorIndex = candidates.findIndex((region) => region.id === anchor.id)
+  if (anchorIndex < 0) return []
+
+  let firstIndex = anchorIndex
+  while (firstIndex > 0) {
+    const previous = candidates[firstIndex - 1]
+    const current = candidates[firstIndex]
+    if (!formsCueCutBoundary(previous, current)) break
+    firstIndex -= 1
+  }
+  let lastIndex = anchorIndex
+  while (lastIndex < candidates.length - 1) {
+    const current = candidates[lastIndex]
+    const next = candidates[lastIndex + 1]
+    if (!formsCueCutBoundary(current, next)) break
+    lastIndex += 1
+  }
+  return candidates.slice(firstIndex, lastIndex + 1)
+}
+
+function resizeContiguousAudioRegions(
+  t: SafeTransactionBuilder,
+  regions: NexusEntity<'audioRegion'>[],
+  previousContentDurationTicks: number,
+  nextContentDurationTicks: number,
+  nextRegionDurationTicks = nextContentDurationTicks,
+  nextFirstPositionTicks?: number,
+) {
+  if (
+    regions.length === 0
+    || previousContentDurationTicks <= 0
+    || nextContentDurationTicks <= 0
+    || nextRegionDurationTicks <= 0
+  ) throw new Error('Cue-cut timing could not be resized')
+  const firstPositionTicks = regions[0].fields.region.fields.positionTicks.value
+  const resolvedFirstPositionTicks = nextFirstPositionTicks ?? firstPositionTicks
+  const last = regions.at(-1)!
+  const previousRegionDurationTicks =
+    last.fields.region.fields.positionTicks.value
+    + last.fields.region.fields.durationTicks.value
+    - firstPositionTicks
+  const scaleRegionTicks = (ticks: number) =>
+    Math.round((ticks / previousRegionDurationTicks) * nextRegionDurationTicks)
+  const firstRegionFields = regions[0].fields.region.fields
+  const firstCollectionOffsetTicks = firstRegionFields.collectionOffsetTicks.value
+  const firstLoopOffsetTicks = firstRegionFields.loopOffsetTicks.value
+
+  regions.forEach((region, index) => {
+    const fields = region.fields.region.fields
+    const previousStartTicks = fields.positionTicks.value - firstPositionTicks
+    const previousEndTicks = previousStartTicks + fields.durationTicks.value
+    const nextStartTicks = scaleRegionTicks(previousStartTicks)
+    const nextEndTicks = index === regions.length - 1
+      ? nextRegionDurationTicks
+      : scaleRegionTicks(previousEndTicks)
+    if (nextEndTicks <= nextStartTicks) {
+      throw new Error('Tempo change would collapse a cue-cut region')
+    }
+    t.update(fields.positionTicks, resolvedFirstPositionTicks + nextStartTicks)
+    t.update(fields.durationTicks, nextEndTicks - nextStartTicks)
+    const offsets = planResizedCueOffsets({
+      firstCollectionOffsetTicks,
+      firstLoopOffsetTicks,
+      loopDurationTicks: fields.loopDurationTicks.value,
+      previousContentDurationTicks,
+      nextContentDurationTicks,
+      nextStartTicks,
+    })
+    t.update(fields.collectionOffsetTicks, offsets.collectionOffsetTicks)
+    t.update(fields.loopOffsetTicks, offsets.loopOffsetTicks)
+    t.update(fields.loopDurationTicks, offsets.loopDurationTicks)
+  })
+}
+
+function audioRegionChainDuration(regions: NexusEntity<'audioRegion'>[]) {
+  const first = regions[0]
+  const last = regions.at(-1)
+  if (!first || !last) return 0
+  return last.fields.region.fields.positionTicks.value
+    + last.fields.region.fields.durationTicks.value
+    - first.fields.region.fields.positionTicks.value
+}
+
+function updateAudioRegionChainEnabled(
+  t: SafeTransactionBuilder,
+  regions: NexusEntity<'audioRegion'>[],
+  isEnabled: boolean,
+) {
+  regions.forEach((region) => {
+    if (region.fields.region.fields.isEnabled.value !== isEnabled) {
+      t.update(region.fields.region.fields.isEnabled, isEnabled)
+    }
+  })
+}
+
+function updateDeckRegionChainTiming(
+  t: SafeTransactionBuilder,
+  anchor: NexusEntity<'audioRegion'>,
+  nextPositionTicks: number,
+  nextDurationTicks: number,
+) {
+  const regions = contiguousAudioRegions(t.entities, anchor)
+  if (regions.length <= 1) {
+    t.update(anchor.fields.region.fields.positionTicks, nextPositionTicks)
+    t.update(anchor.fields.region.fields.durationTicks, nextDurationTicks)
+    return regions.length === 1 ? regions : [anchor]
+  }
+  const terminalEvent = getExpectedPlaybackTerminalEvent(t, anchor)
+  const contentDurationTicks = terminalEvent?.fields.positionTicks.value
+    ?? anchor.fields.region.fields.loopDurationTicks.value
+  resizeContiguousAudioRegions(
+    t,
+    regions,
+    contentDurationTicks,
+    contentDurationTicks,
+    nextDurationTicks,
+    nextPositionTicks,
+  )
+  return regions
+}
+
+function deckCueRegions(entities: EntityQuery, deckIndex: WaveformDeckIndex) {
+  const regionId = decks[deckIndex].regionEntity?.id
+  if (!regionId) return []
+  const anchor = entities.ofTypes('audioRegion').getEntity(regionId)
+  return anchor ? contiguousAudioRegions(entities, anchor) : []
+}
+
+function projectCuePositions(entities: EntityQuery, deckIndex: WaveformDeckIndex) {
+  return cuePositionsFromSegments(deckCueRegions(entities, deckIndex).map((region) => ({
+    id: region.id,
+    positionTicks: region.fields.region.fields.positionTicks.value,
+    durationTicks: region.fields.region.fields.durationTicks.value,
+  }))).slice(0, 5)
+}
+
+function reconcileCueSlots(
+  storedPoints: CuePointSlots,
+  authoritativePoints: number[],
+): CuePointSlots {
+  const reconciled = emptyCuePoints()
+  const remaining = [...authoritativePoints]
+  storedPoints.forEach((storedPoint, slot) => {
+    if (storedPoint === null) return
+    const closest = remaining
+      .map((point, index) => ({ difference: Math.abs(point - storedPoint), index }))
+      .sort((a, b) => a.difference - b.difference)[0]
+    const matchIndex = closest && closest.difference < 0.000_5
+      ? closest.index
+      : -1
+    if (matchIndex < 0) return
+    reconciled[slot] = remaining.splice(matchIndex, 1)[0]
+  })
+  remaining.forEach((point) => {
+    const emptySlot = reconciled.findIndex((candidate) => candidate === null)
+    if (emptySlot >= 0) reconciled[emptySlot] = point
+  })
+  return reconciled
+}
+
+function resetDeckCueState(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  deck.cueLoadId += 1
+  deck.audioFootprint = null
+  deck.cuePoints = emptyCuePoints()
+  deck.cuePosition = 0
+  deck.cueLoading = false
+  renderCueControls(deckIndex)
+}
+
+function formatCueTime(deckIndex: WaveformDeckIndex, position: number) {
+  const durationSeconds = decks[deckIndex].sampleMeta?.durationSeconds
+  if (!durationSeconds || !Number.isFinite(durationSeconds)) return '—'
+  return formatDuration(Math.min(durationSeconds, Math.max(0, position * durationSeconds)))
+}
+
+function getCueElements(deckIndex: WaveformDeckIndex) {
+  const prefix = `d${deckIndex + 1}-cue`
+  return {
+    module: el<HTMLDivElement>(`${prefix}-module`),
+    slider: el<HTMLInputElement>(`${prefix}-position`),
+    position: el<HTMLOutputElement>(`${prefix}-position-value`),
+    status: el<HTMLSpanElement>(`${prefix}-status`),
+    pads: Array.from({ length: 5 }, (_, slot) => ({
+      trigger: el<HTMLButtonElement>(`${prefix}-${slot + 1}`),
+      clear: el<HTMLButtonElement>(`${prefix}-${slot + 1}-clear`),
+    })),
+  }
+}
+
+function isCueDeckLoaded(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  return deck.sampleMeta !== null && deck.regionEntity !== null
+}
+
+function renderCueControls(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const controls = getCueElements(deckIndex)
+  const loaded = isCueDeckLoaded(deckIndex)
+  const ready = loaded && deck.audioFootprint !== null && !deck.cueLoading
+  controls.module.classList.toggle('is-disabled', !loaded)
+  controls.slider.disabled = !ready
+  controls.slider.value = String(Math.round(deck.cuePosition * 1000))
+  controls.position.value = formatCueTime(deckIndex, deck.cuePosition)
+  controls.status.textContent = deck.cueLoading
+    ? 'SYNCING PROJECT CUTS…'
+    : ready
+      ? 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
+      : loaded
+        ? 'CUES UNAVAILABLE'
+        : 'LOAD A TRACK TO ADD CUES'
+  controls.pads.forEach(({ trigger, clear }, slot) => {
+    const point = deck.cuePoints[slot]
+    trigger.disabled = !ready
+    trigger.classList.toggle('is-set', point !== null)
+    trigger.textContent = point === null
+      ? `CUE ${slot + 1}\nSET`
+      : `CUE ${slot + 1}\n${formatCueTime(deckIndex, point)}`
+    trigger.setAttribute(
+      'aria-label',
+      point === null
+        ? `Create Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, deck.cuePosition)}`
+        : `Select Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, point)}`,
+    )
+    clear.disabled = !ready || point === null
+    clear.classList.toggle('is-hidden', point === null)
+  })
+}
+
+async function initializeDeckCues(
+  deckIndex: WaveformDeckIndex,
+  sampleMeta: SampleMeta,
+) {
+  const deck = decks[deckIndex]
+  const loadId = ++deck.cueLoadId
+  deck.audioFootprint = null
+  deck.cuePoints = emptyCuePoints()
+  deck.cuePosition = 0
+  deck.cueLoading = true
+  renderCueControls(deckIndex)
+  try {
+    const audioFootprint = await sampleAudioFootprint(sampleMeta)
+    if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
+    deck.audioFootprint = audioFootprint
+    const storedPoints = loadStoredCuePoints(audioFootprint)
+    const authoritativePoints = nexus
+      ? projectCuePositions(nexus.queryEntities, deckIndex)
+      : []
+    deck.cuePoints = reconcileCueSlots(storedPoints, authoritativePoints)
+    persistCuePoints(deckIndex)
+  } catch (error) {
+    if (loadId !== deck.cueLoadId) return
+    console.warn(`[CUES] ${placementDeckLabel(deckIndex)} initialization:`, error)
+  } finally {
+    if (loadId === deck.cueLoadId) {
+      deck.cueLoading = false
+      renderCueControls(deckIndex)
+    }
+  }
+}
+
+async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
+  const deck = decks[deckIndex]
+  const projectDocument = nexus
+  const expectedSession = tempoSessionId
+  const regionId = deck.regionEntity?.id
+  if (!projectDocument || !projectConnected || !regionId) {
+    throw new Error('The synchronized Audiotool region is required')
+  }
+  const operationId = ++deck.cueLoadId
+  const requestedPosition = deck.cuePosition
+  deck.cueLoading = true
+  renderCueControls(deckIndex)
+  try {
+    const result = await serializeSourceTiming(() => projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+        || deck.regionEntity?.id !== regionId
+        || deck.cueLoadId !== operationId
+      ) throw new Error('Project connection changed before the cue cut')
+      const regions = deckCueRegions(t.entities, deckIndex)
+      if (regions.length === 0) throw new Error('The Audiotool region is no longer available')
+      const firstPositionTicks = regions[0].fields.region.fields.positionTicks.value
+      const last = regions.at(-1)!
+      const endPositionTicks =
+        last.fields.region.fields.positionTicks.value
+        + last.fields.region.fields.durationTicks.value
+      const fullDurationTicks = endPositionTicks - firstPositionTicks
+      const cutTicks = firstPositionTicks + Math.round(requestedPosition * fullDurationTicks)
+      if (cutTicks <= firstPositionTicks || cutTicks >= endPositionTicks) {
+        throw new Error('Move the cue away from the start or end of the region')
+      }
+      const existingCut = regions.find((region) =>
+        region.fields.region.fields.positionTicks.value === cutTicks)
+      if (existingCut) {
+        throw new Error('There is already an Audiotool cut at this position')
+      }
+      const containingRegion = regions.find((region) => {
+        const positionTicks = region.fields.region.fields.positionTicks.value
+        return cutTicks > positionTicks
+          && cutTicks < positionTicks + region.fields.region.fields.durationTicks.value
+      })
+      if (!containingRegion) throw new Error('Move the cue away from a region edge')
+      const regionFields = containingRegion.fields.region.fields
+      const split = planAudioRegionSplit({
+        positionTicks: regionFields.positionTicks.value,
+        durationTicks: regionFields.durationTicks.value,
+        collectionOffsetTicks: regionFields.collectionOffsetTicks.value,
+        loopOffsetTicks: regionFields.loopOffsetTicks.value,
+        loopDurationTicks: regionFields.loopDurationTicks.value,
+      }, cutTicks)
+      const originalFadeOutTicks = containingRegion.fields.fadeOutDurationTicks.value
+      const leftFadeInTicks = Math.min(
+        containingRegion.fields.fadeInDurationTicks.value,
+        split.leftDurationTicks,
+      )
+      const rightFadeOutTicks = Math.min(
+        originalFadeOutTicks,
+        split.right.durationTicks,
+      )
+      t.update(containingRegion.fields.fadeInDurationTicks, leftFadeInTicks)
+      t.update(containingRegion.fields.fadeOutDurationTicks, 0)
+      t.update(regionFields.durationTicks, split.leftDurationTicks)
+      t.create('audioRegion', buildIndependentAudioRegionCopy({
+        region: {
+          positionTicks: regionFields.positionTicks.value,
+          durationTicks: regionFields.durationTicks.value,
+          collectionOffsetTicks: regionFields.collectionOffsetTicks.value,
+          loopOffsetTicks: regionFields.loopOffsetTicks.value,
+          loopDurationTicks: regionFields.loopDurationTicks.value,
+          isEnabled: regionFields.isEnabled.value,
+          colorIndex: regionFields.colorIndex.value,
+          displayName: regionFields.displayName.value,
+        },
+        track: containingRegion.fields.track.value,
+        playbackAutomationCollection:
+          containingRegion.fields.playbackAutomationCollection.value,
+        sample: containingRegion.fields.sample.value,
+        gain: containingRegion.fields.gain.value,
+        fadeInDurationTicks: containingRegion.fields.fadeInDurationTicks.value,
+        fadeInSlope: containingRegion.fields.fadeInSlope.value,
+        fadeOutDurationTicks: originalFadeOutTicks,
+        fadeOutSlope: containingRegion.fields.fadeOutSlope.value,
+        timestretchMode: containingRegion.fields.timestretchMode.value,
+        pitchShiftSemitones: containingRegion.fields.pitchShiftSemitones.value,
+      }, {
+        region: split.right,
+        fadeInDurationTicks: 0,
+        fadeOutDurationTicks: rightFadeOutTicks,
+      }))
+      return { cuePosition: (cutTicks - firstPositionTicks) / fullDurationTicks }
+    }))
+    if (
+      nexus !== projectDocument
+      || expectedSession !== tempoSessionId
+      || deck.regionEntity?.id !== regionId
+      || deck.cueLoadId !== operationId
+    ) return
+    deck.cuePoints[slot] = result.cuePosition
+    deck.cuePosition = result.cuePosition
+    persistCuePoints(deckIndex)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT IN AUDIOTOOL AT ${formatCueTime(deckIndex, result.cuePosition)}`)
+  } finally {
+    if (deck.cueLoadId === operationId) {
+      deck.cueLoading = false
+      renderCueControls(deckIndex)
+    }
+  }
+}
+
+async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
+  const deck = decks[deckIndex]
+  const projectDocument = nexus
+  const expectedSession = tempoSessionId
+  const regionId = deck.regionEntity?.id
+  const cuePosition = deck.cuePoints[slot]
+  if (!projectDocument || !projectConnected || !regionId || cuePosition === null) {
+    throw new Error('The synchronized Audiotool cut is no longer available')
+  }
+  const operationId = ++deck.cueLoadId
+  deck.cueLoading = true
+  renderCueControls(deckIndex)
+  try {
+    const authoritativePoints = await serializeSourceTiming(() => projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+        || deck.regionEntity?.id !== regionId
+        || deck.cueLoadId !== operationId
+      ) throw new Error('Project connection changed before joining the cue cut')
+      const regions = deckCueRegions(t.entities, deckIndex)
+      const firstPositionTicks = regions[0]?.fields.region.fields.positionTicks.value
+      const last = regions.at(-1)
+      if (firstPositionTicks === undefined || !last) {
+        throw new Error('The Audiotool regions are no longer available')
+      }
+      const endPositionTicks =
+        last.fields.region.fields.positionTicks.value
+        + last.fields.region.fields.durationTicks.value
+      const fullDurationTicks = endPositionTicks - firstPositionTicks
+      const closestCut = regions
+        .slice(1)
+        .map((region, index) => ({
+          difference: Math.abs(
+            (region.fields.region.fields.positionTicks.value - firstPositionTicks)
+              / fullDurationTicks
+              - cuePosition,
+          ),
+          rightIndex: index + 1,
+        }))
+        .sort((a, b) => a.difference - b.difference)[0]
+      const rightIndex = closestCut && closestCut.difference < 0.000_5
+        ? closestCut.rightIndex
+        : -1
+      if (rightIndex <= 0) throw new Error('The Audiotool cut was changed or removed')
+      const left = regions[rightIndex - 1]
+      const right = regions[rightIndex]
+      const mergedDurationTicks =
+        left.fields.region.fields.durationTicks.value
+        + right.fields.region.fields.durationTicks.value
+      t.update(
+        left.fields.region.fields.durationTicks,
+        mergedDurationTicks,
+      )
+      t.update(left.fields.fadeOutDurationTicks, right.fields.fadeOutDurationTicks.value)
+      t.remove(right)
+      const remaining = regions.filter((region) => region.id !== right.id)
+      return cuePositionsFromSegments(remaining.map((region) => ({
+        id: region.id,
+        positionTicks: region.fields.region.fields.positionTicks.value,
+        durationTicks: region.id === left.id
+          ? mergedDurationTicks
+          : region.fields.region.fields.durationTicks.value,
+      }))).slice(0, 5)
+    }))
+    if (
+      nexus !== projectDocument
+      || expectedSession !== tempoSessionId
+      || deck.regionEntity?.id !== regionId
+      || deck.cueLoadId !== operationId
+    ) return
+    deck.cuePoints[slot] = null
+    deck.cuePoints = reconcileCueSlots(deck.cuePoints, authoritativePoints)
+    persistCuePoints(deckIndex)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT JOINED IN AUDIOTOOL`)
+  } finally {
+    if (deck.cueLoadId === operationId) {
+      deck.cueLoading = false
+      renderCueControls(deckIndex)
+    }
+  }
+}
+
+function setupCueControls(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const controls = getCueElements(deckIndex)
+  controls.slider.addEventListener('input', () => {
+    deck.cuePosition = Number(controls.slider.value) / 1000
+    renderCueControls(deckIndex)
+  })
+  controls.pads.forEach(({ trigger, clear }, slot) => {
+    trigger.addEventListener('click', () => {
+      const point = deck.cuePoints[slot]
+      if (point === null) {
+        void createProjectCueCut(deckIndex, slot).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE CUT FAILED — ${message}`)
+        })
+        return
+      }
+      deck.cuePosition = point
+      renderCueControls(deckIndex)
+      setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SELECTED — PLAYBACK REMAINS IN AUDIOTOOL`)
+    })
+    clear.addEventListener('click', () => {
+      void removeProjectCueCut(deckIndex, slot).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE JOIN FAILED — ${message}`)
+      })
+    })
+  })
+  renderCueControls(deckIndex)
+}
+
 function updateSourceDeckUi(deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
   const operation = deckOperationStates[deckIndex]
@@ -1370,10 +2217,13 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const metadataBpm = el<HTMLElement>(`drop${deckIndex + 1}-bpm`)
   const metadataDuration = el<HTMLElement>(`drop${deckIndex + 1}-duration`)
   const unload = el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`)
+  const uploadIndicator = el<HTMLDivElement>(`deck${deckIndex + 1}-upload-indicator`)
 
   zone.classList.toggle('loaded', loaded)
   zone.classList.toggle('pending', pending)
   zone.setAttribute('aria-busy', String(pending))
+  el(`deck-${deckIndex + 1}`).setAttribute('aria-busy', String(operation.uploading))
+  uploadIndicator.hidden = !operation.uploading
   filename.textContent = loaded ? deck.fileName ?? '' : ''
   const bpm = loaded ? normalizeBpm(deck.sampleBpm ?? deck.baseBpm) : null
   metadataBpm.textContent = bpm === null ? '—' : String(bpm)
@@ -1382,11 +2232,13 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   unload.disabled = pending || !projectConnected
   renderTempoControls(deckIndex)
   renderDeckTransport(deckIndex)
+  renderCueControls(deckIndex)
   updateManualBpmReportUi(deckIndex)
 }
 
 function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
   const deck = decks[deckIndex]
+  resetDeckCueState(deckIndex)
   deck.audioBuffer = null
   deck.fileName = null
   deck.baseBpm = null
@@ -1395,6 +2247,7 @@ function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
 
 function clearMagicDeckLocalMedia() {
   const magicDeck = decks[2]
+  resetDeckCueState(2)
   magicDeck.audioBuffer = null
   magicDeck.fileName = null
   magicDeck.baseBpm = null
@@ -1481,7 +2334,13 @@ function getExpectedPlaybackTerminalEvent(
     .filter((candidate) =>
       candidate.fields.playbackAutomationCollection.value.entityId === collectionId,
     )
-  if (regionUsers.length !== 1 || regionUsers[0].id !== region.id) return null
+  const contiguousUsers = contiguousAudioRegions(t.entities, region)
+  if (
+    !regionUsers.some((candidate) => candidate.id === region.id)
+    || regionUsers.length !== contiguousUsers.length
+    || regionUsers.some((candidate) =>
+      !contiguousUsers.some((contiguous) => contiguous.id === candidate.id))
+  ) return null
   const events = t.entities
     .ofTypes('automationEvent')
     .get()
@@ -1682,6 +2541,20 @@ function applyNativeSourceTiming(
   }
 
   const previousFullDurationTicks = terminalEvent.fields.positionTicks.value
+  const contiguousRegions = contiguousAudioRegions(t.entities, region)
+  if (contiguousRegions.length > 1) {
+    resizeContiguousAudioRegions(
+      t,
+      contiguousRegions,
+      previousFullDurationTicks,
+      durationTicks,
+    )
+    t.update(terminalEvent.fields.positionTicks, durationTicks)
+    contiguousRegions.forEach((candidate) => {
+      t.update(candidate.fields.timestretchMode, 2)
+    })
+    return { durationTicks, replacementRegion: null }
+  }
   const previousRegionDurationTicks = region.fields.region.fields.durationTicks.value
   const regionDurationTicks = previousRegionDurationTicks < previousFullDurationTicks
     ? Math.min(previousRegionDurationTicks, durationTicks)
@@ -1719,6 +2592,23 @@ function applyMagicTempoTiming(
       regionDurationTicks,
     )
     return { durationTicks, replacementRegion: replacement.region }
+  }
+
+  const previousFullDurationTicks = terminalEvent.fields.positionTicks.value
+  const contiguousRegions = contiguousAudioRegions(t.entities, region)
+  if (contiguousRegions.length > 1) {
+    resizeContiguousAudioRegions(
+      t,
+      contiguousRegions,
+      previousFullDurationTicks,
+      durationTicks,
+      regionDurationTicks,
+    )
+    t.update(terminalEvent.fields.positionTicks, durationTicks)
+    contiguousRegions.forEach((candidate) => {
+      t.update(candidate.fields.timestretchMode, 2)
+    })
+    return { durationTicks, replacementRegion: null }
   }
 
   if (
@@ -1928,18 +2818,28 @@ function updateMagicLoopDurationInTransaction(
   if (!magicRegion) return
   const durationTicks = durationTicksOverride
     ?? getMagicLoopDurationTicks(t, durationOverrides)
+  const magicRegions = contiguousAudioRegions(t.entities, magicRegion)
+  const currentRegionDurationTicks = audioRegionChainDuration(magicRegions)
   const regionDurationTicks = preservedStopEndTicks === null || preservedStopEndTicks === undefined
     ? durationTicks
     : Math.min(
         durationTicks,
         Math.max(0, preservedStopEndTicks - magicRegion.fields.region.fields.positionTicks.value),
       )
-  if (magicRegion.fields.region.fields.durationTicks.value !== regionDurationTicks) {
-    t.update(magicRegion.fields.region.fields.durationTicks, regionDurationTicks)
+  if (currentRegionDurationTicks !== regionDurationTicks) {
+    updateDeckRegionChainTiming(
+      t,
+      magicRegion,
+      magicRegions[0]?.fields.region.fields.positionTicks.value
+        ?? magicRegion.fields.region.fields.positionTicks.value,
+      regionDurationTicks,
+    )
   }
-  if (magicRegion.fields.timestretchMode.value !== 2) {
-    t.update(magicRegion.fields.timestretchMode, 2)
-  }
+  magicRegions.forEach((region) => {
+    if (region.fields.timestretchMode.value !== 2) {
+      t.update(region.fields.timestretchMode, 2)
+    }
+  })
 }
 
 function getMagicScheduledStopEndTicks(t: SafeTransactionBuilder) {
@@ -1947,10 +2847,12 @@ function getMagicScheduledStopEndTicks(t: SafeTransactionBuilder) {
   if (!magicRegionId) return null
   const magicRegion = t.entities.ofTypes('audioRegion').getEntity(magicRegionId)
   if (!magicRegion || !magicRegion.fields.region.fields.isEnabled.value) return null
+  const magicRegions = contiguousAudioRegions(t.entities, magicRegion)
   const fullDurationTicks = getMagicLoopDurationTicks(t)
-  const durationTicks = magicRegion.fields.region.fields.durationTicks.value
+  const durationTicks = audioRegionChainDuration(magicRegions)
   return durationTicks < fullDurationTicks
-    ? magicRegion.fields.region.fields.positionTicks.value + durationTicks
+    ? (magicRegions[0]?.fields.region.fields.positionTicks.value
+        ?? magicRegion.fields.region.fields.positionTicks.value) + durationTicks
     : null
 }
 
@@ -2453,16 +3355,11 @@ function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: S
   const audioDevice = t.entities.ofTypes('audioDevice').getEntity(audioDeviceId)
   if (!audioDevice) throw new Error('Inserted audio device was not found')
 
-  const cable = t.entities
-    .ofTypes('desktopAudioCable')
-    .get()
-    .find((candidate) => candidate.fields.fromSocket.value.equals(audioDevice.fields.audioOutput.location))
-  if (!cable) throw new Error('Inserted mixer cable was not found')
+  const routing = resolveDeckRoutingGraphs(t.entities, audioDevice)
+    .find((candidate) => candidate.track.id === track.id)
+  if (!routing) throw new Error('Inserted deck routing was not found')
 
-  const mixerChannel = t.entities.ofTypes('mixerChannel').getEntity(cable.fields.toSocket.value.entityId)
-  if (!mixerChannel) throw new Error('Inserted mixer channel was not found')
-
-  return { track, audioDevice, mixerChannel, sample, automationCollection, cable }
+  return { ...routing, sample, automationCollection }
 }
 
 function getMagicLoopDurationTicks(
@@ -2576,8 +3473,12 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
     controls.status.textContent = 'READY'
     return
   }
-  const positionTicks = region.fields.region.fields.positionTicks.value
-  const durationTicks = region.fields.region.fields.durationTicks.value
+  const regions = nexus
+    ? contiguousAudioRegions(nexus.queryEntities, region)
+    : [region]
+  const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
+    ?? region.fields.region.fields.positionTicks.value
+  const durationTicks = audioRegionChainDuration(regions)
   const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
   if (fullDurationTicks !== null && durationTicks < fullDurationTicks) {
     controls.status.textContent = `STOP · BAR ${tickToBar(positionTicks + durationTicks, Ticks.Bars(1))}`
@@ -2718,6 +3619,160 @@ async function resolveDeckCancelPosition(
 
 function crossfadeAutomationName(deckIndex: WaveformDeckIndex) {
   return `MAGIC DECK CROSSFADE ${deckIndex === 0 ? 'A' : deckIndex === 1 ? 'B' : 'MAGIC'}`
+}
+
+function deckVolumeAutomationName(deckIndex: WaveformDeckIndex) {
+  return `MAGIC DECK VOLUME ${deckIndex === 0 ? 'A' : deckIndex === 1 ? 'B' : 'MAGIC'}`
+}
+
+function inspectDeckVolumeAutomation(
+  entities: EntityQuery,
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+) {
+  const expectedName = deckVolumeAutomationName(deckIndex)
+  const target = mixerChannel.fields.faderParameters.fields.postGain.location
+  const targetTracks = entities
+    .ofTypes('automationTrack')
+    .get()
+    .filter((track) => track.fields.automatedParameter.value.equals(target))
+  const ownedTracks = targetTracks.filter((track) => {
+    const regions = entities
+      .ofTypes('automationRegion')
+      .get()
+      .filter((region) => region.fields.track.value.entityId === track.id)
+    return regions.length > 0 && regions.every((region) =>
+      region.fields.region.fields.displayName.value === expectedName,
+    )
+  })
+  return {
+    conflict: targetTracks.length > 1
+      || (targetTracks.length === 1 && ownedTracks.length !== 1),
+    ownedTrack: ownedTracks.length === 1 ? ownedTracks[0] : null,
+  }
+}
+
+function getOwnedDeckVolumeAutomationValue(
+  entities: EntityQuery,
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+) {
+  const inspection = inspectDeckVolumeAutomation(entities, deckIndex, mixerChannel)
+  if (inspection.conflict || !inspection.ownedTrack) return null
+  const expectedName = deckVolumeAutomationName(deckIndex)
+  const regions = entities
+    .ofTypes('automationRegion')
+    .get()
+    .filter((region) =>
+      region.fields.track.value.entityId === inspection.ownedTrack!.id
+      && region.fields.region.fields.displayName.value === expectedName
+      && region.fields.region.fields.positionTicks.value === 0,
+    )
+  if (regions.length !== 1) return null
+  const collectionId = regions[0].fields.collection.value.entityId
+  const startEvents = entities
+    .ofTypes('automationEvent')
+    .get()
+    .filter((event) =>
+      event.fields.collection.value.entityId === collectionId
+      && event.fields.positionTicks.value === 0,
+    )
+  return startEvents.length === 1 ? startEvents[0].fields.value.value : null
+}
+
+function replaceDeckVolumeAutomation(
+  t: SafeTransactionBuilder,
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+  region: NexusEntity<'audioRegion'>,
+  value: number,
+) {
+  const inspection = inspectDeckVolumeAutomation(t.entities, deckIndex, mixerChannel)
+  if (inspection.conflict) {
+    throw new Error(
+      `${placementDeckLabel(deckIndex)} volume already has user automation; volume recording is unavailable`,
+    )
+  }
+  const displayName = deckVolumeAutomationName(deckIndex)
+  const target = mixerChannel.fields.faderParameters.fields.postGain
+  const track = inspection.ownedTrack ?? t.create('automationTrack', {
+    orderAmongTracks: nextTrackOrder(t.entities),
+    automatedParameter: target.location,
+  })
+  const ownedRegions = t.entities
+    .ofTypes('automationRegion')
+    .get()
+    .filter((candidate) =>
+      candidate.fields.track.value.entityId === track.id
+      && candidate.fields.region.fields.displayName.value === displayName,
+    )
+  const regionEndTicks =
+    region.fields.region.fields.positionTicks.value
+    + region.fields.region.fields.durationTicks.value
+  if (!Number.isSafeInteger(regionEndTicks)) {
+    throw new Error('Deck volume automation exceeds the safe tick range')
+  }
+  const durationTicks = Math.max(Ticks.Bars(1), regionEndTicks)
+  if (ownedRegions.length === 1) {
+    const ownedRegion = ownedRegions[0]
+    const collectionId = ownedRegion.fields.collection.value.entityId
+    const events = t.entities
+      .ofTypes('automationEvent')
+      .get()
+      .filter((event) => event.fields.collection.value.entityId === collectionId)
+    const startEvents = events.filter((event) => event.fields.positionTicks.value === 0)
+    const terminalEvents = events.filter((event) => event.fields.positionTicks.value > 0)
+    if (startEvents.length === 1 && terminalEvents.length === 1) {
+      t.update(ownedRegion.fields.region.fields.positionTicks, 0)
+      t.update(ownedRegion.fields.region.fields.durationTicks, durationTicks)
+      t.update(ownedRegion.fields.region.fields.loopDurationTicks, durationTicks)
+      t.update(ownedRegion.fields.region.fields.isEnabled, true)
+      t.update(startEvents[0].fields.value, value)
+      t.update(startEvents[0].fields.interpolation, 1)
+      t.update(terminalEvents[0].fields.positionTicks, durationTicks)
+      t.update(terminalEvents[0].fields.value, value)
+      t.update(terminalEvents[0].fields.interpolation, 1)
+      t.update(target, value)
+      return
+    }
+  }
+  ownedRegions.forEach((ownedRegion) => {
+    const collectionId = ownedRegion.fields.collection.value.entityId
+    const collection = t.entities.ofTypes('automationCollection').getEntity(collectionId)
+    const events = t.entities
+      .ofTypes('automationEvent')
+      .get()
+      .filter((event) => event.fields.collection.value.entityId === collectionId)
+    t.remove(ownedRegion)
+    events.forEach((event) => t.remove(event))
+    if (collection) t.remove(collection)
+  })
+
+  const collection = t.create('automationCollection', {})
+  t.create('automationEvent', {
+    collection: collection.location,
+    positionTicks: 0,
+    value,
+    interpolation: 1,
+  })
+  t.create('automationEvent', {
+    collection: collection.location,
+    positionTicks: durationTicks,
+    value,
+    interpolation: 1,
+  })
+  t.create('automationRegion', {
+    collection: collection.location,
+    track: track.location,
+    region: {
+      positionTicks: 0,
+      durationTicks,
+      loopDurationTicks: durationTicks,
+      displayName,
+      isEnabled: true,
+    },
+  })
+  t.update(target, value)
 }
 
 function inspectGainAutomation(
@@ -2898,15 +3953,23 @@ async function mutateDeckCrossfade(
       getDeckFullDurationTicks(t, incomingDeckIndex, incomingRegion),
       targetTicks,
     )
-    t.update(incomingRegion.fields.region.fields.durationTicks, incomingPlan.durationTicks)
-    t.update(incomingRegion.fields.region.fields.positionTicks, incomingPlan.positionTicks)
-    t.update(incomingRegion.fields.region.fields.isEnabled, incomingPlan.isEnabled)
+    const incomingRegions = updateDeckRegionChainTiming(
+      t,
+      incomingRegion,
+      incomingPlan.positionTicks,
+      incomingPlan.durationTicks,
+    )
+    updateAudioRegionChainEnabled(t, incomingRegions, incomingPlan.isEnabled)
 
     const fadeEndTicks = targetTicks + fadeDurationTicks
     if (!Number.isSafeInteger(fadeEndTicks)) throw new Error('Crossfade boundary exceeds the safe tick range')
+    const outgoingRegions = contiguousAudioRegions(t.entities, outgoingRegion)
+    const outgoingPositionTicks =
+      outgoingRegions[0]?.fields.region.fields.positionTicks.value
+      ?? outgoingRegion.fields.region.fields.positionTicks.value
     const outgoingPlan = planRegionStop(
-      outgoingRegion.fields.region.fields.positionTicks.value,
-      outgoingRegion.fields.region.fields.durationTicks.value,
+      outgoingPositionTicks,
+      audioRegionChainDuration(outgoingRegions),
       getDeckFullDurationTicks(t, outgoingDeckIndex, outgoingRegion),
       true,
       targetTicks,
@@ -2916,7 +3979,12 @@ async function mutateDeckCrossfade(
       throw new Error('The outgoing deck has not begun by the crossfade boundary')
     }
     if (outgoingPlan.kind === 'stop') {
-      t.update(outgoingRegion.fields.region.fields.durationTicks, outgoingPlan.durationTicks)
+      updateDeckRegionChainTiming(
+        t,
+        outgoingRegion,
+        outgoingPositionTicks,
+        outgoingPlan.durationTicks,
+      )
     }
     replaceCrossfadeAutomation(
       t,
@@ -2991,9 +4059,13 @@ async function mutateDeckLaunch(
       getDeckFullDurationTicks(t, deckIndex, region),
       targetTicks,
     )
-    t.update(region.fields.region.fields.durationTicks, plan.durationTicks)
-    t.update(region.fields.region.fields.positionTicks, plan.positionTicks)
-    t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+    const regions = updateDeckRegionChainTiming(
+      t,
+      region,
+      plan.positionTicks,
+      plan.durationTicks,
+    )
+    updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
   }))
   if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
     throw new Error('Project connection changed after launch scheduling')
@@ -3026,11 +4098,14 @@ async function mutateDeckCancel(deckIndex: WaveformDeckIndex, expectedSession: n
     if (!region || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region changed before cancellation')
     }
-    const plan = planRegionCancel(region.fields.region.fields.positionTicks.value, guardedTicks)
+    const regions = contiguousAudioRegions(t.entities, region)
+    const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
+      ?? region.fields.region.fields.positionTicks.value
+    const plan = planRegionCancel(positionTicks, guardedTicks)
     if (plan.kind === 'refuse') {
       throw new Error('Launch boundary reached — use Stop Next Bar')
     }
-    t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+    updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
   }))
   return true
 }
@@ -3059,18 +4134,21 @@ async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: num
     if (!region || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region changed before stop scheduling')
     }
+    const regions = contiguousAudioRegions(t.entities, region)
+    const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
+      ?? region.fields.region.fields.positionTicks.value
     const plan = planRegionStop(
-      region.fields.region.fields.positionTicks.value,
-      region.fields.region.fields.durationTicks.value,
+      positionTicks,
+      audioRegionChainDuration(regions),
       getDeckFullDurationTicks(t, deckIndex, region),
       region.fields.region.fields.isEnabled.value,
       transport.guardedTicks,
       transport.targetTicks,
     )
     if (plan.kind === 'cancel') {
-      t.update(region.fields.region.fields.isEnabled, plan.isEnabled)
+      updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
     } else if (plan.kind === 'stop') {
-      t.update(region.fields.region.fields.durationTicks, plan.durationTicks)
+      updateDeckRegionChainTiming(t, region, positionTicks, plan.durationTicks)
     }
   }))
   return true
@@ -3195,6 +4273,19 @@ function watchDeckRouting(
 ) {
   const deck = decks[deckIndex]
   deck.routingSubscriptions.push(
+    projectDocument.events.onUpdate(
+      routing.mixerChannel.fields.faderParameters.fields.postGain,
+      (volume) => {
+        if (
+          nexus !== projectDocument
+          || expectedSession !== tempoSessionId
+          || deck.mixerChannelEntity?.id !== routing.mixerChannel.id
+        ) return
+        deck.volume = Math.max(0, Math.min(1, volume))
+        el<HTMLInputElement>(`d${deckIndex + 1}-vol`).value = String(deck.volume)
+        el(`d${deckIndex + 1}-vol-val`).textContent = String(Math.round(deck.volume * 100))
+      },
+    ),
     projectDocument.events.onRemove(routing.track, () => {
       if (
         nexus !== projectDocument
@@ -3230,6 +4321,28 @@ function watchDeckRouting(
       }
     }),
   )
+  if (routing.fxGraph) {
+    const { delay, reverb, distortion, flanger } = routing.fxGraph
+    const hydrateIfCurrent = () => {
+      if (
+        nexus !== projectDocument
+        || expectedSession !== tempoSessionId
+        || activeFxDeckIndex !== deckIndex
+        || decks[deckIndex].fxGraph?.delay.id !== delay.id
+      ) return
+      hydrateDeckFxControls(routing.fxGraph!)
+    }
+    deck.routingSubscriptions.push(
+      projectDocument.events.onUpdate(delay.fields.mix, hydrateIfCurrent),
+      projectDocument.events.onUpdate(delay.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(reverb.fields.mix, hydrateIfCurrent),
+      projectDocument.events.onUpdate(reverb.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(distortion.fields.drive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(distortion.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onUpdate(flanger.fields.lfoModulationDepth, hydrateIfCurrent),
+      projectDocument.events.onUpdate(flanger.fields.isActive, hydrateIfCurrent),
+    )
+  }
 }
 
 function watchSourceDeckContent(
@@ -3339,7 +4452,25 @@ function bindDeckRoutingGraph(
   deck.audioDeviceEntity = routing.audioDevice
   deck.mixerChannelEntity = routing.mixerChannel
   deck.cableEntity = routing.cable
-  hydrateRestoredProjectControls(deckIndex, routing.mixerChannel)
+  deck.fxGraph = routing.fxGraph
+  hydrateRestoredProjectControls(deckIndex, projectDocument.queryEntities, routing.mixerChannel)
+  watchDeckRouting(deckIndex, projectDocument, routing, expectedSession)
+}
+
+function bindDeckFxRoutingGraph(
+  deckIndex: WaveformDeckIndex,
+  projectDocument: SyncedDocument,
+  routing: ResolvedDeckRoutingGraph,
+  expectedSession: number,
+) {
+  const deck = decks[deckIndex]
+  clearDeckRoutingEntities(deck)
+  deck.trackEntity = routing.track
+  deck.audioDeviceEntity = routing.audioDevice
+  deck.mixerChannelEntity = routing.mixerChannel
+  deck.cableEntity = routing.cable
+  deck.fxGraph = routing.fxGraph
+  hydrateRestoredProjectControls(deckIndex, projectDocument.queryEntities, routing.mixerChannel)
   watchDeckRouting(deckIndex, projectDocument, routing, expectedSession)
 }
 
@@ -3563,12 +4694,22 @@ async function uploadToNexus(
   try {
     const sampleDisplayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
     const projectDisplayName = deckNum === 3 ? 'MAGIC DECK' : sampleDisplayName
+    const sourceDeckIndex = deckNum <= 2 ? (deckNum - 1) as 0 | 1 : null
+    if (sourceDeckIndex !== null) {
+      deckOperationStates[sourceDeckIndex].uploading = true
+      updateSourceDeckUi(sourceDeckIndex)
+    }
     const sample = await uploadSample(
       file,
       sampleDisplayName,
       options.timing?.bpm,
       options.sampleDescription,
     )
+      .finally(() => {
+        if (sourceDeckIndex === null) return
+        deckOperationStates[sourceDeckIndex].uploading = false
+        updateSourceDeckUi(sourceDeckIndex)
+      })
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during upload')
     const resolution = deckNum <= 2 ? await resolveSampleBpm(sample, file, deckNum, expectedSession) : undefined
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during BPM selection')
@@ -3605,6 +4746,7 @@ async function uploadToNexus(
       options.timing,
     )
     if (deckNum <= 2) {
+      void initializeDeckCues(deckIndex, sample)
       setStatus('connected', inserted.establishedTempo
         ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — NATIVE SPEED PRESERVED ✓`
         : `DECK ${deckNum}: ${file.name} — NATIVE SPEED PRESERVED ✓`)
@@ -3630,21 +4772,8 @@ function removeDeckContentInTransaction(
   const sampleId = region?.fields.sample.value.entityId ?? storedSampleId
   const automationCollectionId = region?.fields.playbackAutomationCollection.value.entityId
     ?? storedAutomationCollectionId
-  const chainIds = region
-    ? logicalRegionChainIds(
-        t.entities
-          .ofTypes('audioRegion')
-          .get()
-          .filter((candidate) =>
-            candidate.fields.track.value.entityId === region.fields.track.value.entityId)
-          .map(regionSnapshot),
-        region.id,
-      )
-    : []
-  chainIds.forEach((chainRegionId) => {
-    const chainRegion = t.entities.ofTypes('audioRegion').getEntity(chainRegionId)
-    if (chainRegion) t.remove(chainRegion)
-  })
+  const regionsToRemove = region ? contiguousAudioRegions(t.entities, region) : []
+  regionsToRemove.forEach((candidate) => t.remove(candidate))
 
   const sampleStillUsed = sampleId
     ? t.entities
@@ -3770,17 +4899,37 @@ function applyCurrentDeckEq(deckIndex: WaveformDeckIndex) {
   })
 }
 
-async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
+async function applyDeckProjectLevels(
+  deckIndex: WaveformDeckIndex,
+  recordVolumeAutomation = false,
+) {
   const deck = decks[deckIndex]
-  if (!nexus || !deck.mixerChannelEntity) {
+  const projectDocument = nexus
+  const mixerChannelId = deck.mixerChannelEntity?.id
+  if (!projectDocument || !mixerChannelId) {
     setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT LEVELS`)
     return
   }
 
   try {
-    await nexus.modify((t) => {
-      const channel = t.entities.ofTypes('mixerChannel').getEntity(deck.mixerChannelEntity!.id) ?? deck.mixerChannelEntity!
-      t.update(channel.fields.faderParameters.fields.postGain, deck.volume)
+    await projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || deck.mixerChannelEntity?.id !== mixerChannelId
+      ) {
+        throw new Error('Project routing changed before the level update')
+      }
+      const channel = t.entities.ofTypes('mixerChannel').getEntity(mixerChannelId)
+      if (!channel) throw new Error('Deck mixer channel is no longer available')
+      const regionId = deck.regionEntity?.id
+      const region = regionId
+        ? t.entities.ofTypes('audioRegion').getEntity(regionId)
+        : null
+      if (recordVolumeAutomation && region) {
+        replaceDeckVolumeAutomation(t, deckIndex, channel, region, deck.volume)
+      } else {
+        t.update(channel.fields.faderParameters.fields.postGain, deck.volume)
+      }
       t.update(channel.fields.preGain, PROJECT_PRE_GAIN_BASE * deck.gainTrim)
     })
   } catch (e) {
@@ -3790,7 +4939,167 @@ async function applyDeckProjectLevels(deckIndex: WaveformDeckIndex) {
 }
 
 function applyCurrentDeckLevels(deckIndex: WaveformDeckIndex) {
-  return applyDeckProjectLevels(deckIndex)
+  return applyDeckProjectLevels(deckIndex, true)
+}
+
+function clampUnit(value: number) {
+  return Math.max(0, Math.min(1, value))
+}
+
+function deckFxValues(fxGraph: DeckFxGraph): Record<DeckFxKind, number> {
+  return {
+    delay: fxGraph.delay.fields.isActive.value
+      ? clampUnit(fxGraph.delay.fields.mix.value)
+      : 0,
+    reverb: fxGraph.reverb.fields.isActive.value
+      ? clampUnit(fxGraph.reverb.fields.mix.value)
+      : 0,
+    distortion: fxGraph.distortion.fields.isActive.value
+      ? clampUnit((fxGraph.distortion.fields.drive.value - 0.1) / 11.9)
+      : 0,
+    flanger: fxGraph.flanger.fields.isActive.value
+      ? clampUnit(fxGraph.flanger.fields.lfoModulationDepth.value)
+      : 0,
+  }
+}
+
+function setDeckFxKnobValue(kind: DeckFxKind, value: number) {
+  const canvas = el<HTMLCanvasElement>(`fx-${kind}`)
+  const state = knobState.get(canvas)
+  if (!state) return
+  state.value = clampUnit(value)
+  drawKnob(canvas, state.value)
+  canvas.setAttribute('aria-valuenow', String(Math.round(state.value * 100)))
+  el<HTMLOutputElement>(`fx-${kind}-value`).value = `${Math.round(state.value * 100)}%`
+}
+
+function hydrateDeckFxControls(fxGraph: DeckFxGraph) {
+  const values = deckFxValues(fxGraph)
+  const kinds = Object.keys(values) as DeckFxKind[]
+  kinds.forEach((kind) => {
+    setDeckFxKnobValue(kind, values[kind])
+  })
+}
+
+async function applyDeckFx(
+  deckIndex: WaveformDeckIndex,
+  kind: DeckFxKind,
+  value: number,
+) {
+  const projectDocument = nexus
+  const fxGraph = decks[deckIndex].fxGraph
+  const expectedSession = tempoSessionId
+  if (!projectDocument || !projectConnected || !fxGraph) return
+  const normalizedValue = clampUnit(value)
+
+  try {
+    await projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+      ) throw new Error('Project connection changed during FX update')
+      const currentGraph = reusableDeckGraphs(t.entities, deckIndex)[0]?.routing.fxGraph
+      if (
+        !currentGraph
+        || currentGraph.delay.id !== fxGraph.delay.id
+        || currentGraph.reverb.id !== fxGraph.reverb.id
+        || currentGraph.distortion.id !== fxGraph.distortion.id
+        || currentGraph.flanger.id !== fxGraph.flanger.id
+      ) {
+        throw new Error('The synchronized FX chain changed')
+      }
+      const { delay, reverb, distortion, flanger } = currentGraph
+      const enabled = normalizedValue > 0
+      if (kind === 'delay') {
+        t.update(delay.fields.mix, normalizedValue)
+        t.update(delay.fields.isActive, enabled)
+      } else if (kind === 'reverb') {
+        t.update(reverb.fields.mix, normalizedValue)
+        t.update(reverb.fields.isActive, enabled)
+      } else if (kind === 'distortion') {
+        t.update(distortion.fields.drive, 0.1 + normalizedValue * 11.9)
+        t.update(distortion.fields.isActive, enabled)
+      } else {
+        t.update(flanger.fields.feedbackFactor, normalizedValue * 0.75)
+        t.update(flanger.fields.lfoFrequencyHz, 0.1 + normalizedValue * 1.9)
+        t.update(flanger.fields.lfoModulationDepth, normalizedValue)
+        t.update(flanger.fields.isActive, enabled)
+      }
+    })
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) return
+    el<HTMLDivElement>('fx-modal-error').textContent = ''
+  } catch (error) {
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) return
+    const message = error instanceof Error ? error.message : String(error)
+    el<HTMLDivElement>('fx-modal-error').textContent = `FX UPDATE FAILED: ${message.toUpperCase()}`
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX UPDATE FAILED — ${message}`)
+  }
+}
+
+function closeDeckFxAssistant() {
+  const trigger = activeFxTrigger
+  activeFxDeckIndex = null
+  activeFxTrigger = null
+  el<HTMLDivElement>('fx-modal').classList.add('is-hidden')
+  document.removeEventListener('keydown', handleDeckFxModalKey)
+  if (trigger && !trigger.disabled && trigger.isConnected) trigger.focus()
+}
+
+function handleDeckFxModalKey(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeDeckFxAssistant()
+}
+
+async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
+  const projectDocument = nexus
+  const expectedSession = tempoSessionId
+  if (!projectDocument || !projectConnected) {
+    setStatus('error', 'CONNECT AN AUDIOTOOL PROJECT TO OPEN DECK FX')
+    return
+  }
+  const trigger = document.querySelector<HTMLButtonElement>(`[data-deck-fx="${deckIndex}"]`)
+  if (trigger) trigger.disabled = true
+  setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: PREPARING PROJECT FX…`)
+
+  try {
+    const routing = await ensureDeckFxGraph(projectDocument, deckIndex, expectedSession)
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+      || !routing.fxGraph
+    ) throw new Error('Project connection changed while opening FX')
+    bindDeckFxRoutingGraph(deckIndex, projectDocument, routing, expectedSession)
+    activeFxDeckIndex = deckIndex
+    activeFxTrigger = trigger ?? null
+    hydrateDeckFxControls(routing.fxGraph)
+    el<HTMLHeadingElement>('fx-modal-title').textContent = `${placementDeckLabel(deckIndex)} Effects`
+    el<HTMLDivElement>('fx-modal-error').textContent = ''
+    el<HTMLDivElement>('fx-modal').classList.remove('is-hidden')
+    document.addEventListener('keydown', handleDeckFxModalKey)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: FX READY ↔ PROJECT SYNCED`)
+    el<HTMLCanvasElement>('fx-delay').focus()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX FAILED — ${message}`)
+  } finally {
+    if (trigger) trigger.disabled = !projectConnected
+  }
+}
+
+function renderDeckFxAvailability() {
+  document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
+    button.disabled = !projectConnected || nexus === null
+  })
+  if (!projectConnected && activeFxDeckIndex !== null) closeDeckFxAssistant()
 }
 
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
@@ -3957,6 +5266,15 @@ function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: WaveformDeckI
   if (!match) return null
   return { deckIndex: Number(match[1]) - 1 as WaveformDeckIndex, band: match[2] as EqBand }
 }
+function getDeckFxControl(canvas: HTMLCanvasElement): DeckFxKind | null {
+  const kind = canvas.dataset.fx
+  return kind === 'delay'
+    || kind === 'reverb'
+    || kind === 'distortion'
+    || kind === 'flanger'
+    ? kind
+    : null
+}
 function initKnob(canvas: HTMLCanvasElement) {
   const init = parseFloat(canvas.dataset.value ?? '0.5')
   knobState.set(canvas, { value: init, dragging: false, startY: 0, startVal: init })
@@ -3970,6 +5288,8 @@ function initKnob(canvas: HTMLCanvasElement) {
   canvas.setAttribute('aria-valuenow', String(Math.round(init * 100)))
   const label = canvas.id.match(/^d(\d)-(hi|mid|low)$/)
   if (label) canvas.setAttribute('aria-label', `Deck ${label[1]} ${label[2].toUpperCase()} EQ`)
+  const fxKind = getDeckFxControl(canvas)
+  if (fxKind) canvas.setAttribute('aria-label', `${fxKind} effect amount`)
 
   const updateValue = (newValue: number) => {
     const s = knobState.get(canvas)!
@@ -3978,6 +5298,11 @@ function initKnob(canvas: HTMLCanvasElement) {
     canvas.setAttribute('aria-valuenow', String(Math.round(s.value * 100)))
     const control = getDeckEqControl?.(canvas)
     if (control) void applyDeckEq?.(control.deckIndex, control.band, s.value)
+    const effect = getDeckFxControl(canvas)
+    if (effect && activeFxDeckIndex !== null) {
+      el<HTMLOutputElement>(`fx-${effect}-value`).value = `${Math.round(s.value * 100)}%`
+      void applyDeckFx(activeFxDeckIndex, effect, s.value)
+    }
   }
 
   // Mouse drag
@@ -4133,10 +5458,8 @@ function handleCaptureWorkletMessage(event: MessageEvent<CaptureWorkletMessage>)
     const now = performance.now()
     if (now - recording.lastProgressUpdate >= 250 || recording.capturedFrames === recording.targetFrames) {
       recording.lastProgressUpdate = now
-      const progress = Math.min(1, recording.capturedFrames / recording.targetFrames)
-      const barsRecorded = (progress * MAGIC_CAPTURE_BARS).toFixed(1)
-      setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
-      setMagicStatus('generating', `RECORDING ${barsRecorded} / ${MAGIC_CAPTURE_BARS} BARS`)
+      setAudioCaptureStatus('connecting', 'LOADING…')
+      setMagicStatus('generating', 'LOADING…')
     }
     return
   }
@@ -4164,8 +5487,8 @@ async function recordNextFiveBars(bpm: number) {
   const targetFrames = requiredLiveAudioFrames(bpm)
   const timeoutMs = Math.ceil((targetFrames / liveAudioContext.sampleRate) * 1000) + 5000
 
-  setAudioCaptureStatus('connecting', `RECORDING NEW AUDIO · 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
-  setMagicStatus('generating', `RECORDING 0.0 / ${MAGIC_CAPTURE_BARS} BARS`)
+  setAudioCaptureStatus('connecting', 'LOADING…')
+  setMagicStatus('generating', 'LOADING…')
   return new Promise<CaptureChunk>((resolve, reject) => {
     const recordingId = ++liveAudioRecordingId
     const timeoutId = window.setTimeout(() => {
@@ -4494,6 +5817,7 @@ async function generateMagicAudio() {
     magicWaveformPeaks = null
     drawMagicWaveform(generatedBuffer)
     renderDeckTransport(2)
+    void initializeDeckCues(2, magicDeck.sampleMeta!)
 
     if (timingWarning || timingStatus !== 'aligned') {
       const warning = timingWarning || `Timing status: ${timingStatus}`
@@ -4625,7 +5949,7 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   volSlider?.addEventListener('input', () => {
     deck.volume = parseFloat(volSlider.value)
     if (volVal) volVal.textContent = String(Math.round(deck.volume * 100))
-    void applyDeckProjectLevels(deckIndex)
+    void applyDeckProjectLevels(deckIndex, true)
   })
 
   gainSlider?.addEventListener('input', () => {
@@ -4667,12 +5991,21 @@ function initApp() {
   setupDropZone('drop-2', 1)
   setupUnloadButton(0)
   setupUnloadButton(1)
+  setupCueControls(0)
+  setupCueControls(1)
+  setupCueControls(2)
   updateSourceDeckUi(0)
   updateSourceDeckUi(1)
   wireTransport('d1', 0)
   wireTransport('d2', 1)
   wireTransport('d3', 2)
-  document.querySelectorAll<HTMLCanvasElement>('.eq-knob').forEach(initKnob)
+  document.querySelectorAll<HTMLCanvasElement>('.eq-knob, .fx-knob').forEach(initKnob)
+  document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
+    const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
+    button.addEventListener('click', () => { void showDeckFxAssistant(deckIndex) })
+  })
+  el<HTMLButtonElement>('fx-modal-close').addEventListener('click', closeDeckFxAssistant)
+  renderDeckFxAvailability()
 
   btnGenerate.addEventListener('click', generateMagicAudio)
   drawMagicIdle()
