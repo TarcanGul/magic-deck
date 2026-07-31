@@ -3483,7 +3483,7 @@ async function insertSampleIntoProject(
         if (isSourceDeck || forceMagicLoop) {
           t.update(region.fields.timestretchMode, 2)
         }
-        t.update(region.fields.region.fields.isEnabled, false)
+        t.update(region.fields.region.fields.isEnabled, true)
         const entities = resolveInsertedProjectEntities(region, t)
         return {
           region,
