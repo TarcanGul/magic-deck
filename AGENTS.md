@@ -15,6 +15,21 @@ Key files are:
 
 Keep generated build output out of source control. Put future assets under `nexus-app/src/assets/`.
 
+## Deck Assistant Interaction Principle
+
+Keep contextual questions about a deck inside that deck's visible Deck Assistant.
+In particular, bar or song-section entry for placement, launch, stop, or
+cancellation checks must use an inline Deck Assistant form and must not open a
+full-screen overlay or modal. The question should remain visually attached to
+the deck it affects so the surrounding controls and project context stay
+visible.
+
+Deck Assistant forms own their validation and status messages. Enter confirms
+the focused form, Escape and a visible Cancel action abort it, and cancelling
+must not mutate or remove existing project content. Reserve blocking modal
+dialogs for workflows that truly require the rest of the application to be
+temporarily unavailable; choosing a bar or section never qualifies.
+
 ## Deck Placement Process
 
 Deck A, Deck B, and Magic Deck insert at the beginning of the current Audiotool
@@ -31,10 +46,11 @@ automatically. Empty routing tracks and devices do not count as loaded timeline
 content.
 
 When automatic transport capture is unavailable for a non-empty project, use
-the in-app Deck Assistant placement modal for one-based whole-number bar entry.
-Do not use JavaScript `window.prompt` or `window.alert` for placement. Invalid
-input errors stay inside the modal, Escape and Cancel abort placement, and
-cancelling must preserve existing project content.
+the affected deck's inline Deck Assistant form for one-based whole-number bar
+entry. Do not use a modal, full-screen overlay, JavaScript `window.prompt`, or
+`window.alert` for placement. Invalid input errors stay inside the assistant,
+Escape and Cancel abort placement, and cancelling must preserve existing
+project content.
 
 Source decks capture their immutable placement when file loading begins, before
 queueing, BPM confirmation, upload, or replacement removal. Magic Deck uploads

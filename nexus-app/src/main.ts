@@ -33,6 +33,13 @@ import {
   tempoPercentToPlaybackRate,
 } from './tempo-utils.js'
 import type { TempoRange } from './tempo-utils.js'
+import {
+  logicalRegionChainIds,
+  planForwardTimelineInsertion,
+  selectCanonicalRouting,
+  selectLatestLogicalRegion,
+} from './deck-project-utils.js'
+import type { TimelineRegionSnapshot } from './deck-project-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -106,7 +113,6 @@ interface SampleTiming {
 }
 interface UploadToNexusOptions {
   timing?: SampleTiming
-  replaceExistingMagic?: boolean
   sampleDescription?: string
   placement?: DeckInsertionPlacement
 }
@@ -186,7 +192,7 @@ let currentProjectId: string | null = null
 let currentProjectBpm: number | null = null
 let deckLoadQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
-let placementModalQueue: Promise<void> = Promise.resolve()
+let barAssistantQueue: Promise<void> = Promise.resolve()
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -209,7 +215,6 @@ const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperatio
   { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
   { pendingCount: 0, activeKind: null, suppressProjectRemovalSync: false },
 ]
-
 const decks: [DeckState, DeckState, DeckState] = [
   { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
   { audioCtx: null, audioBuffer: null, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, contentSubscriptions: [], routingSubscriptions: [] },
@@ -304,67 +309,76 @@ function requestExtensionTransportPosition(
   })
 }
 
-type BarModalPurpose = 'placement' | 'launch' | 'exact-launch' | 'stop' | 'cancel-check'
+type BarAssistantPurpose = 'placement' | 'launch' | 'exact-launch' | 'stop' | 'cancel-check'
 
-function showBarModalNow(
+function showBarAssistantNow(
   deckIndex: WaveformDeckIndex,
-  purpose: BarModalPurpose,
+  purpose: BarAssistantPurpose,
 ): Promise<number | null> {
   return new Promise((resolve) => {
-    const overlay = el<HTMLDivElement>('placement-modal')
-    const title = el<HTMLHeadingElement>('placement-modal-title')
-    const copy = el<HTMLParagraphElement>('placement-modal-copy')
-    const input = el<HTMLInputElement>('placement-modal-input')
-    const error = el<HTMLDivElement>('placement-modal-error')
-    const confirm = el<HTMLButtonElement>('placement-modal-confirm')
-    const cancel = el<HTMLButtonElement>('placement-modal-cancel')
+    const deckNumber = deckIndex + 1
+    const assistant = el<HTMLDivElement>(
+      deckIndex < 2 ? `deck${deckNumber}-bpm-dialogue` : `deck${deckNumber}-assistant`,
+    )
+    const form = el<HTMLDivElement>(`deck${deckNumber}-bar-assistant`)
+    const title = el<HTMLDivElement>(`deck${deckNumber}-bar-assistant-title`)
+    const copy = el<HTMLParagraphElement>(`deck${deckNumber}-bar-assistant-copy`)
+    const input = el<HTMLInputElement>(`deck${deckNumber}-bar-assistant-input`)
+    const error = el<HTMLDivElement>(`deck${deckNumber}-bar-assistant-error`)
+    const confirm = el<HTMLButtonElement>(`deck${deckNumber}-bar-assistant-confirm`)
+    const cancel = el<HTMLButtonElement>(`deck${deckNumber}-bar-assistant-cancel`)
     const label = placementDeckLabel(deckIndex)
 
-    const modalCopy: Record<BarModalPurpose, { title: string; copy: string; confirm: string; cancel: string }> = {
+    const assistantCopy: Record<BarAssistantPurpose, { title: string; copy: string; confirm: string; cancel: string }> = {
       placement: {
         title: `Choose ${label} Insertion Bar`,
         copy: `The Audiotool transport could not be read automatically. Enter the whole-number bar currently displayed in Studio. ${label} will be placed at the beginning of that bar.`,
-        confirm: '⬡ PLACE AT BAR',
-        cancel: '⬡ CANCEL LOAD',
+        confirm: 'PLACE AT BAR',
+        cancel: 'CANCEL LOAD',
       },
       launch: {
         title: `Choose ${label} Launch Bar`,
         copy: 'Automatic transport capture is unavailable. Enter the future whole-number bar where this deck should launch.',
-        confirm: '⬡ LAUNCH AT BAR',
-        cancel: '⬡ CANCEL',
+        confirm: 'LAUNCH AT BAR',
+        cancel: 'CANCEL',
       },
       'exact-launch': {
         title: `Choose ${label} Launch Bar`,
         copy: 'Enter the future whole-number Audiotool bar where this deck should launch.',
-        confirm: '⬡ USE BAR',
-        cancel: '⬡ CANCEL',
+        confirm: 'USE BAR',
+        cancel: 'CANCEL',
       },
       stop: {
         title: `Choose ${label} Stop Bar`,
         copy: 'Automatic transport capture is unavailable. Enter the future whole-number bar where this deck should stop.',
-        confirm: '⬡ STOP AT BAR',
-        cancel: '⬡ CANCEL',
+        confirm: 'STOP AT BAR',
+        cancel: 'CANCEL',
       },
       'cancel-check': {
         title: `Confirm ${label} Current Bar`,
         copy: 'Automatic transport capture is unavailable. Enter the whole-number bar currently displayed in Audiotool so Deck Assistant can confirm the launch has not begun.',
-        confirm: '⬡ CHECK & CANCEL',
-        cancel: '⬡ KEEP LAUNCH',
+        confirm: 'CHECK & CANCEL',
+        cancel: 'KEEP LAUNCH',
       },
     }
-    const content = modalCopy[purpose]
+    const content = assistantCopy[purpose]
     title.textContent = content.title
     copy.textContent = content.copy
     confirm.textContent = content.confirm
     cancel.textContent = content.cancel
     input.value = '1'
     error.textContent = ''
-    overlay.classList.remove('is-hidden')
+    assistant.classList.remove('is-hidden')
+    assistant.classList.add('bar-assistant-active')
+    form.classList.remove('is-hidden')
+    assistant.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     input.focus()
     input.select()
 
     const close = (bar: number | null) => {
-      overlay.classList.add('is-hidden')
+      form.classList.add('is-hidden')
+      assistant.classList.remove('bar-assistant-active')
+      if (deckIndex === 2) assistant.classList.add('is-hidden')
       confirm.onclick = null
       cancel.onclick = null
       input.oninput = null
@@ -396,21 +410,25 @@ function showBarModalNow(
   })
 }
 
-function showBarModal(deckIndex: WaveformDeckIndex, purpose: BarModalPurpose) {
-  const queued = placementModalQueue.then(() => showBarModalNow(deckIndex, purpose))
-  placementModalQueue = queued.then(() => undefined, () => undefined)
+function showBarAssistant(deckIndex: WaveformDeckIndex, purpose: BarAssistantPurpose) {
+  const queued = barAssistantQueue.then(() => showBarAssistantNow(deckIndex, purpose))
+  barAssistantQueue = queued.then(() => undefined, () => undefined)
   return queued
 }
 
-function showPlacementModal(deckIndex: WaveformDeckIndex) {
-  return showBarModal(deckIndex, 'placement')
+function showPlacementAssistant(deckIndex: WaveformDeckIndex) {
+  return showBarAssistant(deckIndex, 'placement')
 }
 
-function projectHasLoadedTimelineContent(projectDocument: SyncedDocument) {
-  return projectDocument.queryEntities
+function projectHasTimelineContent(entities: EntityQuery) {
+  return entities
     .ofTypes('audioRegion', 'noteRegion', 'patternRegion', 'automationRegion')
     .get()
     .length > 0
+}
+
+function projectHasLoadedTimelineContent(projectDocument: SyncedDocument) {
+  return projectHasTimelineContent(projectDocument.queryEntities)
 }
 
 async function captureDeckInsertionPlacement(
@@ -436,7 +454,7 @@ async function captureDeckInsertionPlacement(
   if (nexus !== projectDocument || !projectConnected) {
     throw new Error('Project connection changed during placement capture')
   }
-  const bar = extensionCapture?.bar ?? await showPlacementModal(deckIndex)
+  const bar = extensionCapture?.bar ?? await showPlacementAssistant(deckIndex)
   if (bar === null) return null
   if (nexus !== projectDocument || !projectConnected) {
     throw new Error('Project connection changed during manual placement')
@@ -902,7 +920,7 @@ function resolveDeckRoutingGraphs(
   entities: EntityQuery,
   audioDevice: NexusEntity<'audioDevice'>,
 ): ResolvedDeckRoutingGraph[] {
-  const cableAndMixer = entities
+  const cableAndMixers = entities
     .ofTypes('desktopAudioCable')
     .get()
     .filter((candidate) =>
@@ -913,21 +931,22 @@ function resolveDeckRoutingGraphs(
         .ofTypes('mixerChannel')
         .getEntity(cable.fields.toSocket.value.entityId),
     }))
-    .find((candidate) => candidate.mixerChannel !== undefined)
-  if (!cableAndMixer?.mixerChannel) return []
-  const { cable, mixerChannel } = cableAndMixer
+    .filter((candidate): candidate is {
+      cable: NexusEntity<'desktopAudioCable'>
+      mixerChannel: NexusEntity<'mixerChannel'>
+    } => candidate.mixerChannel !== undefined)
 
   return entities
     .ofTypes('audioTrack')
     .get()
     .filter((candidate) => candidate.fields.player.value.entityId === audioDevice.id)
-    .map((track) => ({
+    .flatMap((track) => cableAndMixers.map(({ cable, mixerChannel }) => ({
       track,
       audioDevice,
       mixerChannel,
       cable,
       displayName: audioDevice.fields.displayName.value,
-    }))
+    })))
 }
 
 function resolveDeckContentGraph(
@@ -938,20 +957,30 @@ function resolveDeckContentGraph(
     .ofTypes('audioRegion')
     .get()
     .filter((candidate) => candidate.fields.track.value.entityId === routing.track.id)
-    .sort((a, b) => {
-      const positionDifference =
-        a.fields.region.fields.positionTicks.value - b.fields.region.fields.positionTicks.value
-      return positionDifference || a.id.localeCompare(b.id)
-    })
-
-  for (const region of regions) {
+  const validContent = regions.flatMap((region) => {
     const sample = entities.ofTypes('sample').getEntity(region.fields.sample.value.entityId)
     const automationCollection = entities
       .ofTypes('automationCollection')
       .getEntity(region.fields.playbackAutomationCollection.value.entityId)
-    if (sample && automationCollection) return { region, sample, automationCollection }
+    return sample && automationCollection ? [{ region, sample, automationCollection }] : []
+  })
+  const latest = selectLatestLogicalRegion(
+    validContent.map(({ region }) => regionSnapshot(region)),
+  )
+  if (!latest) return null
+  return validContent.find(({ region }) => region.id === latest.id) ?? null
+}
+
+function regionSnapshot(region: NexusEntity<'audioRegion'>): TimelineRegionSnapshot {
+  return {
+    id: region.id,
+    sampleId: region.fields.sample.value.entityId,
+    automationCollectionId: region.fields.playbackAutomationCollection.value.entityId,
+    positionTicks: region.fields.region.fields.positionTicks.value,
+    durationTicks: region.fields.region.fields.durationTicks.value,
+    fadeInDurationTicks: region.fields.fadeInDurationTicks.value,
+    fadeOutDurationTicks: region.fields.fadeOutDurationTicks.value,
   }
-  return null
 }
 
 function reusableDeckGraphs(
@@ -967,20 +996,14 @@ function reusableDeckGraphs(
     .map((routing) => ({
       routing,
       content: resolveDeckContentGraph(entities, routing),
-      regionCount: entities
-        .ofTypes('audioRegion')
-        .get()
-        .filter((region) => region.fields.track.value.entityId === routing.track.id)
-        .length,
+      trackId: routing.track.id,
+      trackOrder: routing.track.fields.orderAmongTracks.value,
+      deviceName: routing.audioDevice.fields.displayName.value,
+      stripName: routing.mixerChannel.fields.displayParameters.fields.displayName.value,
+      routingId: `${routing.audioDevice.id}\u0000${routing.mixerChannel.id}\u0000${routing.cable.id}`,
     }))
-    .sort((a, b) =>
-      a.routing.track.fields.orderAmongTracks.value - b.routing.track.fields.orderAmongTracks.value
-      || a.routing.track.id.localeCompare(b.routing.track.id))
-
-  return [
-    ...candidates.filter((candidate) => candidate.content !== null),
-    ...candidates.filter((candidate) => candidate.content === null && candidate.regionCount === 0),
-  ].map(({ routing, content }) => ({ routing, content }))
+  const selected = selectCanonicalRouting(candidates, DECK_PROJECT_NAMES[deckIndex])
+  return selected ? [{ routing: selected.routing, content: selected.content }] : []
 }
 
 function nextTrackOrder(entities: EntityQuery) {
@@ -2613,7 +2636,7 @@ async function resolveDeckLaunchTarget(
   expectedSession: number,
 ) {
   const exactBar = quantization === 'exact-bar'
-    ? await showBarModal(deckIndex, 'exact-launch')
+    ? await showBarAssistant(deckIndex, 'exact-launch')
     : undefined
   if (quantization === 'exact-bar' && exactBar === null) return null
   const guardedTicks = await automaticGuardedTransportTicks(
@@ -2622,7 +2645,7 @@ async function resolveDeckLaunchTarget(
     expectedSession,
   )
   if (guardedTicks === null) {
-    const targetBar = exactBar ?? await showBarModal(deckIndex, 'launch')
+    const targetBar = exactBar ?? await showBarAssistant(deckIndex, 'launch')
     return targetBar === null ? null : barToPositionTicks(targetBar, Ticks.Bars(1))
   }
   const targetTicks = resolveLaunchTick(
@@ -2653,7 +2676,7 @@ async function resolveDeckStopTarget(
       targetTicks: resolveLaunchTick('next-bar', guardedTicks, Ticks.Bars(1))!,
     }
   }
-  const targetBar = await showBarModal(deckIndex, 'stop')
+  const targetBar = await showBarAssistant(deckIndex, 'stop')
   if (targetBar === null) return null
   const targetTicks = barToPositionTicks(targetBar, Ticks.Bars(1))
   return { guardedTicks: Math.max(0, targetTicks - 1), targetTicks }
@@ -2670,7 +2693,7 @@ async function resolveDeckCancelPosition(
     expectedSession,
   )
   if (guardedTicks !== null) return guardedTicks
-  const currentBar = await showBarModal(deckIndex, 'cancel-check')
+  const currentBar = await showBarAssistant(deckIndex, 'cancel-check')
   if (currentBar === null) return null
   return guardedTransportTicks(
     { bar: currentBar, precision: 'bar', capturedAt: Date.now() },
@@ -3204,7 +3227,10 @@ function watchSourceDeckContent(
     projectDocument.events.onUpdate(region.fields.region.fields.durationTicks, () => {
       if (deck.regionEntity?.id === region.id) {
         scheduleDeckTimingReconstruction(deckIndex)
-        void syncMagicLoopDuration(projectDocument, expectedSession)
+        if (
+          deckOperationStates[deckIndex].activeKind !== 'loading'
+          && deckOperationStates[deckIndex].activeKind !== 'replacing'
+        ) void syncMagicLoopDuration(projectDocument, expectedSession)
         renderDeckTransport(deckIndex)
       }
     }),
@@ -3338,78 +3364,138 @@ async function insertSampleIntoProject(
   const deckIndex = (deckNum - 1) as WaveformDeckIndex
   const deck = decks[deckIndex]
   if (placement.deckIndex !== deckIndex) throw new Error('Insertion placement belongs to another deck')
+  const expectedRoutingIds = {
+    track: deck.trackEntity?.id,
+    audioDevice: deck.audioDeviceEntity?.id,
+    mixerChannel: deck.mixerChannelEntity?.id,
+    cable: deck.cableEntity?.id,
+  }
+  if (Object.values(expectedRoutingIds).some((id) => id === undefined)) {
+    throw new Error(`${DECK_PROJECT_NAMES[deckIndex]} canonical routing is not available`)
+  }
   const sampleBpm = normalizeBpm(sample.bpm)
   const bpm = normalizeBpm(timing?.bpm ?? resolution?.bpm ?? (isSupportedBpm(sampleBpm) ? sampleBpm : currentProjectBpm))
   if (!isSupportedBpm(bpm)) throw new Error(`A BPM between ${MIN_SUPPORTED_BPM} and ${MAX_SUPPORTED_BPM} is required`)
-  const selected = await ensureDeckRoutingGraph(projectDocument, deckIndex, expectedSession)
   if (
     nexus !== projectDocument
     || !projectConnected
     || expectedSession !== tempoSessionId
   ) throw new Error('Project connection changed before insertion')
-  bindDeckRoutingGraph(deckIndex, projectDocument, selected.routing, expectedSession)
-  const targetTrackId = selected.routing.track.id
 
-  const insertTransaction = () => projectDocument.modify((t) => {
-    const config = t.entities.ofTypes('config').get()[0]
-    const targetTrack = t.entities.ofTypes('audioTrack').getEntity(targetTrackId)
-    if (!targetTrack) throw new Error('Provisioned deck track is no longer available')
-    const isSourceDeck = deckNum <= 2
-    const magicStopEndTicks = isSourceDeck ? getMagicScheduledStopEndTicks(t) : null
-    const establishedTempo = isSourceDeck && loadedSourceDeckCount(t) === 0
-    if (isSourceDeck && !config) throw new Error('Project tempo configuration was not found')
-    const effectiveProjectBpm = establishedTempo
-      ? bpm
-      : Number(config?.fields.tempoBpm.value ?? currentProjectBpm)
-    if (
-      isSourceDeck
-      && (
-        !Number.isFinite(effectiveProjectBpm)
-        || effectiveProjectBpm < MIN_SUPPORTED_BPM
-        || effectiveProjectBpm > MAX_SUPPORTED_BPM
-      )
-    ) {
-      throw new Error('Project tempo is outside the supported range')
-    }
-    if (establishedTempo && config) {
-      t.update(config.fields.tempoBpm, bpm)
-    }
-    const sourceDurationTicks = isSourceDeck
-      ? secondsToTicks(sample.durationSeconds, effectiveProjectBpm)
-      : undefined
-    const region = t.insertSample(sample, {
-      sample: isSourceDeck
-        ? { musicDurationTicks: sourceDurationTicks }
-        : timing?.musicDurationTicks === undefined
-          ? { bpm }
-          : { musicDurationTicks: timing.musicDurationTicks },
-      region: forceMagicLoop
-        ? {
-            positionTicks: placement.positionTicks,
-            durationTicks: getMagicLoopDurationTicks(t),
+  const removedRegionIds: string[] = []
+  const insertTransaction = async () => {
+    try {
+      return await projectDocument.modify((t) => {
+        const canonical = reusableDeckGraphs(t.entities, deckIndex)[0]
+        if (!canonical) {
+          throw new Error(`${DECK_PROJECT_NAMES[deckIndex]} canonical track is no longer available`)
+        }
+        if (
+          canonical.routing.track.id !== expectedRoutingIds.track
+          || canonical.routing.audioDevice.id !== expectedRoutingIds.audioDevice
+          || canonical.routing.mixerChannel.id !== expectedRoutingIds.mixerChannel
+          || canonical.routing.cable.id !== expectedRoutingIds.cable
+        ) {
+          throw new Error(`${DECK_PROJECT_NAMES[deckIndex]} canonical routing changed before insertion`)
+        }
+        const targetTrack = t.entities
+          .ofTypes('audioTrack')
+          .getEntity(canonical.routing.track.id)
+        if (!targetTrack) {
+          throw new Error(`${DECK_PROJECT_NAMES[deckIndex]} canonical track is no longer available`)
+        }
+        const destinationRegions = t.entities
+          .ofTypes('audioRegion')
+          .get()
+          .filter((region) => region.fields.track.value.entityId === targetTrack.id)
+        const collisionPlan = planForwardTimelineInsertion(
+          destinationRegions.map(regionSnapshot),
+          placement.positionTicks,
+        )
+        if (collisionPlan.kind === 'reject') {
+          throw new Error(collisionPlan.reason === 'region-starts-at-boundary'
+            ? 'A deck region already starts at the selected bar; choose a later bar'
+            : 'The selected bar is before this deck’s latest insertion; choose a later bar')
+        }
+
+        collisionPlan.truncate.forEach((truncation) => {
+          const region = t.entities.ofTypes('audioRegion').getEntity(truncation.id)
+          if (!region || region.fields.track.value.entityId !== targetTrack.id) {
+            throw new Error('Destination deck content changed during collision planning')
           }
-        : { positionTicks: placement.positionTicks },
-      loop: forceMagicLoop ? true : undefined,
-      attachTo: targetTrack,
-      displayName,
-    })
-    if (isSourceDeck) {
-      t.update(region.fields.timestretchMode, 2)
-    } else if (forceMagicLoop) {
-      t.update(region.fields.timestretchMode, 2)
+          t.update(region.fields.region.fields.durationTicks, truncation.durationTicks)
+          if (region.fields.fadeInDurationTicks.value !== truncation.fadeInDurationTicks) {
+            t.update(region.fields.fadeInDurationTicks, truncation.fadeInDurationTicks)
+          }
+          if (region.fields.fadeOutDurationTicks.value !== truncation.fadeOutDurationTicks) {
+            t.update(region.fields.fadeOutDurationTicks, truncation.fadeOutDurationTicks)
+          }
+        })
+        collisionPlan.removeRegionIds.forEach((regionId) => {
+          const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+          if (!region || region.fields.track.value.entityId !== targetTrack.id) {
+            throw new Error('Destination deck content changed during collision planning')
+          }
+          guardedRegionRemovalIds.add(regionId)
+          removedRegionIds.push(regionId)
+          t.remove(region)
+        })
+
+        const config = t.entities.ofTypes('config').get()[0]
+        const isSourceDeck = deckNum <= 2
+        const establishedTempo = isSourceDeck && !projectHasTimelineContent(t.entities)
+        if (isSourceDeck && !config) throw new Error('Project tempo configuration was not found')
+        const effectiveProjectBpm = establishedTempo
+          ? bpm
+          : Number(config?.fields.tempoBpm.value ?? currentProjectBpm)
+        if (
+          isSourceDeck
+          && (
+            !Number.isFinite(effectiveProjectBpm)
+            || effectiveProjectBpm < MIN_SUPPORTED_BPM
+            || effectiveProjectBpm > MAX_SUPPORTED_BPM
+          )
+        ) {
+          throw new Error('Project tempo is outside the supported range')
+        }
+        if (establishedTempo && config) {
+          t.update(config.fields.tempoBpm, bpm)
+        }
+        const sourceDurationTicks = isSourceDeck
+          ? secondsToTicks(sample.durationSeconds, effectiveProjectBpm)
+          : undefined
+        const region = t.insertSample(sample, {
+          sample: isSourceDeck
+            ? { musicDurationTicks: sourceDurationTicks }
+            : timing?.musicDurationTicks === undefined
+              ? { bpm }
+              : { musicDurationTicks: timing.musicDurationTicks },
+          region: forceMagicLoop
+            ? {
+                positionTicks: placement.positionTicks,
+                durationTicks: getMagicLoopDurationTicks(t),
+              }
+            : { positionTicks: placement.positionTicks },
+          loop: forceMagicLoop ? true : undefined,
+          attachTo: targetTrack,
+          displayName,
+        })
+        if (isSourceDeck || forceMagicLoop) {
+          t.update(region.fields.timestretchMode, 2)
+        }
+        t.update(region.fields.region.fields.isEnabled, false)
+        const entities = resolveInsertedProjectEntities(region, t)
+        return {
+          region,
+          ...entities,
+          routing: canonical.routing,
+          establishedTempo,
+        }
+      })
+    } finally {
+      removedRegionIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
     }
-    t.update(region.fields.region.fields.isEnabled, false)
-    if (isSourceDeck && sourceDurationTicks !== undefined) {
-      updateMagicLoopDurationInTransaction(
-        t,
-        undefined,
-        Math.max(getMagicLoopDurationTicks(t), sourceDurationTicks),
-        magicStopEndTicks,
-      )
-    }
-    const entities = resolveInsertedProjectEntities(region, t)
-    return { region, ...entities, establishedTempo }
-  })
+  }
   const inserted = deckNum <= 2
     ? await serializeSourceTiming(insertTransaction)
     : await insertTransaction()
@@ -3421,6 +3507,7 @@ async function insertSampleIntoProject(
     currentProjectBpm = bpm
   }
 
+  bindDeckRoutingGraph(deckIndex, projectDocument, inserted.routing, expectedSession)
   deck.sampleBpm = bpm
   deck.baseBpm = bpm
   deck.sampleMeta = sample
@@ -3436,12 +3523,7 @@ async function insertSampleIntoProject(
     expectedSession,
   )
   if (deckNum <= 2) {
-    try {
-      updateManualBpmReportUi((deckNum - 1) as 0 | 1)
-      await syncMagicLoopDuration(projectDocument, expectedSession)
-    } catch (error) {
-      console.warn('[NEXUS] magic loop resize after source insertion:', error)
-    }
+    updateManualBpmReportUi((deckNum - 1) as 0 | 1)
   }
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
   applyCurrentDeckEq((deckNum - 1) as WaveformDeckIndex)
@@ -3492,10 +3574,6 @@ async function uploadToNexus(
       throw new Error('Project connection changed during placement capture')
     }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
-    if (deckNum === 3 && options.replaceExistingMagic && decks[2].regionEntity) {
-      setMagicStatus('generating', 'REPLACING PREVIOUS MAGIC DECK')
-      await removeMagicDeckProjectContent(expectedSession)
-    }
     const inserted = await insertSampleIntoProject(
       deckNum,
       sample,
@@ -3532,7 +3610,21 @@ function removeDeckContentInTransaction(
   const sampleId = region?.fields.sample.value.entityId ?? storedSampleId
   const automationCollectionId = region?.fields.playbackAutomationCollection.value.entityId
     ?? storedAutomationCollectionId
-  if (region) t.remove(region)
+  const chainIds = region
+    ? logicalRegionChainIds(
+        t.entities
+          .ofTypes('audioRegion')
+          .get()
+          .filter((candidate) =>
+            candidate.fields.track.value.entityId === region.fields.track.value.entityId)
+          .map(regionSnapshot),
+        region.id,
+      )
+    : []
+  chainIds.forEach((chainRegionId) => {
+    const chainRegion = t.entities.ofTypes('audioRegion').getEntity(chainRegionId)
+    if (chainRegion) t.remove(chainRegion)
+  })
 
   const sampleStillUsed = sampleId
     ? t.entities
@@ -3583,18 +3675,11 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
     operation.suppressProjectRemovalSync = true
     try {
       await projectDocument.modify((t) => {
-        const magicStopEndTicks = getMagicScheduledStopEndTicks(t)
         removeDeckContentInTransaction(
           t,
           regionId,
           storedSampleId,
           storedAutomationCollectionId,
-        )
-        updateMagicLoopDurationInTransaction(
-          t,
-          undefined,
-          undefined,
-          magicStopEndTicks,
         )
       })
       clearDeckContentEntities(deck)
@@ -3602,12 +3687,6 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
       operation.suppressProjectRemovalSync = false
     }
   })
-
-  try {
-    await syncMagicLoopDuration(projectDocument, expectedSession)
-  } catch (error) {
-    console.warn('[NEXUS] magic loop resize after deck removal:', error)
-  }
 }
 
 async function removeMagicDeckProjectContent(expectedSession: number) {
@@ -3712,10 +3791,7 @@ async function loadAudioFile(
   setStatus('connecting', `DECK ${deckIndex + 1}: ${replacing ? 'PREPARING REPLACEMENT' : 'PREPARING UPLOAD'}…`)
 
   if (replacing) {
-    setStatus('connecting', `DECK ${deckIndex + 1}: REMOVING OLD PROJECT CONTENT BEFORE REPLACEMENT…`)
-    await removeDeckProjectContent(deckIndex, expectedSession)
-    clearSourceDeckLocalMedia(deckIndex)
-    updateSourceDeckUi(deckIndex)
+    setStatus('connecting', `DECK ${deckIndex + 1}: PRESERVING HISTORY — PREPARING FORWARD INSERTION…`)
   }
 
   const inserted = await uploadToNexus(deckIndex + 1, file, false, expectedSession, { placement })
@@ -4387,7 +4463,6 @@ async function generateMagicAudio() {
         bpm: generationBpm,
         musicDurationTicks: Ticks.Bars(MAGIC_DURATION_BARS),
       },
-      replaceExistingMagic: true,
       sampleDescription: promptText,
     })
     if (!inserted) {

@@ -166,6 +166,18 @@
                 </div>
                 <div class="bpm-dialogue-error" id="deck1-bpm-report-error"></div>
               </div>
+              <div class="bar-assistant-form is-hidden" id="deck1-bar-assistant" role="group" aria-labelledby="deck1-bar-assistant-title">
+                <span class="deck-assistant-kicker">DECK ASSISTANT</span>
+                <div class="bar-assistant-title" id="deck1-bar-assistant-title"></div>
+                <p class="bar-assistant-copy" id="deck1-bar-assistant-copy"></p>
+                <label class="bar-assistant-label" for="deck1-bar-assistant-input">AUDIOTOOL BAR</label>
+                <div class="bar-assistant-actions">
+                  <input type="number" id="deck1-bar-assistant-input" class="bpm-dialogue-input bar-assistant-input" min="1" step="1" value="1" inputmode="numeric" autocomplete="off" />
+                  <button id="deck1-bar-assistant-cancel" class="btn-danger bpm-dialogue-button" type="button">CANCEL</button>
+                  <button id="deck1-bar-assistant-confirm" class="btn-primary bpm-dialogue-button" type="button">PLACE AT BAR</button>
+                </div>
+                <div class="bar-assistant-error" id="deck1-bar-assistant-error" aria-live="polite"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -287,6 +299,18 @@
                 </div>
                 <div class="bpm-dialogue-error" id="deck2-bpm-report-error"></div>
               </div>
+              <div class="bar-assistant-form is-hidden" id="deck2-bar-assistant" role="group" aria-labelledby="deck2-bar-assistant-title">
+                <span class="deck-assistant-kicker">DECK ASSISTANT</span>
+                <div class="bar-assistant-title" id="deck2-bar-assistant-title"></div>
+                <p class="bar-assistant-copy" id="deck2-bar-assistant-copy"></p>
+                <label class="bar-assistant-label" for="deck2-bar-assistant-input">AUDIOTOOL BAR</label>
+                <div class="bar-assistant-actions">
+                  <input type="number" id="deck2-bar-assistant-input" class="bpm-dialogue-input bar-assistant-input" min="1" step="1" value="1" inputmode="numeric" autocomplete="off" />
+                  <button id="deck2-bar-assistant-cancel" class="btn-danger bpm-dialogue-button" type="button">CANCEL</button>
+                  <button id="deck2-bar-assistant-confirm" class="btn-primary bpm-dialogue-button" type="button">PLACE AT BAR</button>
+                </div>
+                <div class="bar-assistant-error" id="deck2-bar-assistant-error" aria-live="polite"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -363,6 +387,20 @@
             <span class="project-transport-status" id="d3-project-status">EMPTY</span>
             <div class="transport-error" id="d3-transport-error" aria-live="polite"></div>
           </div>
+          <div class="bpm-dialogue magic-deck-assistant is-hidden" id="deck3-assistant">
+            <div class="bar-assistant-form is-hidden" id="deck3-bar-assistant" role="group" aria-labelledby="deck3-bar-assistant-title">
+              <span class="deck-assistant-kicker">DECK ASSISTANT</span>
+              <div class="bar-assistant-title" id="deck3-bar-assistant-title"></div>
+              <p class="bar-assistant-copy" id="deck3-bar-assistant-copy"></p>
+              <label class="bar-assistant-label" for="deck3-bar-assistant-input">AUDIOTOOL BAR</label>
+              <div class="bar-assistant-actions">
+                <input type="number" id="deck3-bar-assistant-input" class="bpm-dialogue-input bar-assistant-input" min="1" step="1" value="1" inputmode="numeric" autocomplete="off" />
+                <button id="deck3-bar-assistant-cancel" class="btn-danger bpm-dialogue-button" type="button">CANCEL</button>
+                <button id="deck3-bar-assistant-confirm" class="btn-primary bpm-dialogue-button" type="button">USE BAR</button>
+              </div>
+              <div class="bar-assistant-error" id="deck3-bar-assistant-error" aria-live="polite"></div>
+            </div>
+          </div>
           <div class="magic-playback-row">
             <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>
             <div class="controls-row magic-controls-row">
@@ -434,33 +472,5 @@
   </div>
 </div>
 
-<!-- Deck Assistant fallback for manual Audiotool bar operations -->
-<div id="placement-modal" class="modal-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="placement-modal-title">
-  <div class="modal">
-    <div class="modal-header">
-      <span class="modal-kicker">DECK ASSISTANT</span>
-      <h2 class="modal-title" id="placement-modal-title">Choose Insertion Bar</h2>
-    </div>
-    <div class="modal-body">
-      <p class="modal-copy" id="placement-modal-copy"></p>
-      <label class="modal-label" for="placement-modal-input">AUDIOTOOL BAR</label>
-      <input
-        type="number"
-        id="placement-modal-input"
-        class="modal-input"
-        min="1"
-        step="1"
-        value="1"
-        inputmode="numeric"
-        autocomplete="off"
-      />
-      <div class="modal-error" id="placement-modal-error" aria-live="polite"></div>
-    </div>
-    <div class="modal-actions">
-      <button id="placement-modal-cancel" class="btn-danger" type="button">⬡ CANCEL LOAD</button>
-      <button id="placement-modal-confirm" class="btn-primary" type="button">⬡ PLACE AT BAR</button>
-    </div>
-  </div>
-</div>
 </body>
 </html>

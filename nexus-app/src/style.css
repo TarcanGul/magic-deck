@@ -442,6 +442,59 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .bpm-dialogue-input { min-width: 90px; flex: 1 1 100px; background: var(--black); border: 1px solid var(--grey-light); color: var(--white); font-family: var(--font-data); padding: 7px 8px; outline: none; border-radius: 3px; }
 .bpm-dialogue-input:focus { border-color: var(--red); box-shadow: 0 0 8px var(--red-glow2); }
 .bpm-dialogue-button { flex: 0 0 auto; padding: 7px 10px; }
+.bpm-dialogue.bar-assistant-active > :not(.bar-assistant-form) { display: none; }
+.bar-assistant-form {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.deck-assistant-kicker {
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 2px;
+}
+.bar-assistant-title {
+  color: var(--red);
+  font-family: var(--font-header);
+  font-size: 17px;
+  letter-spacing: 2px;
+  line-height: 1.1;
+}
+.bar-assistant-copy {
+  margin: 0;
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.bar-assistant-label {
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 1px;
+}
+.bar-assistant-actions {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.bar-assistant-input { flex: 1 1 90px; }
+.bar-assistant-error {
+  min-height: 1.2em;
+  color: var(--red);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 0.5px;
+}
+.magic-deck-assistant {
+  width: 100%;
+  min-height: 0;
+  flex-basis: auto;
+}
 .bpm-report-trigger, .deck-unload {
   flex: 0 0 auto;
   padding: 5px 7px;
