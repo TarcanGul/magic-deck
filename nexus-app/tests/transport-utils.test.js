@@ -238,21 +238,21 @@ test('rounds to safe next-bar and four-bar phrase boundaries', () => {
   )
 })
 
-test('moves a remembered launch position by beats, bars, and four-bar blocks', () => {
+test('moves an individual deck region by beats, bars, and four-bar blocks', () => {
   const beat = Ticks.Beat
   const bar = Ticks.Bars(1)
-  const remembered = bar * 8 + beat * 2
-  assert.equal(moveLaunchPosition(remembered, 'previous-beat', beat, bar), remembered - beat)
-  assert.equal(moveLaunchPosition(remembered, 'next-beat', beat, bar), remembered + beat)
-  assert.equal(moveLaunchPosition(remembered, 'previous-bar', beat, bar), remembered - bar)
-  assert.equal(moveLaunchPosition(remembered, 'next-bar', beat, bar), remembered + bar)
+  const currentPosition = bar * 8 + beat * 2
+  assert.equal(moveLaunchPosition(currentPosition, 'previous-beat', beat, bar), currentPosition - beat)
+  assert.equal(moveLaunchPosition(currentPosition, 'next-beat', beat, bar), currentPosition + beat)
+  assert.equal(moveLaunchPosition(currentPosition, 'previous-bar', beat, bar), currentPosition - bar)
+  assert.equal(moveLaunchPosition(currentPosition, 'next-bar', beat, bar), currentPosition + bar)
   assert.equal(
-    moveLaunchPosition(remembered, 'previous-four-bars', beat, bar),
-    remembered - bar * 4,
+    moveLaunchPosition(currentPosition, 'previous-four-bars', beat, bar),
+    currentPosition - bar * 4,
   )
   assert.equal(
-    moveLaunchPosition(remembered, 'next-four-bars', beat, bar),
-    remembered + bar * 4,
+    moveLaunchPosition(currentPosition, 'next-four-bars', beat, bar),
+    currentPosition + bar * 4,
   )
 })
 
@@ -265,7 +265,7 @@ test('composes every launch direction and step', () => {
   assert.equal(composeLaunchPositionAction('next', 'four-bars'), 'next-four-bars')
 })
 
-test('rejects remembered launch movement before bar 1 or beyond safe ticks', () => {
+test('rejects deck region movement before bar 1 or beyond safe ticks', () => {
   const beat = Ticks.Beat
   const bar = Ticks.Bars(1)
   assert.throws(
@@ -317,21 +317,25 @@ test('plans launch restoration, cancellation, and quantized stopping', () => {
   })
 })
 
-test('plans cue launches with rounded source offsets and natural remaining duration', () => {
-  assert.deepEqual(planRegionLaunch(10_001, 50_000, 0.25), {
+test('plans cue launches at exact entered bars with rounded offsets and natural duration', () => {
+  const ticksPerBar = Ticks.Bars(1)
+  const firstTarget = barToPositionTicks(14, ticksPerBar)
+  const secondTarget = barToPositionTicks(21, ticksPerBar)
+  assert.deepEqual(planRegionLaunch(10_001, firstTarget, 0.25), {
     kind: 'launch',
-    positionTicks: 50_000,
+    positionTicks: firstTarget,
     cueOffsetTicks: 2_500,
     durationTicks: 7_501,
     isEnabled: true,
   })
-  assert.deepEqual(planRegionLaunch(10_001, 60_000, 0.75), {
+  assert.deepEqual(planRegionLaunch(10_001, secondTarget, 0.75), {
     kind: 'launch',
-    positionTicks: 60_000,
+    positionTicks: secondTarget,
     cueOffsetTicks: 7_501,
     durationTicks: 2_500,
     isEnabled: true,
   })
+  assert.equal(planRegionLaunch(10_001, secondTarget, 0.25).cueOffsetTicks, 2_500)
   assert.throws(() => planRegionLaunch(1, 0, 0.999), /no playable/)
   assert.throws(() => planRegionLaunch(10, 0, 1), /\[0, 1\)/)
 })

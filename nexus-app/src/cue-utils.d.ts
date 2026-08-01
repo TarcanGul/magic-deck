@@ -56,6 +56,41 @@ export function buildIndependentAudioRegionCopy<TPointer>(
   overwrites?: CueAudioRegionOverwrites,
 ): CueAudioRegionFields<TPointer>
 
+export interface CueRegionDuplicateInput<TPointer = unknown> {
+  source: CueAudioRegionFields<TPointer>
+  playbackAutomationCollection: TPointer
+  targetPositionTicks: number
+  fullDurationTicks: number
+  cuePosition: number
+}
+
+export function planCueRegionDuplicate<TPointer>(input: CueRegionDuplicateInput<TPointer>): {
+  region: CueAudioRegionFields<TPointer>
+  cueOffsetTicks: number
+  remainingDurationTicks: number
+  automationTerminalTicks: number
+}
+
+export interface SourceInstanceTimingResizeInput {
+  positionTicks: number
+  durationTicks: number
+  collectionOffsetTicks: number
+  loopOffsetTicks: number
+  loopDurationTicks: number
+  previousFullDurationTicks: number
+  nextFullDurationTicks: number
+}
+
+export function planSourceInstanceTimingResize(input: SourceInstanceTimingResizeInput): {
+  positionTicks: number
+  durationTicks: number
+  collectionOffsetTicks: number
+  loopOffsetTicks: number
+  loopDurationTicks: number
+  automationTerminalTicks: number
+  explicitlyShortened: boolean
+}
+
 export function cuePositionsFromSegments(segments: CueRegionSegment[]): number[]
 
 export interface CueOffsetResizeInput {

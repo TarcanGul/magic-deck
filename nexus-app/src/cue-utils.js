@@ -59,6 +59,99 @@ export function buildIndependentAudioRegionCopy(source, overwrites = {}) {
   }
 }
 
+export function planCueRegionDuplicate({
+  source,
+  playbackAutomationCollection,
+  targetPositionTicks,
+  fullDurationTicks,
+  cuePosition,
+}) {
+  if (!Number.isSafeInteger(targetPositionTicks) || targetPositionTicks < 0) {
+    throw new RangeError('Cue target must be a non-negative safe tick position')
+  }
+  if (!Number.isSafeInteger(fullDurationTicks) || fullDurationTicks <= 0) {
+    throw new RangeError('Cue source duration must be a positive safe integer')
+  }
+  if (
+    typeof cuePosition !== 'number'
+    || !Number.isFinite(cuePosition)
+    || cuePosition < 0
+    || cuePosition >= 1
+  ) throw new RangeError('Cue position must be a finite number in [0, 1)')
+
+  const cueOffsetTicks = Math.round(fullDurationTicks * cuePosition)
+  const remainingDurationTicks = fullDurationTicks - cueOffsetTicks
+  if (remainingDurationTicks <= 0) throw new RangeError('Cue has no playable audio remaining')
+  const fadeInDurationTicks = Math.min(
+    Math.max(0, source.fadeInDurationTicks),
+    remainingDurationTicks,
+  )
+  const fadeOutDurationTicks = Math.min(
+    Math.max(0, source.fadeOutDurationTicks),
+    Math.max(0, remainingDurationTicks - fadeInDurationTicks),
+  )
+  return {
+    region: buildIndependentAudioRegionCopy({
+      ...source,
+      playbackAutomationCollection,
+    }, {
+      region: {
+        positionTicks: targetPositionTicks,
+        durationTicks: remainingDurationTicks,
+        collectionOffsetTicks: cueOffsetTicks,
+        isEnabled: true,
+      },
+      fadeInDurationTicks,
+      fadeOutDurationTicks,
+    }),
+    cueOffsetTicks,
+    remainingDurationTicks,
+    automationTerminalTicks: fullDurationTicks,
+  }
+}
+
+export function planSourceInstanceTimingResize({
+  positionTicks,
+  durationTicks,
+  collectionOffsetTicks,
+  loopOffsetTicks,
+  loopDurationTicks,
+  previousFullDurationTicks,
+  nextFullDurationTicks,
+}) {
+  if (
+    ![positionTicks, durationTicks, collectionOffsetTicks, loopOffsetTicks, loopDurationTicks,
+      previousFullDurationTicks, nextFullDurationTicks].every(Number.isSafeInteger)
+    || positionTicks < 0
+    || durationTicks <= 0
+    || collectionOffsetTicks < 0
+    || previousFullDurationTicks <= 0
+    || nextFullDurationTicks <= 0
+    || collectionOffsetTicks >= previousFullDurationTicks
+  ) throw new RangeError('Source instance timing is invalid')
+
+  const scale = (ticks) =>
+    Math.round((ticks / previousFullDurationTicks) * nextFullDurationTicks)
+  const nextCollectionOffsetTicks = Math.min(
+    nextFullDurationTicks - 1,
+    scale(collectionOffsetTicks),
+  )
+  const previousNaturalDurationTicks = previousFullDurationTicks - collectionOffsetTicks
+  const nextNaturalDurationTicks = nextFullDurationTicks - nextCollectionOffsetTicks
+  const explicitlyShortened = durationTicks < previousNaturalDurationTicks
+  return {
+    positionTicks,
+    durationTicks: explicitlyShortened
+      ? Math.min(durationTicks, nextNaturalDurationTicks)
+      : nextNaturalDurationTicks,
+    collectionOffsetTicks: nextCollectionOffsetTicks,
+    loopOffsetTicks: scale(loopOffsetTicks),
+    loopDurationTicks: scale(loopDurationTicks),
+    automationTerminalTicks: nextFullDurationTicks,
+    explicitlyShortened,
+  }
+}
+
 export function cuePositionsFromSegments(segments) {
   if (segments.length < 2) return []
   const sorted = [...segments].sort((a, b) =>

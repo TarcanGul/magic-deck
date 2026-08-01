@@ -7,7 +7,9 @@ import {
   cuePositionsFromSegments,
   planAudioRegionSplit,
   planLegacyCueChainCollapse,
+  planCueRegionDuplicate,
   planResizedCueOffsets,
+  planSourceInstanceTimingResize,
 } from '../src/cue-utils.js'
 
 test('plans adjacent audio regions without changing playback alignment', () => {
@@ -118,6 +120,144 @@ test('creates split regions with independent owned fields and only shared Nexus 
   assert.equal(right.fadeOutSlope, original.fadeOutSlope)
   assert.equal(right.timestretchMode, original.timestretchMode)
   assert.equal(right.pitchShiftSemitones, original.pitchShiftSemitones)
+})
+
+test('plans an exact-position cropped duplicate with independent playback automation', () => {
+  const sourceAutomation = { entityId: 'automation-original' }
+  const duplicateAutomation = { entityId: 'automation-duplicate' }
+  const source = {
+    region: {
+      positionTicks: 3_840,
+      durationTicks: 10_001,
+      collectionOffsetTicks: 0,
+      loopOffsetTicks: 120,
+      loopDurationTicks: 6_000,
+      isEnabled: true,
+      colorIndex: 7,
+      displayName: 'Deck A source',
+    },
+    track: { entityId: 'track' },
+    playbackAutomationCollection: sourceAutomation,
+    sample: { entityId: 'sample' },
+    gain: 0.8,
+    fadeInDurationTicks: 900,
+    fadeInSlope: -0.25,
+    fadeOutDurationTicks: 2_000,
+    fadeOutSlope: 0.5,
+    timestretchMode: 2,
+    pitchShiftSemitones: -2,
+  }
+  const original = structuredClone(source)
+  const plan = planCueRegionDuplicate({
+    source,
+    playbackAutomationCollection: duplicateAutomation,
+    targetPositionTicks: 49_920,
+    fullDurationTicks: 10_001,
+    cuePosition: 0.75,
+  })
+
+  assert.deepEqual(source, original)
+  assert.equal(plan.cueOffsetTicks, 7_501)
+  assert.equal(plan.remainingDurationTicks, 2_500)
+  assert.equal(plan.automationTerminalTicks, 10_001)
+  assert.strictEqual(plan.region.playbackAutomationCollection, duplicateAutomation)
+  assert.notStrictEqual(plan.region.playbackAutomationCollection, sourceAutomation)
+  assert.deepEqual(plan.region.region, {
+    ...source.region,
+    positionTicks: 49_920,
+    durationTicks: 2_500,
+    collectionOffsetTicks: 7_501,
+    loopDurationTicks: 6_000,
+  })
+  assert.equal(plan.region.fadeInDurationTicks, 900)
+  assert.equal(plan.region.fadeOutDurationTicks, 1_600)
+})
+
+test('rejects invalid duplicate scheduling without mutating the source payload', () => {
+  const source = {
+    region: {
+      positionTicks: 0,
+      durationTicks: 1_000,
+      collectionOffsetTicks: 0,
+      loopOffsetTicks: 0,
+      loopDurationTicks: 1_000,
+      isEnabled: true,
+      colorIndex: 1,
+      displayName: 'Deck source',
+    },
+    track: 'track',
+    playbackAutomationCollection: 'original-automation',
+    sample: 'sample',
+    gain: 1,
+    fadeInDurationTicks: 0,
+    fadeInSlope: 0,
+    fadeOutDurationTicks: 0,
+    fadeOutSlope: 0,
+    timestretchMode: 2,
+    pitchShiftSemitones: 0,
+  }
+  const original = structuredClone(source)
+  assert.throws(() => planCueRegionDuplicate({
+    source,
+    playbackAutomationCollection: 'duplicate-automation',
+    targetPositionTicks: -1,
+    fullDurationTicks: 1_000,
+    cuePosition: 0.5,
+  }), /non-negative/)
+  assert.throws(() => planCueRegionDuplicate({
+    source,
+    playbackAutomationCollection: 'duplicate-automation',
+    targetPositionTicks: 0,
+    fullDurationTicks: 1_000,
+    cuePosition: 1,
+  }), /\[0, 1\)/)
+  assert.deepEqual(source, original)
+})
+
+test('resizes natural and explicitly stopped instances without moving their timeline starts', () => {
+  const natural = planSourceInstanceTimingResize({
+    positionTicks: 40_000,
+    durationTicks: 7_500,
+    collectionOffsetTicks: 2_500,
+    loopOffsetTicks: 100,
+    loopDurationTicks: 10_000,
+    previousFullDurationTicks: 10_000,
+    nextFullDurationTicks: 12_000,
+  })
+  assert.deepEqual(natural, {
+    positionTicks: 40_000,
+    durationTicks: 9_000,
+    collectionOffsetTicks: 3_000,
+    loopOffsetTicks: 120,
+    loopDurationTicks: 12_000,
+    automationTerminalTicks: 12_000,
+    explicitlyShortened: false,
+  })
+
+  const stopped = planSourceInstanceTimingResize({
+    positionTicks: 80_000,
+    durationTicks: 2_000,
+    collectionOffsetTicks: 2_500,
+    loopOffsetTicks: 100,
+    loopDurationTicks: 10_000,
+    previousFullDurationTicks: 10_000,
+    nextFullDurationTicks: 4_000,
+  })
+  assert.equal(stopped.positionTicks, 80_000)
+  assert.equal(stopped.collectionOffsetTicks, 1_000)
+  assert.equal(stopped.durationTicks, 2_000)
+  assert.equal(stopped.explicitlyShortened, true)
+
+  const clamped = planSourceInstanceTimingResize({
+    positionTicks: 80_000,
+    durationTicks: 4_000,
+    collectionOffsetTicks: 5_000,
+    loopOffsetTicks: 0,
+    loopDurationTicks: 10_000,
+    previousFullDurationTicks: 10_000,
+    nextFullDurationTicks: 6_000,
+  })
+  assert.equal(clamped.durationTicks, 3_000)
 })
 
 test('derives authoritative cue positions from contiguous project segments', () => {
