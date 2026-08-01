@@ -744,7 +744,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .deck-library-grid-header, .deck-library-row {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(110px, 2fr) minmax(70px, 1.3fr) 55px 74px;
+  grid-template-columns: minmax(130px, 1fr) 55px 74px;
 }
 .deck-library-grid-header {
   border-bottom: 1px solid var(--grey-light);
@@ -797,6 +797,41 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   white-space: nowrap;
 }
 .deck-library-cell:last-child { border-right: 0; }
+.deck-library-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding-left: calc(4px + var(--tree-depth, 0) * 12px);
+}
+.deck-library-disclosure {
+  width: 17px;
+  min-width: 17px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.deck-library-disclosure:disabled { cursor: default; opacity: 1; }
+.deck-library-disclosure:focus-visible { box-shadow: inset 0 0 0 1px var(--red); }
+.deck-library-track-icon {
+  width: 17px;
+  min-width: 17px;
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1;
+  text-align: center;
+}
+.deck-library-node-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .deck-library-empty {
   padding: 12px 6px;
   color: var(--grey-text);
@@ -922,7 +957,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   .bpm-dialogue-header-actions { flex-wrap: wrap; }
   .music-library-row { align-items: stretch; }
   .music-library-summary { min-width: 100%; }
-  .deck-library-grid-header, .deck-library-row { grid-template-columns: minmax(100px, 2fr) minmax(70px, 1fr); }
+  .deck-library-grid-header, .deck-library-row { grid-template-columns: minmax(120px, 1fr) 55px; }
   .deck-library-grid-header > :nth-child(n+3), .deck-library-row > :nth-child(n+3) { display: none; }
   .bpm-report-actions { flex-wrap: wrap; }
   .bpm-report-actions .bpm-dialogue-input { flex-basis: 100%; }

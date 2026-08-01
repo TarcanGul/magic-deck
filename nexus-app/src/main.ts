@@ -51,15 +51,18 @@ import {
   planResizedCueOffsets,
 } from './cue-utils.js'
 import {
-  filterMusicEntries,
+  buildMusicLibraryTree,
+  findMusicLibraryNode,
+  flattenMusicLibraryTree,
   indexMusicDirectory,
   indexMusicFiles,
   isSupportedMusicFile,
-  nextMusicSelectionIndex,
-  sortMusicEntries,
+  musicLibraryTreeKeyAction,
+  recoverMusicLibrarySelectionId,
 } from './music-library-utils.js'
 import type {
   MusicLibraryEntry,
+  MusicLibraryNode,
   MusicLibrarySortDirection,
   MusicLibrarySortKey,
 } from './music-library-utils.js'
@@ -240,6 +243,7 @@ interface MusicLibraryPickerState {
   sortKey: MusicLibrarySortKey
   sortDirection: MusicLibrarySortDirection
   selectedId: string | null
+  expandedFolderIds: Set<string>
 }
 type MusicLibraryConnectionState = 'empty' | 'busy' | 'ready' | 'reconnect' | 'error'
 type MusicDirectoryHandle = FileSystemDirectoryHandle & {
@@ -295,6 +299,7 @@ let deckFxAssistantRequestId = 0
 let activeLibraryDeckIndex: 0 | 1 | null = null
 let musicLibraryDirectoryHandle: MusicDirectoryHandle | null = null
 let musicLibraryEntries: MusicLibraryEntry[] = []
+let musicLibraryTree: MusicLibraryNode[] = []
 let musicLibraryFolderName = ''
 let musicLibraryConnectionState: MusicLibraryConnectionState = 'empty'
 let musicLibraryStatusMessage = 'NO MUSIC FOLDER SELECTED'
@@ -317,8 +322,14 @@ const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
 ]
 const musicLibraryPickerStates: [MusicLibraryPickerState, MusicLibraryPickerState] = [
-  { query: '', sortKey: 'name', sortDirection: 'ascending', selectedId: null },
-  { query: '', sortKey: 'name', sortDirection: 'ascending', selectedId: null },
+  {
+    query: '', sortKey: 'name', sortDirection: 'ascending', selectedId: null,
+    expandedFolderIds: new Set(),
+  },
+  {
+    query: '', sortKey: 'name', sortDirection: 'ascending', selectedId: null,
+    expandedFolderIds: new Set(),
+  },
 ]
 const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
   { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
@@ -498,13 +509,25 @@ function setMusicLibrarySetupState(
   renderMusicLibrarySetup()
 }
 
+function updateMusicLibraryIndex(entries: MusicLibraryEntry[]) {
+  musicLibraryEntries = entries
+  musicLibraryTree = buildMusicLibraryTree(entries)
+  for (const state of musicLibraryPickerStates) {
+    for (const folderId of state.expandedFolderIds) {
+      if (findMusicLibraryNode(musicLibraryTree, folderId)?.kind !== 'folder') {
+        state.expandedFolderIds.delete(folderId)
+      }
+    }
+  }
+}
+
 async function scanMusicDirectory(handle: MusicDirectoryHandle) {
   setMusicLibrarySetupState('busy', `INDEXING ${handle.name.toUpperCase()}…`)
   try {
     const entries = await indexMusicDirectory(handle)
     musicLibraryDirectoryHandle = handle
     musicLibraryFolderName = handle.name
-    musicLibraryEntries = entries
+    updateMusicLibraryIndex(entries)
     musicLibraryUsesFallback = false
     setMusicLibrarySetupState(
       'ready',
@@ -5457,13 +5480,14 @@ function formatLibraryModified(lastModified: number) {
   })
 }
 
-function visibleMusicLibraryEntries(deckIndex: 0 | 1) {
+function visibleMusicLibraryNodes(deckIndex: 0 | 1) {
   const state = musicLibraryPickerStates[deckIndex]
-  return sortMusicEntries(
-    filterMusicEntries(musicLibraryEntries, state.query),
-    state.sortKey,
-    state.sortDirection,
-  )
+  return flattenMusicLibraryTree(musicLibraryTree, {
+    expandedFolderIds: state.expandedFolderIds,
+    query: state.query,
+    sortKey: state.sortKey,
+    sortDirection: state.sortDirection,
+  })
 }
 
 function focusSelectedMusicLibraryRow(deckIndex: 0 | 1) {
@@ -5477,22 +5501,45 @@ function focusSelectedMusicLibraryRow(deckIndex: 0 | 1) {
   }
 }
 
-function selectMusicLibraryEntry(deckIndex: 0 | 1, entryId: string, focus = false) {
+function selectMusicLibraryNode(deckIndex: 0 | 1, nodeId: string, focus = false) {
   const state = musicLibraryPickerStates[deckIndex]
-  state.selectedId = entryId
+  state.selectedId = nodeId
   const controls = getDeckLibraryElements(deckIndex)
   const rows = Array.from(controls.list.querySelectorAll<HTMLElement>('.deck-library-row'))
   if (rows.length === 0) {
     renderDeckLibraryView(deckIndex)
   } else {
     rows.forEach((row) => {
-      const selected = row.dataset.libraryEntryId === entryId
+      const selected = row.dataset.libraryNodeId === nodeId
       row.setAttribute('aria-selected', String(selected))
       row.tabIndex = selected ? 0 : -1
     })
-    controls.load.disabled = !projectConnected || nexus === null
+    const selectedNode = findMusicLibraryNode(musicLibraryTree, state.selectedId)
+    controls.load.disabled = selectedNode?.kind !== 'track'
+      || !projectConnected
+      || nexus === null
+      || deckOperationStates[deckIndex].pendingCount > 0
   }
   if (focus) focusSelectedMusicLibraryRow(deckIndex)
+}
+
+function toggleMusicLibraryFolder(
+  deckIndex: 0 | 1,
+  folderId: string,
+  expanded?: boolean,
+  focus = true,
+) {
+  const state = musicLibraryPickerStates[deckIndex]
+  state.selectedId = folderId
+  if (state.query.trim()) {
+    if (focus) focusSelectedMusicLibraryRow(deckIndex)
+    return
+  }
+  const shouldExpand = expanded ?? !state.expandedFolderIds.has(folderId)
+  if (shouldExpand) state.expandedFolderIds.add(folderId)
+  else state.expandedFolderIds.delete(folderId)
+  renderDeckLibraryView(deckIndex)
+  if (focus) requestAnimationFrame(() => focusSelectedMusicLibraryRow(deckIndex))
 }
 
 function handleMusicLibraryRowKey(
@@ -5513,39 +5560,48 @@ function handleMusicLibraryRowKey(
     controls.search.select()
     return
   }
-  if (event.key === 'Enter') {
-    event.preventDefault()
-    selectMusicLibraryEntry(deckIndex, entryId)
-    void loadSelectedMusicLibraryEntry(deckIndex)
-    return
-  }
-  if (!['ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return
+  if (![
+    'Enter',
+    'ArrowUp',
+    'ArrowDown',
+    'ArrowLeft',
+    'ArrowRight',
+    'Home',
+    'End',
+    'PageUp',
+    'PageDown',
+  ].includes(event.key)) return
   event.preventDefault()
-  const entries = visibleMusicLibraryEntries(deckIndex)
-  const currentIndex = Math.max(0, entries.findIndex(({ id }) => id === entryId))
-  const nextIndex = nextMusicSelectionIndex(
-    currentIndex,
+  const action = musicLibraryTreeKeyAction(
+    visibleMusicLibraryNodes(deckIndex),
+    entryId,
     event.key,
-    entries.length,
     MUSIC_LIBRARY_PAGE_SIZE,
   )
-  const nextEntry = entries[nextIndex]
-  if (nextEntry) selectMusicLibraryEntry(deckIndex, nextEntry.id, true)
+  if (!action.id || action.type === 'none') return
+  if (action.type === 'select') selectMusicLibraryNode(deckIndex, action.id, true)
+  else if (action.type === 'expand') toggleMusicLibraryFolder(deckIndex, action.id, true)
+  else if (action.type === 'collapse') toggleMusicLibraryFolder(deckIndex, action.id, false)
+  else if (action.type === 'activate') {
+    selectMusicLibraryNode(deckIndex, action.id)
+    void loadSelectedMusicLibraryEntry(deckIndex)
+  }
 }
 
 function renderDeckLibraryView(deckIndex: 0 | 1) {
   const controls = getDeckLibraryElements(deckIndex)
   const state = musicLibraryPickerStates[deckIndex]
-  const entries = visibleMusicLibraryEntries(deckIndex)
-  if (!entries.some(({ id }) => id === state.selectedId)) {
-    state.selectedId = entries[0]?.id ?? null
-  }
+  const visibleNodes = visibleMusicLibraryNodes(deckIndex)
+  state.selectedId = recoverMusicLibrarySelectionId(state.selectedId, visibleNodes)
   controls.search.value = state.query
-  controls.count.textContent = `${entries.length}/${musicLibraryEntries.length}`
-  controls.grid.setAttribute('aria-rowcount', String(entries.length + 1))
+  const matchingTrackCount = state.query.trim()
+    ? visibleNodes.filter(({ node }) => node.kind === 'track').length
+    : musicLibraryEntries.length
+  controls.count.textContent = `${matchingTrackCount}/${musicLibraryEntries.length}`
+  controls.grid.setAttribute('aria-rowcount', String(visibleNodes.length + 1))
   controls.list.replaceChildren()
 
-  if (entries.length === 0) {
+  if (visibleNodes.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'deck-library-empty'
     empty.textContent = musicLibraryEntries.length === 0
@@ -5553,43 +5609,80 @@ function renderDeckLibraryView(deckIndex: 0 | 1) {
       : 'NO MATCHING TRACKS'
     controls.list.append(empty)
   } else {
-    entries.forEach((entry, index) => {
+    visibleNodes.forEach(({ node, depth, expanded }, index) => {
       const row = document.createElement('div')
-      const selected = entry.id === state.selectedId
+      const selected = node.id === state.selectedId
       row.className = 'deck-library-row'
       row.id = `deck${deckIndex + 1}-library-row-${index}`
       row.setAttribute('role', 'row')
       row.setAttribute('aria-rowindex', String(index + 2))
       row.setAttribute('aria-selected', String(selected))
-      row.setAttribute('aria-label', `${entry.name}, folder ${entry.folder || 'library root'}`)
-      row.dataset.libraryEntryId = entry.id
+      row.setAttribute('aria-level', String(depth + 1))
+      row.setAttribute('aria-label', `${node.kind === 'folder' ? 'Folder' : 'Track'} ${node.name}`)
+      if (node.kind === 'folder') row.setAttribute('aria-expanded', String(expanded))
+      row.dataset.libraryNodeId = node.id
       row.tabIndex = selected ? 0 : -1
 
-      const values = [
-        entry.name,
-        entry.folder || '—',
-        formatLibraryFileSize(entry.size),
-        formatLibraryModified(entry.lastModified),
-      ]
-      values.forEach((value, cellIndex) => {
+      const nameCell = document.createElement('div')
+      nameCell.className = 'deck-library-cell deck-library-name-cell'
+      nameCell.setAttribute('role', 'gridcell')
+      nameCell.setAttribute('aria-colindex', '1')
+      nameCell.style.setProperty('--tree-depth', String(depth))
+      nameCell.title = node.relativePath
+      if (node.kind === 'folder') {
+        const disclosure = document.createElement('button')
+        disclosure.className = 'deck-library-disclosure'
+        disclosure.type = 'button'
+        disclosure.tabIndex = -1
+        disclosure.disabled = Boolean(state.query.trim())
+        disclosure.setAttribute('aria-label', `${expanded ? 'Collapse' : 'Expand'} folder ${node.name}`)
+        const icon = document.createElement('span')
+        icon.setAttribute('aria-hidden', 'true')
+        icon.textContent = expanded ? '📂' : '📁'
+        disclosure.append(icon)
+        disclosure.addEventListener('click', (event) => {
+          event.stopPropagation()
+          toggleMusicLibraryFolder(deckIndex, node.id, !expanded)
+        })
+        disclosure.addEventListener('dblclick', (event) => event.stopPropagation())
+        nameCell.append(disclosure)
+      } else {
+        const icon = document.createElement('span')
+        icon.className = 'deck-library-track-icon'
+        icon.setAttribute('aria-hidden', 'true')
+        icon.textContent = '♫'
+        nameCell.append(icon)
+      }
+      const name = document.createElement('span')
+      name.className = 'deck-library-node-name'
+      name.textContent = node.name
+      nameCell.append(name)
+      row.append(nameCell)
+
+      const values = node.kind === 'track'
+        ? [formatLibraryFileSize(node.size), formatLibraryModified(node.lastModified)]
+        : ['—', '—']
+      values.forEach((value, valueIndex) => {
         const cell = document.createElement('div')
         cell.className = 'deck-library-cell'
         cell.setAttribute('role', 'gridcell')
-        cell.setAttribute('aria-colindex', String(cellIndex + 1))
+        cell.setAttribute('aria-colindex', String(valueIndex + 2))
         cell.textContent = value
         cell.title = value
         row.append(cell)
       })
-      row.addEventListener('click', () => selectMusicLibraryEntry(deckIndex, entry.id, true))
-      row.addEventListener('dblclick', () => { void loadSelectedMusicLibraryEntry(deckIndex) })
-      row.addEventListener('keydown', (event) => handleMusicLibraryRowKey(event, deckIndex, entry.id))
+      row.addEventListener('click', () => selectMusicLibraryNode(deckIndex, node.id, true))
+      row.addEventListener('dblclick', () => {
+        if (node.kind === 'folder') toggleMusicLibraryFolder(deckIndex, node.id)
+        else void loadSelectedMusicLibraryEntry(deckIndex)
+      })
+      row.addEventListener('keydown', (event) => handleMusicLibraryRowKey(event, deckIndex, node.id))
       controls.list.append(row)
     })
   }
 
   const sortLabels: Record<MusicLibrarySortKey, string> = {
-    name: 'FILE',
-    folder: 'FOLDER',
+    name: 'NAME',
     size: 'SIZE',
     modified: 'MODIFIED',
   }
@@ -5602,8 +5695,9 @@ function renderDeckLibraryView(deckIndex: 0 | 1) {
   })
 
   const operation = deckOperationStates[deckIndex]
+  const selectedNode = findMusicLibraryNode(musicLibraryTree, state.selectedId)
   controls.load.textContent = isSourceDeckSynchronized(deckIndex) ? 'REPLACE' : 'LOAD'
-  controls.load.disabled = state.selectedId === null
+  controls.load.disabled = selectedNode?.kind !== 'track'
     || !projectConnected
     || nexus === null
     || operation.pendingCount > 0
@@ -5664,10 +5758,11 @@ function showDeckLibraryAssistant(deckIndex: 0 | 1) {
 async function loadSelectedMusicLibraryEntry(deckIndex: 0 | 1) {
   if (activeLibraryDeckIndex !== deckIndex) return
   const controls = getDeckLibraryElements(deckIndex)
-  const entry = musicLibraryEntries.find(
-    ({ id }) => id === musicLibraryPickerStates[deckIndex].selectedId,
+  const entry = findMusicLibraryNode(
+    musicLibraryTree,
+    musicLibraryPickerStates[deckIndex].selectedId,
   )
-  if (!entry) return
+  if (!entry || entry.kind !== 'track') return
   if (!projectConnected || !nexus) {
     controls.error.textContent = 'CONNECT AN AUDIOTOOL PROJECT BEFORE LOADING'
     return
@@ -5731,7 +5826,13 @@ function setupDeckLibraryPicker(deckIndex: 0 | 1) {
     }
     if (event.key === 'Escape' && event.target !== controls.search) {
       event.preventDefault()
-      closeDeckLibraryAssistant()
+      if (musicLibraryPickerStates[deckIndex].query) {
+        musicLibraryPickerStates[deckIndex].query = ''
+        renderDeckLibraryView(deckIndex)
+        controls.search.focus()
+      } else {
+        closeDeckLibraryAssistant()
+      }
     }
   })
   controls.sortButtons.forEach((button) => {
@@ -6765,7 +6866,7 @@ function initApp() {
     const relativePath = files[0].webkitRelativePath
     musicLibraryFolderName = relativePath.split('/').filter(Boolean)[0] || 'SELECTED FOLDER'
     musicLibraryDirectoryHandle = null
-    musicLibraryEntries = entries
+    updateMusicLibraryIndex(entries)
     musicLibraryUsesFallback = true
     setMusicLibrarySetupState(
       'ready',
