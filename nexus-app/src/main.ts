@@ -1,7 +1,7 @@
 import { audiotool } from '@audiotool/nexus'
 import { secondsToTicks, Ticks } from '@audiotool/nexus/utils'
 import type { AuthenticatedClient, SyncedDocument } from '@audiotool/nexus'
-import type { SampleMeta } from '@audiotool/nexus/api'
+import type { SampleMeta, SampleUpload } from '@audiotool/nexus/api'
 import type { EntityQuery, NexusEntity, SafeTransactionBuilder } from '@audiotool/nexus/document'
 import type { Terminable } from '@audiotool/nexus/utils'
 import {
@@ -89,6 +89,19 @@ import {
   neutralFilterValue,
 } from './deck-filter-utils.js'
 import type { DeckFilterKind } from './deck-filter-utils.js'
+import {
+  createPerKeyTaskQueue,
+  createUploadTimingRecorder,
+  isCurrentSession,
+  resolveBpmRace,
+  settlePendingInsertion,
+  startConcurrentTasks,
+  uploadProgressText,
+} from './upload-orchestration-utils.js'
+import type {
+  BpmRaceDecision,
+  UploadProgressSnapshot,
+} from './upload-orchestration-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -172,6 +185,11 @@ interface UploadToNexusOptions {
   sampleDescription?: string
   placement?: DeckInsertionPlacement
 }
+interface PreparedSample {
+  name: string
+  durationSeconds: number
+  bpm?: number
+}
 interface DeckInsertionPlacement {
   deckIndex: WaveformDeckIndex
   bar: number
@@ -187,7 +205,7 @@ interface AubioBpmResult {
 interface DeckOperationState {
   pendingCount: number
   activeKind: 'loading' | 'replacing' | 'unloading' | 'launching' | 'cancelling' | 'stopping' | 'generating' | null
-  uploading: boolean
+  uploadProgress: UploadProgressSnapshot | null
   suppressProjectRemovalSync: boolean
 }
 interface ManualBpmReportState {
@@ -309,7 +327,8 @@ let nexus: SyncedDocument | null = null
 let projectConnected = false
 let currentProjectId: string | null = null
 let currentProjectBpm: number | null = null
-let deckLoadQueue: Promise<void> = Promise.resolve()
+const deckLoadQueues = createPerKeyTaskQueue(2)
+let deckTransportQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let barAssistantQueue: Promise<void> = Promise.resolve()
 let sessionLaunchPositionTicks: number | null = null
@@ -337,6 +356,7 @@ let liveAudioShareRequest: Promise<void> | null = null
 let liveAudioSessionId = 0
 let liveAudioRecordingId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
+const sourceLoadAbortControllers: [AbortController | null, AbortController | null] = [null, null]
 const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
   { editing: false, pending: false, requestId: 0 },
@@ -352,9 +372,9 @@ const musicLibraryPickerStates: [MusicLibraryPickerState, MusicLibraryPickerStat
   },
 ]
 const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
-  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploadProgress: null, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploadProgress: null, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploadProgress: null, suppressProjectRemovalSync: false },
 ]
 const decks: [DeckState, DeckState, DeckState] = [
   { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, armedCueSlot: null, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
@@ -1081,6 +1101,11 @@ async function connectProject() {
 
 function resetTempoMasterSession() {
   if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
+  sourceLoadAbortControllers.forEach((controller, deckIndex) => {
+    controller?.abort(new Error('Project session ended'))
+    sourceLoadAbortControllers[deckIndex] = null
+    deckOperationStates[deckIndex].uploadProgress = null
+  })
   tempoSessionId += 1
   projectConnected = false
   currentProjectId = null
@@ -2758,13 +2783,17 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const metadataBpm = el<HTMLElement>(`drop${deckIndex + 1}-bpm`)
   const metadataDuration = el<HTMLElement>(`drop${deckIndex + 1}-duration`)
   const unload = el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`)
-  const uploadIndicator = el<HTMLDivElement>(`deck${deckIndex + 1}-upload-indicator`)
+  const assistant = el<HTMLDivElement>(`deck${deckIndex + 1}-bpm-dialogue`)
+  const uploadProgress = el<HTMLDivElement>(`deck${deckIndex + 1}-upload-progress`)
+  const uploadStatus = el<HTMLSpanElement>(`deck${deckIndex + 1}-upload-status`)
+  const progressText = uploadProgressText(operation.uploadProgress)
 
   zone.classList.toggle('loaded', loaded)
   zone.classList.toggle('pending', pending)
-  zone.setAttribute('aria-busy', String(pending))
-  el(`deck-${deckIndex + 1}`).setAttribute('aria-busy', String(operation.uploading))
-  uploadIndicator.hidden = !operation.uploading
+  zone.setAttribute('aria-disabled', String(pending))
+  assistant.setAttribute('aria-busy', String(progressText !== ''))
+  uploadProgress.hidden = progressText === ''
+  uploadStatus.textContent = progressText
   filename.textContent = loaded ? deck.fileName ?? '' : ''
   const bpm = loaded ? normalizeBpm(deck.sampleBpm ?? deck.baseBpm) : null
   metadataBpm.textContent = bpm === null ? '—' : String(bpm)
@@ -3780,6 +3809,7 @@ function resetBpmDialogue(deckIndex: number) {
 
 function showBpmAnalyzing(deckNum: number) {
   if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
+  if (activeFxDeckIndex !== null) closeDeckFxAssistant(false)
   const prefix = `deck${deckNum}-bpm`
   el<HTMLDivElement>(`${prefix}-dialogue`).classList.remove('is-hidden')
   el<HTMLDivElement>(`${prefix}-form`).classList.add('is-hidden')
@@ -3790,6 +3820,7 @@ function showBpmAnalyzing(deckNum: number) {
 
 function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<BpmResolution | null> {
   if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
+  if (activeFxDeckIndex !== null) closeDeckFxAssistant(false)
   return new Promise((resolve) => {
     const deckIndex = deckNum - 1
     const prefix = `deck${deckNum}-bpm`
@@ -3798,6 +3829,7 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
     const input = el<HTMLInputElement>(`${prefix}-input`)
     const confirm = el<HTMLButtonElement>(`${prefix}-accept`)
     const fallback = el<HTMLButtonElement>(`${prefix}-skip`)
+    const cancel = el<HTMLButtonElement>(`${prefix}-cancel`)
     const hint = el<HTMLDivElement>(`${prefix}-hint`)
     const error = el<HTMLDivElement>(`${prefix}-error`)
     const detectedBpm = normalizeBpm(estimate?.bpm)
@@ -3817,7 +3849,8 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
       resetBpmDialogue(deckIndex)
       confirm.onclick = null
       fallback.onclick = null
-      input.onkeydown = null
+      cancel.onclick = null
+      form.onkeydown = null
       pendingBpmResolutions[deckIndex] = null
       resolve(result)
     }
@@ -3830,8 +3863,9 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
       }
       close({ bpm, source: 'manual' })
     }
-    input.onkeydown = (event: KeyboardEvent) => {
-      if (event.key === 'Enter') { event.preventDefault(); submit() }
+    form.onkeydown = (event: KeyboardEvent) => {
+      if (event.key === 'Enter' && event.target === input) { event.preventDefault(); submit() }
+      if (event.key === 'Escape') { event.preventDefault(); close(null) }
     }
     confirm.onclick = submit
     fallback.onclick = () => {
@@ -3842,13 +3876,18 @@ function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<Bp
       }
       close({ bpm: projectBpm, source: 'project' })
     }
+    cancel.onclick = () => close(null)
   })
 }
 
-async function requestAubioBpm(file: File): Promise<AubioBpmResult> {
+async function requestAubioBpm(file: File, signal?: AbortSignal): Promise<AubioBpmResult> {
   const form = new FormData()
   form.append('audio_file', file, file.name)
-  const response = await fetch(`${magentaEndpoint()}/detect-bpm`, { method: 'POST', body: form })
+  const response = await fetch(`${magentaEndpoint()}/detect-bpm`, {
+    method: 'POST',
+    body: form,
+    signal,
+  })
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { detail?: string } | null
     throw new Error(body?.detail || `BPM analysis failed (${response.status})`)
@@ -3856,46 +3895,34 @@ async function requestAubioBpm(file: File): Promise<AubioBpmResult> {
   return await response.json() as AubioBpmResult
 }
 
-async function resolveSampleBpm(sample: SampleMeta, file: File, deckNum: number, expectedSession: number): Promise<BpmResolution | null> {
-  const metadataBpm = normalizeBpm(sample.bpm)
-  if (isSupportedBpm(metadataBpm)) {
-    resetBpmDialogue(deckNum - 1)
-    setStatus('connected', `DECK ${deckNum}: AUDIOTOOL BPM METADATA ${metadataBpm} ACCEPTED`)
-    return { bpm: metadataBpm, source: 'audiotool' }
-  }
-  showBpmAnalyzing(deckNum)
-  setStatus('connecting', `DECK ${deckNum}: ANALYZING BPM WITH AUBIO…`)
-  try {
-    const estimate = await requestAubioBpm(file)
-    const normalizedEstimate = { ...estimate, bpm: normalizeBpm(estimate.bpm) }
-    if (expectedSession !== tempoSessionId || !nexus) {
-      resetBpmDialogue(deckNum - 1)
-      return null
-    }
-    if (normalizedEstimate.confidence > AUBIO_AUTO_ACCEPT_CONFIDENCE && isSupportedBpm(normalizedEstimate.bpm)) {
-      resetBpmDialogue(deckNum - 1)
-      setStatus('connected', `DECK ${deckNum}: AUBIO DETECTED ${normalizedEstimate.bpm} BPM (${Math.round(normalizedEstimate.confidence * 100)}% CONFIDENCE)`)
-      return { bpm: normalizedEstimate.bpm, source: 'aubio' }
-    }
-    if (isSupportedBpm(normalizedEstimate.bpm)) {
-      setStatus('connected', `DECK ${deckNum}: AUBIO ESTIMATE ${normalizedEstimate.bpm} BPM (${Math.round(normalizedEstimate.confidence * 100)}% CONFIDENCE) — CONFIRM BPM`)
-    } else {
-      setStatus('connected', `DECK ${deckNum}: AUBIO COULD NOT RESOLVE BPM — MANUAL ENTRY REQUIRED`)
-    }
-    return showBpmDialogue(deckNum, normalizedEstimate)
-  } catch (e) {
-    console.warn('[AUBIO] BPM analysis:', e)
-    if (expectedSession !== tempoSessionId || !nexus) {
-      resetBpmDialogue(deckNum - 1)
-      return null
-    }
-    setStatus('connected', `DECK ${deckNum}: BPM ANALYSIS FAILED — MANUAL ENTRY REQUIRED`)
-    return showBpmDialogue(deckNum)
-  }
-}
-
 function knobValueToEqDb(value: number) {
   return Math.max(-18, Math.min(18, (value - 0.5) * 36))
+}
+
+async function startSampleUpload(
+  file: File,
+  displayName: string,
+  bpm?: number,
+  description?: string,
+  signal?: AbortSignal,
+): Promise<SampleUpload> {
+  const client = at
+  if (!client) throw new Error('Not logged in')
+  const upload = await client.samples.upload({
+    file,
+    displayName,
+    description,
+    kind: 'loop',
+    bpm,
+  }, signal)
+  if (upload instanceof Error) throw upload
+  return upload
+}
+
+async function uploadedSampleReady(upload: SampleUpload) {
+  const sample = await upload.ready
+  if (sample instanceof Error) throw sample
+  return sample
 }
 
 async function uploadSample(
@@ -3904,22 +3931,27 @@ async function uploadSample(
   bpm?: number,
   description?: string,
 ) {
-  if (!at) throw new Error('Not logged in')
-  const upload = await at.samples.upload({
-    file,
-    displayName,
-    description,
-    kind: 'loop',
-    bpm,
-  })
-  if (upload instanceof Error) throw upload
+  const upload = await startSampleUpload(file, displayName, bpm, description)
 
   const uploaded = await upload.uploaded
   if (uploaded instanceof Error) throw uploaded
 
-  const sample = await upload.ready
-  if (sample instanceof Error) throw sample
-  return sample
+  return uploadedSampleReady(upload)
+}
+
+async function decodeLocalAudioDuration(file: File, signal: AbortSignal) {
+  if (signal.aborted) throw signal.reason
+  const context = new AudioContext()
+  try {
+    const decoded = await context.decodeAudioData(await file.arrayBuffer())
+    if (signal.aborted) throw signal.reason
+    if (!Number.isFinite(decoded.duration) || decoded.duration <= 0) {
+      throw new Error('Local audio duration could not be decoded')
+    }
+    return decoded.duration
+  } finally {
+    await context.close().catch(() => undefined)
+  }
 }
 
 function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: SafeTransactionBuilder) {
@@ -4844,7 +4876,7 @@ function queueDeckTransportOperation(
   }
   clearDeckTransportError(deckIndex)
   renderDeckTransport(deckIndex)
-  deckLoadQueue = deckLoadQueue
+  deckTransportQueue = deckTransportQueue
     .then(async () => {
       if (expectedSession !== tempoSessionId) return
       const changed = await task(expectedSession)
@@ -5240,7 +5272,7 @@ function bindDeckContentGraph(
 
 async function insertSampleIntoProject(
   deckNum: number,
-  sample: SampleMeta,
+  sample: SampleMeta | PreparedSample,
   displayName: string,
   forceMagicLoop: boolean,
   placement: DeckInsertionPlacement,
@@ -5402,7 +5434,7 @@ async function insertSampleIntoProject(
   deck.cuePosition = 0
   deck.sampleBpm = bpm
   deck.baseBpm = bpm
-  deck.sampleMeta = sample
+  deck.sampleMeta = 'mp3Url' in sample ? sample : null
   resetDeckTempoState(deckIndex)
   bindDeckContentGraph(
     deckIndex,
@@ -5424,6 +5456,319 @@ async function insertSampleIntoProject(
   return inserted
 }
 
+async function removePendingSourceInsertion(
+  deckIndex: 0 | 1,
+  inserted: Awaited<ReturnType<typeof insertSampleIntoProject>>,
+  expectedSession: number,
+) {
+  const projectDocument = nexus
+  if (
+    !projectDocument
+    || !projectConnected
+    || !isCurrentSession(expectedSession, tempoSessionId)
+  ) return
+  const operation = deckOperationStates[deckIndex]
+  const deck = decks[deckIndex]
+  const regionId = inserted.region.id
+  const sampleId = inserted.sample.id
+  const automationCollectionId = inserted.automationCollection.id
+
+  await serializeSourceTiming(async () => {
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || !isCurrentSession(expectedSession, tempoSessionId)
+    ) return
+    operation.suppressProjectRemovalSync = true
+    guardedRegionRemovalIds.add(regionId)
+    try {
+      const removed = await projectDocument.modify((t) => {
+        const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+        if (!region) return false
+        if (region.fields.sample.value.entityId !== sampleId) {
+          throw new Error('Pending source insertion changed before cleanup')
+        }
+        removeDeckContentInTransaction(t, regionId, sampleId, automationCollectionId)
+        return true
+      })
+      if (removed && deck.regionEntity?.id === regionId) {
+        clearDeckContentEntities(deck)
+        clearSourceDeckLocalMedia(deckIndex)
+        updateSourceDeckUi(deckIndex)
+      }
+    } finally {
+      guardedRegionRemovalIds.delete(regionId)
+      operation.suppressProjectRemovalSync = false
+    }
+  })
+}
+
+function logSourceBpmDiscrepancy(
+  deckNum: number,
+  resolution: BpmResolution,
+  sample: SampleMeta,
+) {
+  const metadataBpm = normalizeBpm(sample.bpm)
+  if (
+    resolution.source === 'audiotool'
+    || !isSupportedBpm(metadataBpm)
+    || metadataBpm === resolution.bpm
+  ) return
+  console.warn('[SOURCE_UPLOAD] BPM metadata discrepancy; keeping selected source timing', {
+    deck: deckNum,
+    selectedBpm: resolution.bpm,
+    selectedSource: resolution.source,
+    audiotoolBpm: metadataBpm,
+  })
+}
+
+async function resolutionFromBpmDecision(
+  deckNum: number,
+  decision: BpmRaceDecision,
+  expectedSession: number,
+): Promise<BpmResolution | null> {
+  if (!isCurrentSession(expectedSession, tempoSessionId) || !nexus) {
+    resetBpmDialogue(deckNum - 1)
+    return null
+  }
+  if (decision.kind === 'accepted') {
+    const bpm = normalizeBpm(decision.bpm)
+    if (!isSupportedBpm(bpm)) throw new Error('Resolved BPM is outside the supported range')
+    resetBpmDialogue(deckNum - 1)
+    if (decision.source === 'audiotool') {
+      setStatus('connected', `DECK ${deckNum}: AUDIOTOOL BPM METADATA ${bpm} ACCEPTED`)
+    } else {
+      setStatus('connected', `DECK ${deckNum}: AUBIO DETECTED ${bpm} BPM WITH HIGH CONFIDENCE`)
+    }
+    return { bpm, source: decision.source }
+  }
+
+  if (decision.aubioError) {
+    console.warn('[AUBIO] BPM analysis:', decision.aubioError)
+    setStatus('connected', `DECK ${deckNum}: BPM ANALYSIS FAILED — MANUAL ENTRY REQUIRED`)
+  } else if (isSupportedBpm(normalizeBpm(decision.estimate?.bpm))) {
+    setStatus(
+      'connected',
+      `DECK ${deckNum}: AUBIO ESTIMATE ${normalizeBpm(decision.estimate?.bpm)} BPM (${Math.round((decision.estimate?.confidence ?? 0) * 100)}% CONFIDENCE) — CONFIRM BPM`,
+    )
+  } else {
+    setStatus('connected', `DECK ${deckNum}: BPM COULD NOT BE RESOLVED — MANUAL ENTRY REQUIRED`)
+  }
+  return showBpmDialogue(deckNum, decision.estimate ?? undefined)
+}
+
+async function uploadSourceToNexus(
+  deckIndex: 0 | 1,
+  file: File,
+  replacing: boolean,
+  expectedSession: number,
+  placement: DeckInsertionPlacement,
+) {
+  if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
+  const deckNum = deckIndex + 1
+  const operation = deckOperationStates[deckIndex]
+  const abortController = new AbortController()
+  sourceLoadAbortControllers[deckIndex] = abortController
+  let resultLogged = false
+  const timing = createUploadTimingRecorder({
+    onChange: (progress) => {
+      if (!isCurrentSession(expectedSession, tempoSessionId)) return
+      operation.uploadProgress = progress
+      updateSourceDeckUi(deckIndex)
+    },
+  })
+  const logResult = (details: Record<string, unknown>) => {
+    if (resultLogged) return
+    resultLogged = true
+    console.info('[SOURCE_UPLOAD_RESULT]', timing.complete({
+      deck: deckNum,
+      fileName: file.name,
+      replacement: replacing,
+      ...details,
+    }))
+  }
+
+  timing.begin('preparing')
+  timing.begin('uploading')
+  timing.begin('detecting-bpm')
+  showBpmAnalyzing(deckNum)
+  setStatus('connected', `DECK ${deckNum}: UPLOADING ${file.name} · DETECTING BPM…`)
+  const sampleDisplayName = `DECK ${deckNum} — ${file.name}`
+  const tasks = startConcurrentTasks({
+    upload: () => startSampleUpload(
+      file,
+      sampleDisplayName,
+      undefined,
+      undefined,
+      abortController.signal,
+    ),
+    bpm: () => requestAubioBpm(file, abortController.signal),
+    duration: () => decodeLocalAudioDuration(file, abortController.signal),
+  })
+  const aubioSettled = tasks.bpm.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  )
+  const durationSettled = tasks.duration.then(
+    (durationSeconds) => {
+      timing.end('preparing')
+      return { ok: true as const, durationSeconds }
+    },
+    (error: unknown) => {
+      timing.end('preparing', 'local-decode-failed')
+      console.warn(`[SOURCE_UPLOAD] Deck ${deckNum} local duration decode:`, error)
+      return { ok: false as const, error }
+    },
+  )
+
+  try {
+    const upload = await tasks.upload
+    const rawReadySettled = uploadedSampleReady(upload).then(
+      (sample) => ({ ok: true as const, sample }),
+      (error: unknown) => ({ ok: false as const, error }),
+    )
+    const requireRawReadySample = async () => {
+      const ready = await rawReadySettled
+      if (!ready.ok) throw ready.error
+      return ready.sample
+    }
+    const resolutionPromise = resolveBpmRace(
+      requireRawReadySample().then((sample) => normalizeBpm(sample.bpm)),
+      aubioSettled.then((result) => {
+        if (!result.ok) throw result.error
+        return { ...result.value, bpm: normalizeBpm(result.value.bpm) }
+      }),
+      {
+        minimum: MIN_SUPPORTED_BPM,
+        maximum: MAX_SUPPORTED_BPM,
+        confidenceThreshold: AUBIO_AUTO_ACCEPT_CONFIDENCE,
+      },
+    ).then(async (decision) => {
+      const resolution = await resolutionFromBpmDecision(
+        deckNum,
+        decision,
+        expectedSession,
+      )
+      timing.end('detecting-bpm', resolution ? 'resolved' : 'cancelled')
+      return resolution
+    })
+    const uploadAckPromise = (async () => {
+      const uploaded = await upload.uploaded
+      if (uploaded instanceof Error) throw uploaded
+      timing.end('uploading')
+      timing.begin('processing')
+    })()
+    const [durationResult, resolution] = await Promise.all([
+      durationSettled,
+      resolutionPromise,
+      uploadAckPromise,
+    ])
+    const readySettled = rawReadySettled.then((ready) => {
+      timing.end('processing', ready.ok ? 'completed' : 'failed')
+      return ready
+    })
+    const requireReadySample = async () => {
+      const ready = await readySettled
+      if (!ready.ok) throw ready.error
+      return ready.sample
+    }
+    if (!resolution) {
+      await requireReadySample()
+      logResult({ outcome: 'cancelled', insertedEarly: false })
+      return false
+    }
+    if (!isCurrentSession(expectedSession, tempoSessionId) || !nexus) {
+      throw new Error('Project connection changed during source preparation')
+    }
+    if (resolution.source === 'project') {
+      setStatus('connected', `DECK ${deckNum}: BPM UNKNOWN — ASSUMING PROJECT BPM ${resolution.bpm}`)
+    } else if (resolution.source === 'manual') {
+      setStatus('connected', `DECK ${deckNum}: MANUAL BPM ${resolution.bpm} SELECTED`)
+    }
+
+    let readySample: SampleMeta | null = null
+    if (replacing || !durationResult.ok) readySample = await requireReadySample()
+    const insertedEarly = readySample === null
+    const insertableSample: SampleMeta | PreparedSample = readySample ?? {
+      name: upload.name,
+      durationSeconds: durationResult.ok
+        ? durationResult.durationSeconds
+        : (await requireReadySample()).durationSeconds,
+      bpm: resolution.bpm,
+    }
+    timing.begin('inserting')
+    setStatus('connected', `DECK ${deckNum}: SAMPLE PREPARED — INSERTING PROJECT REGION…`)
+    const inserted = await insertSampleIntoProject(
+      deckNum,
+      insertableSample,
+      sampleDisplayName,
+      false,
+      placement,
+      resolution,
+      expectedSession,
+    )
+    timing.end('inserting')
+
+    if (readySample) {
+      logSourceBpmDiscrepancy(deckNum, resolution, readySample)
+      decks[deckIndex].fileName = file.name
+      void initializeDeckCues(deckIndex, readySample)
+    } else {
+      readySample = await settlePendingInsertion(
+        requireReadySample(),
+        inserted,
+        {
+          hydrate: (_pending, sample) => {
+            if (
+              !isCurrentSession(expectedSession, tempoSessionId)
+              || !nexus
+              || decks[deckIndex].regionEntity?.id !== inserted.region.id
+            ) throw new Error('Project connection or pending region changed during processing')
+            logSourceBpmDiscrepancy(deckNum, resolution, sample)
+            decks[deckIndex].sampleMeta = sample
+            decks[deckIndex].fileName = file.name
+            scheduleDeckTimingReconstruction(deckIndex)
+            updateSourceDeckUi(deckIndex)
+            void initializeDeckCues(deckIndex, sample)
+          },
+          cleanup: () => removePendingSourceInsertion(deckIndex, inserted, expectedSession),
+        },
+      )
+    }
+
+    timing.begin('ready')
+    timing.end('ready')
+    updateSourceDeckUi(deckIndex)
+    setStatus('connected', inserted.establishedTempo
+      ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution.bpm} BPM — NATIVE SPEED PRESERVED ✓`
+      : `DECK ${deckNum}: ${file.name} — NATIVE SPEED PRESERVED ✓`)
+    logResult({
+      outcome: 'ready',
+      insertedEarly,
+      bpm: resolution.bpm,
+      bpmSource: resolution.source,
+      durationSeconds: readySample.durationSeconds,
+    })
+    return true
+  } catch (error) {
+    if (!abortController.signal.aborted) abortController.abort(error)
+    timing.fail(error)
+    logResult({
+      outcome: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    })
+    throw error
+  } finally {
+    if (sourceLoadAbortControllers[deckIndex] === abortController) {
+      sourceLoadAbortControllers[deckIndex] = null
+    }
+    if (isCurrentSession(expectedSession, tempoSessionId)) {
+      operation.uploadProgress = null
+      updateSourceDeckUi(deckIndex)
+    }
+  }
+}
+
 async function uploadToNexus(
   deckNum: number,
   file: File,
@@ -5432,44 +5777,22 @@ async function uploadToNexus(
   options: UploadToNexusOptions = {},
 ) {
   if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
+  if (deckNum !== 3) throw new Error('Source decks must use the concurrent upload pipeline')
   setStatus('connected', `UPLOADING ${file.name}…`)
   try {
-    const sampleDisplayName = `${deckNum === 3 ? 'MAGIC DECK' : `DECK ${deckNum}`} — ${file.name}`
-    const projectDisplayName = deckNum === 3 ? 'MAGIC DECK' : sampleDisplayName
-    const sourceDeckIndex = deckNum <= 2 ? (deckNum - 1) as 0 | 1 : null
-    if (sourceDeckIndex !== null) {
-      deckOperationStates[sourceDeckIndex].uploading = true
-      updateSourceDeckUi(sourceDeckIndex)
-    }
+    const sampleDisplayName = `MAGIC DECK — ${file.name}`
+    const projectDisplayName = 'MAGIC DECK'
     const sample = await uploadSample(
       file,
       sampleDisplayName,
       options.timing?.bpm,
       options.sampleDescription,
     )
-      .finally(() => {
-        if (sourceDeckIndex === null) return
-        deckOperationStates[sourceDeckIndex].uploading = false
-        updateSourceDeckUi(sourceDeckIndex)
-      })
     if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during upload')
-    const resolution = deckNum <= 2 ? await resolveSampleBpm(sample, file, deckNum, expectedSession) : undefined
-    if (expectedSession !== tempoSessionId || !nexus) throw new Error('Project connection changed during BPM selection')
-    if (deckNum <= 2 && !resolution) {
-      setStatus('connected', `DECK ${deckNum}: BPM ENTRY CANCELLED — SAMPLE NOT INSERTED`)
-      return false
-    }
-    if (resolution?.source === 'project') {
-      setStatus('connected', `DECK ${deckNum}: BPM UNKNOWN — ASSUMING PROJECT BPM ${resolution.bpm}`)
-    } else if (resolution?.source === 'manual') {
-      setStatus('connected', `DECK ${deckNum}: MANUAL BPM ${resolution.bpm} SELECTED`)
-    }
-    const deckIndex = (deckNum - 1) as WaveformDeckIndex
-    const placement = options.placement ?? await captureDeckInsertionPlacement(deckIndex)
+    const deckIndex: WaveformDeckIndex = 2
+    const placement = options.placement ?? await captureDeckInsertionPlacement(2)
     if (!placement) {
-      if (deckNum === 3) {
-        setMagicStatus('warning', 'PLACEMENT CANCELLED · PREVIOUS MAGIC DECK PRESERVED')
-      }
+      setMagicStatus('warning', 'PLACEMENT CANCELLED · PREVIOUS MAGIC DECK PRESERVED')
       setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: PLACEMENT CANCELLED — SAMPLE NOT INSERTED`)
       return false
     }
@@ -5477,24 +5800,17 @@ async function uploadToNexus(
       throw new Error('Project connection changed during placement capture')
     }
     setStatus('connected', `DECK ${deckNum}: SAMPLE READY — INSERTING PROJECT REGION…`)
-    const inserted = await insertSampleIntoProject(
+    await insertSampleIntoProject(
       deckNum,
       sample,
       projectDisplayName,
       forceMagicLoop,
       placement,
-      resolution ?? undefined,
+      undefined,
       expectedSession,
       options.timing,
     )
-    if (deckNum <= 2) {
-      void initializeDeckCues(deckIndex, sample)
-      setStatus('connected', inserted.establishedTempo
-        ? `DECK ${deckNum}: MASTER TEMPO SET TO ${resolution!.bpm} BPM — NATIVE SPEED PRESERVED ✓`
-        : `DECK ${deckNum}: ${file.name} — NATIVE SPEED PRESERVED ✓`)
-    } else {
-      setStatus('connected', `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
-    }
+    setStatus('connected', `DECK ${deckNum}: ${file.name} — SYNCHRONIZED TO PROJECT TEMPO ✓`)
     return true
   } catch (e: unknown) {
     setStatus('error', `UPLOAD ERROR: ${e instanceof Error ? e.message : String(e)}`)
@@ -6364,6 +6680,7 @@ function renderDeckFxAvailability() {
     const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
     button.disabled = !projectConnected
       || nexus === null
+      || deckOperationStates[deckIndex].pendingCount > 0
       || activeFxDeckIndex === deckIndex
       || activeLibraryDeckIndex !== null
   })
@@ -6396,7 +6713,13 @@ async function loadAudioFile(
     setStatus('connecting', `DECK ${deckIndex + 1}: PRESERVING HISTORY — PREPARING FORWARD INSERTION…`)
   }
 
-  const inserted = await uploadToNexus(deckIndex + 1, file, false, expectedSession, { placement })
+  const inserted = await uploadSourceToNexus(
+    deckIndex,
+    file,
+    replacing,
+    expectedSession,
+    placement,
+  )
   if (!inserted) {
     updateSourceDeckUi(deckIndex)
     return
@@ -6413,12 +6736,12 @@ function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPla
   resetDeckCueSelection(deckIndex)
   operation.pendingCount += 1
   updateSourceDeckUi(deckIndex)
-  deckLoadQueue = deckLoadQueue
-    .then(async () => {
-      if (expectedSession !== tempoSessionId) return
-      await loadAudioFile(deckIndex, file, expectedSession, placement)
-    })
+  void deckLoadQueues.enqueue(deckIndex, async () => {
+    if (expectedSession !== tempoSessionId) return
+    await loadAudioFile(deckIndex, file, expectedSession, placement)
+  })
     .catch((error: unknown) => {
+      if (expectedSession !== tempoSessionId) return
       const message = error instanceof Error ? error.message : String(error)
       setStatus('error', `DECK ${deckIndex + 1}: LOAD OR REPLACEMENT FAILED — ${message}`)
     })
@@ -6446,12 +6769,12 @@ function queueDeckUnload(deckIndex: 0 | 1) {
   operation.pendingCount += 1
   operation.activeKind = 'unloading'
   updateSourceDeckUi(deckIndex)
-  deckLoadQueue = deckLoadQueue
-    .then(() => {
-      if (expectedSession !== tempoSessionId) return
-      return unloadSourceDeck(deckIndex)
-    })
+  void deckLoadQueues.enqueue(deckIndex, () => {
+    if (expectedSession !== tempoSessionId) return
+    return unloadSourceDeck(deckIndex)
+  })
     .catch((error: unknown) => {
+      if (expectedSession !== tempoSessionId) return
       const message = error instanceof Error ? error.message : String(error)
       setStatus('error', `DECK ${deckIndex + 1}: UNLOAD FAILED — ${message}`)
     })
@@ -7171,6 +7494,10 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
   zone.addEventListener('dragleave', (e) => { e.stopPropagation(); if (!zone.contains(e.relatedTarget as Node)) zone.classList.remove('drag-over') })
   zone.addEventListener('drop', async (e) => {
     e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag-over')
+    if (deckOperationStates[deckIndex].pendingCount > 0) {
+      setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: TRACK OPERATION ALREADY IN PROGRESS`)
+      return
+    }
     const file = e.dataTransfer?.files?.[0]
     if (!file) return
     if (!file.name.match(/\.(mp3|wav)$/i)) { setStatus('error', 'ONLY MP3 / WAV FILES ACCEPTED'); return }

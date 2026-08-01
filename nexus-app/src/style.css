@@ -165,39 +165,6 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 .deck::before { display: none; }
 
-.deck-upload-indicator {
-  position: absolute;
-  inset: 0;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  border-radius: inherit;
-  background: rgba(5, 0, 0, 0.78);
-  color: var(--white);
-  font-family: var(--font-data);
-  font-size: 11px;
-  letter-spacing: 2px;
-  pointer-events: all;
-}
-.deck-upload-indicator[hidden] { display: none; }
-.deck-upload-spinner {
-  width: 20px;
-  height: 20px;
-  border: 2px solid var(--red-dim);
-  border-top-color: var(--red);
-  border-radius: 50%;
-  box-shadow: 0 0 10px var(--red-glow);
-  animation: deck-upload-spin 0.8s linear infinite;
-}
-@keyframes deck-upload-spin {
-  to { transform: rotate(360deg); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .deck-upload-spinner { animation: none; }
-}
-
 .deck-header {
   display: flex; align-items: center; gap: 12px;
   min-width: 0;
@@ -613,6 +580,51 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   gap: 7px;
 }
 .bpm-dialogue-header { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.deck-upload-progress {
+  display: grid;
+  grid-template-columns: minmax(72px, 0.45fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.deck-upload-progress[hidden] { display: none; }
+.deck-upload-progress-track {
+  height: 4px;
+  overflow: hidden;
+  border: 1px solid var(--red-dim);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.8);
+}
+.deck-upload-progress-bar {
+  display: block;
+  width: 45%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red-glow);
+  animation: deck-upload-progress-slide 1.15s ease-in-out infinite alternate;
+}
+.deck-upload-progress-status {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--white);
+  font-family: var(--font-data);
+  font-size: 8px;
+  letter-spacing: 0.7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes deck-upload-progress-slide {
+  from { transform: translateX(-10%); }
+  to { transform: translateX(132%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .deck-upload-progress-bar {
+    width: 100%;
+    animation: none;
+    opacity: 0.72;
+  }
+}
 .bpm-dialogue-header-actions {
   display: flex;
   align-items: center;

@@ -63,10 +63,6 @@
 
       <!-- DECK 1 -->
       <div class="deck" id="deck-1">
-        <div class="deck-upload-indicator" id="deck1-upload-indicator" role="status" aria-live="polite" hidden>
-          <span class="deck-upload-spinner" aria-hidden="true"></span>
-          <span>UPLOADING TRACK</span>
-        </div>
         <div class="deck-header">
           <span class="deck-num">01</span>
           <span class="deck-title">DECK A — PLAYER</span>
@@ -197,12 +193,17 @@
                 </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck1-bpm-title"></div>
               </div>
+              <div class="deck-upload-progress deck-assistant-normal" id="deck1-upload-progress" role="status" aria-live="polite" hidden>
+                <span class="deck-upload-progress-track" aria-hidden="true"><span class="deck-upload-progress-bar"></span></span>
+                <span class="deck-upload-progress-status" id="deck1-upload-status"></span>
+              </div>
               <div class="bpm-dialogue-form deck-assistant-normal is-hidden" id="deck1-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
                   <input type="number" id="deck1-bpm-input" class="bpm-dialogue-input" min="40" max="240" step="0.01" placeholder="BPM" inputmode="decimal" aria-label="Deck A source BPM">
                   <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-accept">ACCEPT</button>
                   <button class="btn-primary bpm-dialogue-button" id="deck1-bpm-skip">SKIP</button>
+                  <button class="btn-danger bpm-dialogue-button" id="deck1-bpm-cancel" type="button">CANCEL</button>
                 </div>
                 <div class="bpm-dialogue-error" id="deck1-bpm-error"></div>
               </div>
@@ -265,10 +266,6 @@
 
       <!-- DECK 2 -->
       <div class="deck" id="deck-2">
-        <div class="deck-upload-indicator" id="deck2-upload-indicator" role="status" aria-live="polite" hidden>
-          <span class="deck-upload-spinner" aria-hidden="true"></span>
-          <span>UPLOADING TRACK</span>
-        </div>
         <div class="deck-header">
           <span class="deck-num">02</span>
           <span class="deck-title">DECK B — PLAYER</span>
@@ -399,12 +396,17 @@
                 </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck2-bpm-title"></div>
               </div>
+              <div class="deck-upload-progress deck-assistant-normal" id="deck2-upload-progress" role="status" aria-live="polite" hidden>
+                <span class="deck-upload-progress-track" aria-hidden="true"><span class="deck-upload-progress-bar"></span></span>
+                <span class="deck-upload-progress-status" id="deck2-upload-status"></span>
+              </div>
               <div class="bpm-dialogue-form deck-assistant-normal is-hidden" id="deck2-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
                   <input type="number" id="deck2-bpm-input" class="bpm-dialogue-input" min="40" max="240" step="0.01" placeholder="BPM" inputmode="decimal" aria-label="Deck B source BPM">
                   <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-accept">ACCEPT</button>
                   <button class="btn-primary bpm-dialogue-button" id="deck2-bpm-skip">SKIP</button>
+                  <button class="btn-danger bpm-dialogue-button" id="deck2-bpm-cancel" type="button">CANCEL</button>
                 </div>
                 <div class="bpm-dialogue-error" id="deck2-bpm-error"></div>
               </div>
