@@ -422,7 +422,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 .transport-error:empty { display: none; }
 
-/* ============================  CONTROLS ROW (VOL + EQ)  ============================ */
+/* ============================  CONTROLS ROW (VOL + FILTER + EQ)  ============================ */
 .controls-row { display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap; min-width: 0; }
 .source-controls-row {
   display: grid;
@@ -448,7 +448,33 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .fader-wrap { height: 80px; display: flex; align-items: center; justify-content: center; }
 .fader-val { font-family: var(--font-live); font-size: 11px; color: var(--red); }
 
+.tone-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 204px;
+}
+.filter-control-section,
+.eq-control-section {
+  padding: 5px;
+  border: 1px solid var(--grey-light);
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(31,31,31,0.72), rgba(5,5,5,0.72));
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.75);
+}
+.tone-section-title {
+  margin-bottom: 4px;
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-align: center;
+}
+.filter-section,
 .eq-section { display: flex; gap: 12px; align-items: flex-end; }
+.filter-section { justify-content: center; }
+.filter-knob-wrap,
 .eq-knob-wrap {
   display: flex; flex-direction: column; align-items: center; gap: 4px;
   padding: 6px 4px 4px 4px;
@@ -456,7 +482,9 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   border-radius: 6px;
   box-shadow: inset 0 1px 2px rgba(0,0,0,0.6);
 }
+.filter-knob,
 .eq-knob { width: 56px; height: 56px; cursor: pointer; display: block; }
+.filter-label,
 .eq-label { font-family: var(--font-data); font-size: 9px; color: var(--grey-text); letter-spacing: 1px; }
 
 /* ============================  TEMPO MODULE  ============================ */
@@ -961,8 +989,9 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   .deck-library-grid-header > :nth-child(n+3), .deck-library-row > :nth-child(n+3) { display: none; }
   .bpm-report-actions { flex-wrap: wrap; }
   .bpm-report-actions .bpm-dialogue-input { flex-basis: 100%; }
-  .eq-section { min-width: 0; gap: 6px; }
-  .eq-knob { width: min(56px, 16vw); height: auto; aspect-ratio: 1; }
+  .tone-controls { min-width: 0; }
+  .filter-section, .eq-section { min-width: 0; gap: 6px; }
+  .filter-knob, .eq-knob { width: min(56px, 16vw); height: auto; aspect-ratio: 1; }
   .effects-tempo-strip { gap: 8px; }
   .tempo-module { flex-basis: 100%; }
   .cue-pads { grid-template-columns: repeat(5, minmax(48px, 1fr)); gap: 4px; }
@@ -1086,22 +1115,30 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   min-width: 0;
   justify-content: center;
 }
-.magic-controls-row .eq-section {
+.magic-controls-row .tone-controls {
   grid-column: 1 / 3;
+  min-width: 0;
+}
+.magic-controls-row .filter-section,
+.magic-controls-row .eq-section {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  justify-content: initial;
   gap: 6px;
   align-items: end;
 }
+.magic-controls-row .filter-section { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.magic-controls-row .eq-section { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .magic-controls-row .tempo-module {
   grid-column: 3;
   grid-row: 1 / 3;
   min-width: 190px;
 }
+.magic-controls-row .filter-knob-wrap,
 .magic-controls-row .eq-knob-wrap {
   min-width: 0;
   padding: 5px 2px 3px 2px;
 }
+.magic-controls-row .filter-knob,
 .magic-controls-row .eq-knob {
   width: min(44px, 100%);
   height: auto;
@@ -1384,6 +1421,7 @@ input[type="range"]:not(.v-fader):not(.tempo-fader)::-moz-range-thumb {
 
 .modal-actions-wrap { flex-wrap: wrap; }
 
+.filter-knob:focus-visible,
 .eq-knob:focus-visible,
 .fx-knob:focus-visible {
   outline: 2px solid var(--red);

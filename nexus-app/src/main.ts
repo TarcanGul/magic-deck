@@ -66,6 +66,14 @@ import type {
   MusicLibrarySortDirection,
   MusicLibrarySortKey,
 } from './music-library-utils.js'
+import {
+  DECK_FILTER_MAX_HZ,
+  DECK_FILTER_MIN_HZ,
+  filterFrequencyToValue,
+  filterValueToFrequency,
+  neutralFilterValue,
+} from './deck-filter-utils.js'
+import type { DeckFilterKind } from './deck-filter-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -1693,6 +1701,7 @@ function hydrateRestoredProjectControls(
     drawKnob(canvas, state.value)
     canvas.setAttribute('aria-valuenow', String(Math.round(state.value * 100)))
   }
+  hydrateDeckFilterControls(deckIndex, mixerChannel)
 }
 
 async function restoreSourceDecksFromProject(
@@ -4654,6 +4663,14 @@ function watchDeckRouting(
   expectedSession: number,
 ) {
   const deck = decks[deckIndex]
+  const hydrateFiltersIfCurrent = () => {
+    if (
+      nexus !== projectDocument
+      || expectedSession !== tempoSessionId
+      || deck.mixerChannelEntity?.id !== routing.mixerChannel.id
+    ) return
+    hydrateDeckFilterControls(deckIndex, routing.mixerChannel)
+  }
   deck.routingSubscriptions.push(
     projectDocument.events.onUpdate(
       routing.mixerChannel.fields.faderParameters.fields.postGain,
@@ -4667,6 +4684,18 @@ function watchDeckRouting(
         el<HTMLInputElement>(`d${deckIndex + 1}-vol`).value = String(deck.volume)
         el(`d${deckIndex + 1}-vol-val`).textContent = String(Math.round(deck.volume * 100))
       },
+    ),
+    projectDocument.events.onUpdate(
+      routing.mixerChannel.fields.trimFilter.fields.highPassCutoffFrequencyHz,
+      hydrateFiltersIfCurrent,
+    ),
+    projectDocument.events.onUpdate(
+      routing.mixerChannel.fields.trimFilter.fields.lowPassCutoffFrequencyHz,
+      hydrateFiltersIfCurrent,
+    ),
+    projectDocument.events.onUpdate(
+      routing.mixerChannel.fields.trimFilter.fields.isActive,
+      hydrateFiltersIfCurrent,
     ),
     projectDocument.events.onRemove(routing.track, () => {
       if (
@@ -5086,6 +5115,7 @@ async function insertSampleIntoProject(
   }
   updateDeckBpmLabel((deckNum - 1) as WaveformDeckIndex)
   applyCurrentDeckEq((deckNum - 1) as WaveformDeckIndex)
+  void applyCurrentDeckFilters((deckNum - 1) as WaveformDeckIndex)
   void applyCurrentDeckLevels((deckNum - 1) as WaveformDeckIndex)
   return inserted
 }
@@ -5305,6 +5335,93 @@ function applyCurrentDeckEq(deckIndex: WaveformDeckIndex) {
     const state = knobState.get(canvas)
     if (state) void applyDeckEq(deckIndex, band, state.value)
   })
+}
+
+function formatFilterFrequency(frequencyHz: number) {
+  if (frequencyHz >= 1000) {
+    const kilohertz = frequencyHz / 1000
+    return `${kilohertz >= 10 ? Math.round(kilohertz) : kilohertz.toFixed(1)} kHz`
+  }
+  return `${Math.round(frequencyHz)} Hz`
+}
+
+function updateFilterKnobAccessibility(canvas: HTMLCanvasElement, value: number) {
+  const frequencyHz = filterValueToFrequency(value)
+  canvas.setAttribute('aria-valuenow', String(Math.round(frequencyHz)))
+  canvas.setAttribute('aria-valuetext', formatFilterFrequency(frequencyHz))
+}
+
+function setDeckFilterKnobValue(
+  deckIndex: WaveformDeckIndex,
+  kind: DeckFilterKind,
+  value: number,
+) {
+  const canvas = el<HTMLCanvasElement>(`d${deckIndex + 1}-${kind}`)
+  const state = knobState.get(canvas)
+  if (!state) return
+  state.value = clampUnit(value)
+  drawKnob(canvas, state.value)
+  updateFilterKnobAccessibility(canvas, state.value)
+}
+
+function hydrateDeckFilterControls(
+  deckIndex: WaveformDeckIndex,
+  mixerChannel: NexusEntity<'mixerChannel'>,
+) {
+  const trimFilter = mixerChannel.fields.trimFilter.fields
+  const isActive = trimFilter.isActive.value
+  setDeckFilterKnobValue(
+    deckIndex,
+    'hpf',
+    isActive
+      ? filterFrequencyToValue(trimFilter.highPassCutoffFrequencyHz.value)
+      : neutralFilterValue('hpf'),
+  )
+  setDeckFilterKnobValue(
+    deckIndex,
+    'lpf',
+    isActive
+      ? filterFrequencyToValue(trimFilter.lowPassCutoffFrequencyHz.value)
+      : neutralFilterValue('lpf'),
+  )
+}
+
+async function applyDeckFilters(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const projectDocument = nexus
+  const mixerChannelId = deck.mixerChannelEntity?.id
+  if (!projectDocument || !mixerChannelId) {
+    setStatus('connected', `DECK ${deckIndex + 1}: LOAD AUDIO TO ENABLE PROJECT FILTERS`)
+    return
+  }
+
+  const highPassState = knobState.get(el<HTMLCanvasElement>(`d${deckIndex + 1}-hpf`))
+  const lowPassState = knobState.get(el<HTMLCanvasElement>(`d${deckIndex + 1}-lpf`))
+  if (!highPassState || !lowPassState) return
+
+  const highPassCutoffFrequencyHz = filterValueToFrequency(highPassState.value)
+  const lowPassCutoffFrequencyHz = filterValueToFrequency(lowPassState.value)
+  try {
+    await projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || deck.mixerChannelEntity?.id !== mixerChannelId
+      ) throw new Error('Project routing changed before the filter update')
+      const channel = t.entities.ofTypes('mixerChannel').getEntity(mixerChannelId)
+      if (!channel) throw new Error('Deck mixer channel is no longer available')
+      const trimFilter = channel.fields.trimFilter.fields
+      t.update(trimFilter.highPassCutoffFrequencyHz, highPassCutoffFrequencyHz)
+      t.update(trimFilter.lowPassCutoffFrequencyHz, lowPassCutoffFrequencyHz)
+      t.update(trimFilter.isActive, true)
+    })
+  } catch (e) {
+    console.warn('[NEXUS] filter update:', e)
+    setStatus('error', `FILTER UPDATE FAILED: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+function applyCurrentDeckFilters(deckIndex: WaveformDeckIndex) {
+  return applyDeckFilters(deckIndex)
 }
 
 async function applyDeckProjectLevels(
@@ -6118,6 +6235,16 @@ function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: WaveformDeckI
   if (!match) return null
   return { deckIndex: Number(match[1]) - 1 as WaveformDeckIndex, band: match[2] as EqBand }
 }
+function getDeckFilterControl(
+  canvas: HTMLCanvasElement,
+): { deckIndex: WaveformDeckIndex; kind: DeckFilterKind } | null {
+  const match = canvas.id.match(/^d([123])-(hpf|lpf)$/)
+  if (!match) return null
+  return {
+    deckIndex: Number(match[1]) - 1 as WaveformDeckIndex,
+    kind: match[2] as DeckFilterKind,
+  }
+}
 function getDeckFxControl(
   canvas: HTMLCanvasElement,
 ): { deckIndex: WaveformDeckIndex; kind: DeckFxKind } | null {
@@ -6147,6 +6274,16 @@ function initKnob(canvas: HTMLCanvasElement) {
   canvas.setAttribute('aria-valuenow', String(Math.round(init * 100)))
   const label = canvas.id.match(/^d(\d)-(hi|mid|low)$/)
   if (label) canvas.setAttribute('aria-label', `Deck ${label[1]} ${label[2].toUpperCase()} EQ`)
+  const filterControl = getDeckFilterControl(canvas)
+  if (filterControl) {
+    canvas.setAttribute(
+      'aria-label',
+      `${placementDeckLabel(filterControl.deckIndex)} ${filterControl.kind.toUpperCase()} cutoff frequency`,
+    )
+    canvas.setAttribute('aria-valuemin', String(DECK_FILTER_MIN_HZ))
+    canvas.setAttribute('aria-valuemax', String(DECK_FILTER_MAX_HZ))
+    updateFilterKnobAccessibility(canvas, init)
+  }
   const fxControl = getDeckFxControl(canvas)
   if (fxControl) {
     canvas.setAttribute(
@@ -6160,8 +6297,13 @@ function initKnob(canvas: HTMLCanvasElement) {
     s.value = Math.max(0, Math.min(1, newValue))
     drawKnob(canvas, s.value)
     canvas.setAttribute('aria-valuenow', String(Math.round(s.value * 100)))
-    const control = getDeckEqControl?.(canvas)
-    if (control) void applyDeckEq?.(control.deckIndex, control.band, s.value)
+    const control = getDeckEqControl(canvas)
+    if (control) void applyDeckEq(control.deckIndex, control.band, s.value)
+    const filter = getDeckFilterControl(canvas)
+    if (filter) {
+      updateFilterKnobAccessibility(canvas, s.value)
+      void applyDeckFilters(filter.deckIndex)
+    }
     const effect = getDeckFxControl(canvas)
     if (effect && activeFxDeckIndex === effect.deckIndex) {
       getDeckFxElements(effect.deckIndex).outputs[effect.kind].value =
@@ -6197,7 +6339,11 @@ function initKnob(canvas: HTMLCanvasElement) {
       case 'PageDown': newVal = s.value - bigStep; break
       case 'Home': newVal = 0; break
       case 'End': newVal = 1; break
-      case ' ': case 'Enter': newVal = 0.5; break  // Space/Enter centers the knob
+      case ' ': case 'Enter': {
+        const filter = getDeckFilterControl(canvas)
+        newVal = filter ? neutralFilterValue(filter.kind) : 0.5
+        break
+      }
       default: return
     }
     e.preventDefault()
@@ -6890,7 +7036,7 @@ function initApp() {
   wireTransport('d1', 0)
   wireTransport('d2', 1)
   wireTransport('d3', 2)
-  document.querySelectorAll<HTMLCanvasElement>('.eq-knob, .fx-knob').forEach(initKnob)
+  document.querySelectorAll<HTMLCanvasElement>('.filter-knob, .eq-knob, .fx-knob').forEach(initKnob)
   document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
     const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
     button.addEventListener('click', () => { void showDeckFxAssistant(deckIndex) })

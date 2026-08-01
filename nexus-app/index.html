@@ -148,10 +148,22 @@
               </div>
               <div class="fader-val" id="d1-gain-val">1.0x</div>
               </div>
-              <div class="eq-section">
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              <div class="tone-controls">
+                <section class="filter-control-section" aria-label="Deck A filters">
+                  <div class="tone-section-title">FILTER</div>
+                  <div class="filter-section">
+                    <div class="filter-knob-wrap"><canvas class="filter-knob" id="d1-hpf" width="56" height="56" data-value="0"></canvas><span class="filter-label">HPF</span></div>
+                    <div class="filter-knob-wrap"><canvas class="filter-knob" id="d1-lpf" width="56" height="56" data-value="1"></canvas><span class="filter-label">LPF</span></div>
+                  </div>
+                </section>
+                <section class="eq-control-section" aria-label="Deck A equalizer">
+                  <div class="tone-section-title">EQ</div>
+                  <div class="eq-section">
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d1-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+                  </div>
+                </section>
               </div>
               <div class="tempo-module" id="d1-tempo-module">
                 <div class="tempo-module-title">TEMPO</div>
@@ -338,10 +350,22 @@
               </div>
               <div class="fader-val" id="d2-gain-val">1.0x</div>
               </div>
-              <div class="eq-section">
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+              <div class="tone-controls">
+                <section class="filter-control-section" aria-label="Deck B filters">
+                  <div class="tone-section-title">FILTER</div>
+                  <div class="filter-section">
+                    <div class="filter-knob-wrap"><canvas class="filter-knob" id="d2-hpf" width="56" height="56" data-value="0"></canvas><span class="filter-label">HPF</span></div>
+                    <div class="filter-knob-wrap"><canvas class="filter-knob" id="d2-lpf" width="56" height="56" data-value="1"></canvas><span class="filter-label">LPF</span></div>
+                  </div>
+                </section>
+                <section class="eq-control-section" aria-label="Deck B equalizer">
+                  <div class="tone-section-title">EQ</div>
+                  <div class="eq-section">
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d2-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+                  </div>
+                </section>
               </div>
               <div class="tempo-module" id="d2-tempo-module">
                 <div class="tempo-module-title">TEMPO</div>
@@ -564,10 +588,22 @@
                 </div>
                 <div class="fader-val" id="d3-gain-val">1.0x</div>
               </div>
-              <div class="eq-section">
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
-                <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+              <div class="tone-controls">
+                <section class="filter-control-section" aria-label="Magic Deck filters">
+                  <div class="tone-section-title">FILTER</div>
+                  <div class="filter-section">
+                    <div class="filter-knob-wrap"><canvas class="filter-knob" id="d3-hpf" width="56" height="56" data-value="0"></canvas><span class="filter-label">HPF</span></div>
+                    <div class="filter-knob-wrap"><canvas class="filter-knob" id="d3-lpf" width="56" height="56" data-value="1"></canvas><span class="filter-label">LPF</span></div>
+                  </div>
+                </section>
+                <section class="eq-control-section" aria-label="Magic Deck equalizer">
+                  <div class="tone-section-title">EQ</div>
+                  <div class="eq-section">
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-low" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">LOW</span></div>
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-mid" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">MID</span></div>
+                    <div class="eq-knob-wrap"><canvas class="eq-knob" id="d3-hi" width="56" height="56" data-value="0.5"></canvas><span class="eq-label">HI</span></div>
+                  </div>
+                </section>
               </div>
               <div class="tempo-module" id="d3-tempo-module">
                 <div class="tempo-module-title">TEMPO</div>
