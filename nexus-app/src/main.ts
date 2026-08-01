@@ -3478,7 +3478,6 @@ function getDeckTransportElements(deckIndex: WaveformDeckIndex) {
     reenter: el<HTMLButtonElement>(`${prefix}-reenter`),
     crossfadeFrom: el<HTMLSelectElement>(`${prefix}-crossfade-from`),
     crossfadeBars: el<HTMLSelectElement>(`${prefix}-crossfade-bars`),
-    launch: el<HTMLButtonElement>(`${prefix}-launch`),
     cancel: el<HTMLButtonElement>(`${prefix}-cancel`),
     stop: el<HTMLButtonElement>(`${prefix}-stop-next-bar`),
     status: el<HTMLSpanElement>(`${prefix}-project-status`),
@@ -3514,10 +3513,8 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
   controls.crossfadeFrom.title = incomingAutomationBlocked
     ? 'Crossfade unavailable because this deck gain already has user automation'
     : ''
-  controls.launch.disabled = !available || pending
   controls.cancel.disabled = !available || pending || region?.fields.region.fields.isEnabled.value !== true
   controls.stop.disabled = !available || pending || region?.fields.region.fields.isEnabled.value !== true
-  controls.launch.textContent = pending && operation.activeKind === 'launching' ? 'SCHEDULING…' : 'LAUNCH'
   controls.cancel.textContent = pending && operation.activeKind === 'cancelling' ? 'CHECKING…' : 'CANCEL'
   controls.stop.textContent = pending && operation.activeKind === 'stopping' ? 'SCHEDULING…' : 'STOP NEXT BAR'
 
@@ -6044,10 +6041,6 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const gainSlider = document.getElementById(`${prefix}-gain`) as HTMLInputElement | null
   const gainVal = document.getElementById(`${prefix}-gain-val`) as HTMLSpanElement | null
 
-  const selectLaunchDirection = (direction: LaunchDirection) => {
-    transport.previous.setAttribute('aria-pressed', String(direction === 'previous'))
-    transport.next.setAttribute('aria-pressed', String(direction === 'next'))
-  }
   const scheduleLaunch = (action: LaunchPositionAction) => {
     const outgoingValue = transport.crossfadeFrom.value
     if (outgoingValue === '') {
@@ -6074,16 +6067,14 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
     )
   }
 
-  transport.previous.addEventListener('click', () => selectLaunchDirection('previous'))
-  transport.next.addEventListener('click', () => selectLaunchDirection('next'))
-  transport.launch.addEventListener('click', () => {
+  const scheduleLaunchMovement = (direction: LaunchDirection) => {
     const stepValue = transport.step.value
     if (stepValue !== 'beat' && stepValue !== 'bar' && stepValue !== 'four-bars') return
-    const direction: LaunchDirection = transport.previous.getAttribute('aria-pressed') === 'true'
-      ? 'previous'
-      : 'next'
     scheduleLaunch(composeLaunchPositionAction(direction, stepValue as LaunchStep))
-  })
+  }
+
+  transport.previous.addEventListener('click', () => scheduleLaunchMovement('previous'))
+  transport.next.addEventListener('click', () => scheduleLaunchMovement('next'))
   transport.reenter.addEventListener('click', () => scheduleLaunch('reenter-bar'))
   transport.crossfadeFrom.addEventListener('change', () => renderDeckTransport(deckIndex))
   transport.cancel.addEventListener('click', () => {

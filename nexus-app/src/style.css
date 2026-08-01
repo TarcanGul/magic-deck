@@ -377,11 +377,6 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   transition: all 0.15s;
 }
 .launch-direction-button:hover:not(:disabled) { border-color: var(--red); }
-.launch-direction-button[aria-pressed='true'] {
-  border-color: var(--red);
-  background: var(--red-dim);
-  box-shadow: 0 0 6px var(--red-glow2);
-}
 .launch-step-select { width: 88px; padding: 0 7px; }
 .crossfade-select { min-width: 126px; padding: 0 8px; }
 .crossfade-bars-select { min-width: 78px; padding: 0 8px; }
@@ -391,7 +386,6 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   background: var(--red);
   box-shadow: 0 0 8px var(--red-glow);
 }
-.launch-action { border-color: #287d56; color: #62efa9; }
 .stop-action { border-color: var(--red-dim); }
 .transport-action:disabled,
 .launch-direction-button:disabled,
