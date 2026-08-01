@@ -40,6 +40,11 @@ export function planForwardTimelineInsertion(
 ):
   | { kind: 'reject'; reason: 'region-starts-at-boundary' | 'backward-placement' }
   | { kind: 'insert'; truncate: RegionTruncation[]; removeRegionIds: string[] }
+export function planNonOverlappingCueTakeover(
+  regions: TimelineRegionSnapshot[],
+  positionTicks: number,
+  durationTicks: number,
+): { truncate: RegionTruncation[]; removeRegionIds: string[] }
 export function selectCanonicalRouting<T extends RoutingCandidate>(
   candidates: T[],
   canonicalName: string,

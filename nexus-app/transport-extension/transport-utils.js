@@ -266,7 +266,7 @@ export function moveLaunchPosition(
   ticksPerBar,
 ) {
   if (!Number.isSafeInteger(positionTicks) || positionTicks < 0) {
-    throw new RangeError('Remembered launch ticks must be a non-negative whole number')
+    throw new RangeError('Deck region position must be a non-negative whole number')
   }
   if (!Number.isSafeInteger(ticksPerBeat) || ticksPerBeat <= 0) {
     throw new RangeError('Ticks per beat must be a positive whole number')

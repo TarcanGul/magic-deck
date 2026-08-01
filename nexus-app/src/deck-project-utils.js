@@ -105,6 +105,73 @@ export function planForwardTimelineInsertion(regions, insertionTicks) {
   }
 }
 
+export function planNonOverlappingCueTakeover(regions, positionTicks, durationTicks) {
+  if (
+    !Number.isSafeInteger(positionTicks)
+    || positionTicks < 0
+    || !Number.isSafeInteger(durationTicks)
+    || durationTicks <= 0
+    || !Number.isSafeInteger(positionTicks + durationTicks)
+  ) throw new Error('Cue takeover requires a positive safe timeline range')
+
+  const takeoverEndTicks = positionTicks + durationTicks
+  const ordered = [...regions].sort(compareRegionStart)
+  const removeIds = new Set()
+  const plannedDurations = new Map()
+
+  ordered.forEach((region, index) => {
+    if (
+      !Number.isSafeInteger(region.positionTicks)
+      || region.positionTicks < 0
+      || !Number.isSafeInteger(region.durationTicks)
+      || region.durationTicks <= 0
+      || !Number.isSafeInteger(regionEnd(region))
+    ) throw new Error('Cue takeover found invalid deck region timing')
+    const next = ordered[index + 1]
+    if (!next) return
+    if (next.positionTicks === region.positionTicks) {
+      removeIds.add(region.id)
+      return
+    }
+    if (regionEnd(region) > next.positionTicks) {
+      plannedDurations.set(region.id, next.positionTicks - region.positionTicks)
+    }
+  })
+
+  ordered.forEach((region) => {
+    if (removeIds.has(region.id)) return
+    const plannedDuration = plannedDurations.get(region.id) ?? region.durationTicks
+    const plannedEndTicks = region.positionTicks + plannedDuration
+    if (region.positionTicks >= positionTicks && region.positionTicks < takeoverEndTicks) {
+      removeIds.add(region.id)
+      plannedDurations.delete(region.id)
+      return
+    }
+    if (region.positionTicks < positionTicks && plannedEndTicks > positionTicks) {
+      plannedDurations.set(region.id, positionTicks - region.positionTicks)
+    }
+  })
+
+  const truncate = ordered.flatMap((region) => {
+    if (removeIds.has(region.id)) return []
+    const nextDurationTicks = plannedDurations.get(region.id)
+    if (nextDurationTicks === undefined || nextDurationTicks === region.durationTicks) return []
+    return [{
+      id: region.id,
+      durationTicks: nextDurationTicks,
+      ...clampRegionFades(
+        nextDurationTicks,
+        region.fadeInDurationTicks,
+        region.fadeOutDurationTicks,
+      ),
+    }]
+  })
+  return {
+    truncate,
+    removeRegionIds: [...removeIds].sort(),
+  }
+}
+
 export function selectCanonicalRouting(candidates, canonicalName) {
   const ordered = candidates.slice().sort((a, b) =>
     a.trackOrder - b.trackOrder
