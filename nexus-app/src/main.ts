@@ -3602,10 +3602,10 @@ async function resolveDeckLaunchTarget(
   projectDocument: SyncedDocument,
   expectedSession: number,
 ) {
-  if (action === 'reenter-bar' || sessionLaunchPositionTicks === null) {
+  if (action === 'reenter-bar') {
     const targetBar = await showBarAssistant(
       deckIndex,
-      action === 'reenter-bar' ? 'reenter-launch' : 'launch',
+      'reenter-launch',
     )
     if (targetBar === null) return null
     if (
@@ -3618,8 +3618,32 @@ async function resolveDeckLaunchTarget(
     return barToPositionTicks(targetBar, Ticks.Bars(1))
   }
 
+  const controlledRegionId = decks[deckIndex].regionEntity?.id
+  const controlledRegion = controlledRegionId
+    ? projectDocument.queryEntities.ofTypes('audioRegion').getEntity(controlledRegionId)
+    : null
+  const recoveredRegions = controlledRegion
+    ? contiguousAudioRegions(projectDocument.queryEntities, controlledRegion)
+    : []
+  const recoveredPositionTicks = recoveredRegions[0]?.fields.region.fields.positionTicks.value
+    ?? controlledRegion?.fields.region.fields.positionTicks.value
+    ?? null
+  const launchPositionTicks = sessionLaunchPositionTicks ?? recoveredPositionTicks
+  if (launchPositionTicks === null) {
+    const targetBar = await showBarAssistant(deckIndex, 'launch')
+    if (targetBar === null) return null
+    if (
+      nexus !== projectDocument
+      || !projectConnected
+      || expectedSession !== tempoSessionId
+    ) {
+      throw new Error('Project connection changed during launch position entry')
+    }
+    return barToPositionTicks(targetBar, Ticks.Bars(1))
+  }
+
   return moveLaunchPosition(
-    sessionLaunchPositionTicks,
+    launchPositionTicks,
     action,
     Ticks.Beat,
     Ticks.Bars(1),
