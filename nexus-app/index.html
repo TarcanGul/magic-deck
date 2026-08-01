@@ -95,15 +95,16 @@
             <span class="cue-status" id="d1-cue-status" aria-live="polite">LOAD A TRACK TO ADD CUES</span>
           </div>
           <div class="transport project-transport" aria-label="Deck A project launch controls">
-            <select class="quantization-select" id="d1-quantization" aria-label="Deck A launch position adjustment">
-              <option value="previous-beat">PREVIOUS BEAT</option>
-              <option value="next-beat">NEXT BEAT</option>
-              <option value="previous-bar">PREVIOUS BAR</option>
-              <option value="next-bar" selected>NEXT BAR</option>
-              <option value="previous-four-bars">PREVIOUS 4 BARS</option>
-              <option value="next-four-bars">NEXT 4 BARS</option>
-              <option value="reenter-bar">RE-ENTER BAR…</option>
-            </select>
+            <div class="launch-position-control" role="group" aria-label="Deck A launch position adjustment">
+              <button class="launch-direction-button" id="d1-launch-previous" type="button" aria-label="Select previous launch direction for Deck A" aria-pressed="false">←</button>
+              <select class="launch-step-select" id="d1-launch-step" aria-label="Deck A launch distance">
+                <option value="beat">BEAT</option>
+                <option value="bar" selected>BAR</option>
+                <option value="four-bars">4 BARS</option>
+              </select>
+              <button class="launch-direction-button" id="d1-launch-next" type="button" aria-label="Select next launch direction for Deck A" aria-pressed="true">→</button>
+            </div>
+            <button class="transport-action reenter-action" id="d1-reenter" type="button" aria-label="Re-enter Deck A launch bar">RE-ENTER</button>
             <select class="crossfade-select" id="d1-crossfade-from" aria-label="Crossfade into Deck A from">
               <option value="">NO CROSSFADE</option>
               <option value="1">FROM DECK B</option>
@@ -265,15 +266,16 @@
             <span class="cue-status" id="d2-cue-status" aria-live="polite">LOAD A TRACK TO ADD CUES</span>
           </div>
           <div class="transport project-transport" aria-label="Deck B project launch controls">
-            <select class="quantization-select" id="d2-quantization" aria-label="Deck B launch position adjustment">
-              <option value="previous-beat">PREVIOUS BEAT</option>
-              <option value="next-beat">NEXT BEAT</option>
-              <option value="previous-bar">PREVIOUS BAR</option>
-              <option value="next-bar" selected>NEXT BAR</option>
-              <option value="previous-four-bars">PREVIOUS 4 BARS</option>
-              <option value="next-four-bars">NEXT 4 BARS</option>
-              <option value="reenter-bar">RE-ENTER BAR…</option>
-            </select>
+            <div class="launch-position-control" role="group" aria-label="Deck B launch position adjustment">
+              <button class="launch-direction-button" id="d2-launch-previous" type="button" aria-label="Select previous launch direction for Deck B" aria-pressed="false">←</button>
+              <select class="launch-step-select" id="d2-launch-step" aria-label="Deck B launch distance">
+                <option value="beat">BEAT</option>
+                <option value="bar" selected>BAR</option>
+                <option value="four-bars">4 BARS</option>
+              </select>
+              <button class="launch-direction-button" id="d2-launch-next" type="button" aria-label="Select next launch direction for Deck B" aria-pressed="true">→</button>
+            </div>
+            <button class="transport-action reenter-action" id="d2-reenter" type="button" aria-label="Re-enter Deck B launch bar">RE-ENTER</button>
             <select class="crossfade-select" id="d2-crossfade-from" aria-label="Crossfade into Deck B from">
               <option value="">NO CROSSFADE</option>
               <option value="0">FROM DECK A</option>
@@ -439,15 +441,16 @@
           <div class="magic-duration-label">DURATION: 4 BARS</div>
           <button class="btn-generate" id="btn-generate">⬡ GENERATE FROM LIVE AUDIO</button>
           <div class="transport project-transport magic-project-transport" aria-label="Magic Deck project launch controls">
-            <select class="quantization-select" id="d3-quantization" aria-label="Magic Deck launch position adjustment">
-              <option value="previous-beat">PREVIOUS BEAT</option>
-              <option value="next-beat">NEXT BEAT</option>
-              <option value="previous-bar">PREVIOUS BAR</option>
-              <option value="next-bar" selected>NEXT BAR</option>
-              <option value="previous-four-bars">PREVIOUS 4 BARS</option>
-              <option value="next-four-bars">NEXT 4 BARS</option>
-              <option value="reenter-bar">RE-ENTER BAR…</option>
-            </select>
+            <div class="launch-position-control" role="group" aria-label="Magic Deck launch position adjustment">
+              <button class="launch-direction-button" id="d3-launch-previous" type="button" aria-label="Select previous launch direction for Magic Deck" aria-pressed="false">←</button>
+              <select class="launch-step-select" id="d3-launch-step" aria-label="Magic Deck launch distance">
+                <option value="beat">BEAT</option>
+                <option value="bar" selected>BAR</option>
+                <option value="four-bars">4 BARS</option>
+              </select>
+              <button class="launch-direction-button" id="d3-launch-next" type="button" aria-label="Select next launch direction for Magic Deck" aria-pressed="true">→</button>
+            </div>
+            <button class="transport-action reenter-action" id="d3-reenter" type="button" aria-label="Re-enter Magic Deck launch bar">RE-ENTER</button>
             <select class="crossfade-select" id="d3-crossfade-from" aria-label="Crossfade into Magic Deck from">
               <option value="">NO CROSSFADE</option>
               <option value="0">FROM DECK A</option>

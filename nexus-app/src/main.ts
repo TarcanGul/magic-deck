@@ -8,6 +8,7 @@ import {
   TRANSPORT_CHANNEL,
   TRANSPORT_REQUEST_TIMEOUT_MS,
   barToPositionTicks,
+  composeLaunchPositionAction,
   guardedTransportTicks,
   moveLaunchPosition,
   planRegionCancel,
@@ -19,7 +20,9 @@ import {
   validateTransportResponse,
 } from '../transport-extension/transport-utils.js'
 import type {
+  LaunchDirection,
   LaunchPositionAction,
+  LaunchStep,
   TransportRequest,
   TransportPosition,
   TransportResponse,
@@ -3469,7 +3472,10 @@ function getSynchronizedDeckFullDurationTicks(deckIndex: WaveformDeckIndex) {
 function getDeckTransportElements(deckIndex: WaveformDeckIndex) {
   const prefix = `d${deckIndex + 1}`
   return {
-    quantization: el<HTMLSelectElement>(`${prefix}-quantization`),
+    previous: el<HTMLButtonElement>(`${prefix}-launch-previous`),
+    next: el<HTMLButtonElement>(`${prefix}-launch-next`),
+    step: el<HTMLSelectElement>(`${prefix}-launch-step`),
+    reenter: el<HTMLButtonElement>(`${prefix}-reenter`),
     crossfadeFrom: el<HTMLSelectElement>(`${prefix}-crossfade-from`),
     crossfadeBars: el<HTMLSelectElement>(`${prefix}-crossfade-bars`),
     launch: el<HTMLButtonElement>(`${prefix}-launch`),
@@ -3499,7 +3505,10 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
     controls.error.textContent =
       `${placementDeckLabel(outgoingDeckIndex!)} HAS USER GAIN AUTOMATION — ORDINARY LAUNCH REMAINS AVAILABLE`
   }
-  controls.quantization.disabled = !available || pending
+  controls.previous.disabled = !available || pending
+  controls.next.disabled = !available || pending
+  controls.step.disabled = !available || pending
+  controls.reenter.disabled = !available || pending
   controls.crossfadeFrom.disabled = !available || pending || incomingAutomationBlocked
   controls.crossfadeBars.disabled = !available || pending || controls.crossfadeFrom.value === ''
   controls.crossfadeFrom.title = incomingAutomationBlocked
@@ -6035,17 +6044,11 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   const gainSlider = document.getElementById(`${prefix}-gain`) as HTMLInputElement | null
   const gainVal = document.getElementById(`${prefix}-gain-val`) as HTMLSpanElement | null
 
-  transport.launch.addEventListener('click', () => {
-    const action = transport.quantization.value as LaunchPositionAction
-    if (
-      action !== 'previous-beat'
-      && action !== 'next-beat'
-      && action !== 'previous-bar'
-      && action !== 'next-bar'
-      && action !== 'previous-four-bars'
-      && action !== 'next-four-bars'
-      && action !== 'reenter-bar'
-    ) return
+  const selectLaunchDirection = (direction: LaunchDirection) => {
+    transport.previous.setAttribute('aria-pressed', String(direction === 'previous'))
+    transport.next.setAttribute('aria-pressed', String(direction === 'next'))
+  }
+  const scheduleLaunch = (action: LaunchPositionAction) => {
     const outgoingValue = transport.crossfadeFrom.value
     if (outgoingValue === '') {
       queueDeckTransportOperation(
@@ -6069,7 +6072,19 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
       ),
       outgoingDeckIndex,
     )
+  }
+
+  transport.previous.addEventListener('click', () => selectLaunchDirection('previous'))
+  transport.next.addEventListener('click', () => selectLaunchDirection('next'))
+  transport.launch.addEventListener('click', () => {
+    const stepValue = transport.step.value
+    if (stepValue !== 'beat' && stepValue !== 'bar' && stepValue !== 'four-bars') return
+    const direction: LaunchDirection = transport.previous.getAttribute('aria-pressed') === 'true'
+      ? 'previous'
+      : 'next'
+    scheduleLaunch(composeLaunchPositionAction(direction, stepValue as LaunchStep))
   })
+  transport.reenter.addEventListener('click', () => scheduleLaunch('reenter-bar'))
   transport.crossfadeFrom.addEventListener('change', () => renderDeckTransport(deckIndex))
   transport.cancel.addEventListener('click', () => {
     queueDeckTransportOperation(

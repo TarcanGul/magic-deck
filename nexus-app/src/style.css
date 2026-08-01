@@ -349,7 +349,8 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   flex-wrap: wrap;
 }
 .magic-project-transport { margin-top: 10px; }
-.quantization-select,
+.launch-step-select,
+.launch-direction-button,
 .crossfade-select,
 .crossfade-bars-select,
 .transport-action {
@@ -361,7 +362,27 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   font-size: 9px;
   letter-spacing: 1px;
 }
-.quantization-select { min-width: 140px; padding: 0 8px; }
+.launch-position-control {
+  display: grid;
+  grid-template-columns: 32px 88px 32px;
+  flex: 0 0 auto;
+  gap: 3px;
+  white-space: nowrap;
+}
+.launch-direction-button {
+  width: 32px;
+  padding: 0;
+  cursor: pointer;
+  font-size: 15px;
+  transition: all 0.15s;
+}
+.launch-direction-button:hover:not(:disabled) { border-color: var(--red); }
+.launch-direction-button[aria-pressed='true'] {
+  border-color: var(--red);
+  background: var(--red-dim);
+  box-shadow: 0 0 6px var(--red-glow2);
+}
+.launch-step-select { width: 88px; padding: 0 7px; }
 .crossfade-select { min-width: 126px; padding: 0 8px; }
 .crossfade-bars-select { min-width: 78px; padding: 0 8px; }
 .transport-action { padding: 0 11px; cursor: pointer; transition: all 0.15s; }
@@ -373,7 +394,8 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .launch-action { border-color: #287d56; color: #62efa9; }
 .stop-action { border-color: var(--red-dim); }
 .transport-action:disabled,
-.quantization-select:disabled,
+.launch-direction-button:disabled,
+.launch-step-select:disabled,
 .crossfade-select:disabled,
 .crossfade-bars-select:disabled { cursor: not-allowed; opacity: 0.38; }
 .project-transport-status {

@@ -288,6 +288,23 @@ export function moveLaunchPosition(
   return target
 }
 
+export function composeLaunchPositionAction(direction, step) {
+  const action = {
+    previous: {
+      beat: 'previous-beat',
+      bar: 'previous-bar',
+      'four-bars': 'previous-four-bars',
+    },
+    next: {
+      beat: 'next-beat',
+      bar: 'next-bar',
+      'four-bars': 'next-four-bars',
+    },
+  }[direction]?.[step]
+  if (action === undefined) throw new RangeError('Unknown launch direction or step')
+  return action
+}
+
 export function tickToBar(tick, ticksPerBar) {
   if (!Number.isSafeInteger(tick) || tick < 0 || !Number.isSafeInteger(ticksPerBar) || ticksPerBar <= 0) {
     throw new RangeError('Tick and bar size must be safe non-negative values')

@@ -4,6 +4,7 @@ import { Ticks } from '@audiotool/nexus/utils'
 import {
   TRANSPORT_CHANNEL,
   barToPositionTicks,
+  composeLaunchPositionAction,
   guardedTransportTicks,
   matchProjectTabs,
   mergeTransportPositions,
@@ -253,6 +254,15 @@ test('moves a remembered launch position by beats, bars, and four-bar blocks', (
     moveLaunchPosition(remembered, 'next-four-bars', beat, bar),
     remembered + bar * 4,
   )
+})
+
+test('composes every launch direction and step', () => {
+  assert.equal(composeLaunchPositionAction('previous', 'beat'), 'previous-beat')
+  assert.equal(composeLaunchPositionAction('next', 'beat'), 'next-beat')
+  assert.equal(composeLaunchPositionAction('previous', 'bar'), 'previous-bar')
+  assert.equal(composeLaunchPositionAction('next', 'bar'), 'next-bar')
+  assert.equal(composeLaunchPositionAction('previous', 'four-bars'), 'previous-four-bars')
+  assert.equal(composeLaunchPositionAction('next', 'four-bars'), 'next-four-bars')
 })
 
 test('rejects remembered launch movement before bar 1 or beyond safe ticks', () => {
