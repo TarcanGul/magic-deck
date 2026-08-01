@@ -38,6 +38,17 @@
           <span id="audio-capture-label">SHARE AUDIO NOW, OR GENERATE WILL ASK · RECORDING STARTS ON GENERATE</span>
         </div>
       </div>
+      <div class="conn-row music-library-row" id="music-library-row">
+        <label class="conn-label">MUSIC LIBRARY</label>
+        <div class="music-library-summary" role="status" aria-live="polite">
+          <span id="music-library-dot" class="dot idle"></span>
+          <span id="music-library-status">NO MUSIC FOLDER SELECTED</span>
+        </div>
+        <button id="btn-music-library-choose" class="btn-primary" type="button">CHOOSE FOLDER</button>
+        <button id="btn-music-library-refresh" class="btn-primary is-hidden" type="button">REFRESH</button>
+        <button id="btn-music-library-change" class="btn-danger is-hidden" type="button">CHANGE FOLDER</button>
+        <input id="music-library-fallback" class="is-hidden" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav" webkitdirectory multiple />
+      </div>
       <!-- Hidden inputs still in DOM for JS refs -->
       <input type="hidden" id="input-client-id" value="fa370480-13d6-4cba-8015-f9297a81e9e8">
       <div class="conn-actions">
@@ -169,6 +180,7 @@
                   <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                   <button class="deck-unload is-hidden" id="deck1-unload" type="button" aria-label="Unload Deck A">UNLOAD</button>
                   <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+                  <button class="assistant-library-trigger" data-deck-library="0" type="button" aria-label="Browse the music library for Deck A">LIBRARY</button>
                   <button class="assistant-fx-trigger" data-deck-fx="0" type="button" aria-label="Open Deck A effects">FX</button>
                 </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck1-bpm-title"></div>
@@ -203,6 +215,26 @@
                 </div>
                 <div class="bar-assistant-error" id="deck1-bar-assistant-error" aria-live="polite"></div>
               </div>
+              <section class="deck-library-view is-hidden" data-deck-library-view aria-label="Deck A music library">
+                <div class="deck-library-toolbar">
+                  <input class="deck-library-search" data-deck-library-search type="search" placeholder="SEARCH MUSIC" autocomplete="off" aria-label="Search Deck A music library" />
+                  <span class="deck-library-count" data-deck-library-count></span>
+                </div>
+                <div class="deck-library-grid" data-deck-library-grid role="grid" aria-label="Music library tracks" aria-colcount="4" tabindex="-1">
+                  <div class="deck-library-grid-header" role="row">
+                    <button type="button" role="columnheader" data-library-sort="name">FILE</button>
+                    <button type="button" role="columnheader" data-library-sort="folder">FOLDER</button>
+                    <button type="button" role="columnheader" data-library-sort="size">SIZE</button>
+                    <button type="button" role="columnheader" data-library-sort="modified">MODIFIED</button>
+                  </div>
+                  <div class="deck-library-grid-body" data-deck-library-list role="rowgroup"></div>
+                </div>
+                <div class="deck-library-footer">
+                  <div class="deck-library-error" data-deck-library-error aria-live="polite"></div>
+                  <button class="btn-danger deck-library-back" data-deck-library-back type="button">BACK</button>
+                  <button class="btn-primary deck-library-load" data-deck-library-load type="button">LOAD</button>
+                </div>
+              </section>
               <section class="deck-fx-view is-hidden" data-deck-fx-view aria-label="Deck A effects">
                 <div class="deck-fx-title">DECK A EFFECTS</div>
                 <p class="deck-fx-copy">PROJECT-SYNCHRONIZED SIGNAL PATH</p>
@@ -339,6 +371,7 @@
                   <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                   <button class="deck-unload is-hidden" id="deck2-unload" type="button" aria-label="Unload Deck B">UNLOAD</button>
                   <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
+                  <button class="assistant-library-trigger" data-deck-library="1" type="button" aria-label="Browse the music library for Deck B">LIBRARY</button>
                   <button class="assistant-fx-trigger" data-deck-fx="1" type="button" aria-label="Open Deck B effects">FX</button>
                 </div>
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck2-bpm-title"></div>
@@ -373,6 +406,26 @@
                 </div>
                 <div class="bar-assistant-error" id="deck2-bar-assistant-error" aria-live="polite"></div>
               </div>
+              <section class="deck-library-view is-hidden" data-deck-library-view aria-label="Deck B music library">
+                <div class="deck-library-toolbar">
+                  <input class="deck-library-search" data-deck-library-search type="search" placeholder="SEARCH MUSIC" autocomplete="off" aria-label="Search Deck B music library" />
+                  <span class="deck-library-count" data-deck-library-count></span>
+                </div>
+                <div class="deck-library-grid" data-deck-library-grid role="grid" aria-label="Music library tracks" aria-colcount="4" tabindex="-1">
+                  <div class="deck-library-grid-header" role="row">
+                    <button type="button" role="columnheader" data-library-sort="name">FILE</button>
+                    <button type="button" role="columnheader" data-library-sort="folder">FOLDER</button>
+                    <button type="button" role="columnheader" data-library-sort="size">SIZE</button>
+                    <button type="button" role="columnheader" data-library-sort="modified">MODIFIED</button>
+                  </div>
+                  <div class="deck-library-grid-body" data-deck-library-list role="rowgroup"></div>
+                </div>
+                <div class="deck-library-footer">
+                  <div class="deck-library-error" data-deck-library-error aria-live="polite"></div>
+                  <button class="btn-danger deck-library-back" data-deck-library-back type="button">BACK</button>
+                  <button class="btn-primary deck-library-load" data-deck-library-load type="button">LOAD</button>
+                </div>
+              </section>
               <section class="deck-fx-view is-hidden" data-deck-fx-view aria-label="Deck B effects">
                 <div class="deck-fx-title">DECK B EFFECTS</div>
                 <p class="deck-fx-copy">PROJECT-SYNCHRONIZED SIGNAL PATH</p>

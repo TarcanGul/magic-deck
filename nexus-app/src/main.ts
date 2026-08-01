@@ -50,6 +50,19 @@ import {
   planAudioRegionSplit,
   planResizedCueOffsets,
 } from './cue-utils.js'
+import {
+  filterMusicEntries,
+  indexMusicDirectory,
+  indexMusicFiles,
+  isSupportedMusicFile,
+  nextMusicSelectionIndex,
+  sortMusicEntries,
+} from './music-library-utils.js'
+import type {
+  MusicLibraryEntry,
+  MusicLibrarySortDirection,
+  MusicLibrarySortKey,
+} from './music-library-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -209,6 +222,37 @@ interface DeckFxElements {
   knobs: Record<DeckFxKind, HTMLCanvasElement>
   outputs: Record<DeckFxKind, HTMLOutputElement>
 }
+interface DeckLibraryElements {
+  assistant: HTMLDivElement
+  trigger: HTMLButtonElement
+  view: HTMLElement
+  search: HTMLInputElement
+  grid: HTMLDivElement
+  list: HTMLDivElement
+  count: HTMLSpanElement
+  error: HTMLDivElement
+  back: HTMLButtonElement
+  load: HTMLButtonElement
+  sortButtons: HTMLButtonElement[]
+}
+interface MusicLibraryPickerState {
+  query: string
+  sortKey: MusicLibrarySortKey
+  sortDirection: MusicLibrarySortDirection
+  selectedId: string | null
+}
+type MusicLibraryConnectionState = 'empty' | 'busy' | 'ready' | 'reconnect' | 'error'
+type MusicDirectoryHandle = FileSystemDirectoryHandle & {
+  queryPermission(options?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState>
+  requestPermission(options?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState>
+}
+interface DirectoryPickerWindow extends Window {
+  showDirectoryPicker?: (options?: {
+    id?: string
+    mode?: 'read' | 'readwrite'
+    startIn?: 'desktop' | 'documents' | 'downloads' | 'music' | 'pictures' | 'videos'
+  }) => Promise<MusicDirectoryHandle>
+}
 interface ResolvedDeckContentGraph {
   region: NexusEntity<'audioRegion'>
   sample: NexusEntity<'sample'>
@@ -230,6 +274,10 @@ const AUBIO_AUTO_ACCEPT_CONFIDENCE = 0.8
 const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 const DECK_PROJECT_NAMES = ['DECK 1', 'DECK 2', 'MAGIC DECK'] as const
 const CUE_STORAGE_PREFIX = 'magic-deck:cues:v1:'
+const MUSIC_LIBRARY_DB_NAME = 'magic-deck-library'
+const MUSIC_LIBRARY_STORE_NAME = 'settings'
+const MUSIC_LIBRARY_ROOT_KEY = 'music-root'
+const MUSIC_LIBRARY_PAGE_SIZE = 3
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
@@ -244,6 +292,13 @@ let sessionLaunchPositionTicks: number | null = null
 let activeFxDeckIndex: WaveformDeckIndex | null = null
 let activeFxTrigger: HTMLButtonElement | null = null
 let deckFxAssistantRequestId = 0
+let activeLibraryDeckIndex: 0 | 1 | null = null
+let musicLibraryDirectoryHandle: MusicDirectoryHandle | null = null
+let musicLibraryEntries: MusicLibraryEntry[] = []
+let musicLibraryFolderName = ''
+let musicLibraryConnectionState: MusicLibraryConnectionState = 'empty'
+let musicLibraryStatusMessage = 'NO MUSIC FOLDER SELECTED'
+let musicLibraryUsesFallback = false
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -260,6 +315,10 @@ const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) 
 const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
   { editing: false, pending: false, requestId: 0 },
+]
+const musicLibraryPickerStates: [MusicLibraryPickerState, MusicLibraryPickerState] = [
+  { query: '', sortKey: 'name', sortDirection: 'ascending', selectedId: null },
+  { query: '', sortKey: 'name', sortDirection: 'ascending', selectedId: null },
 ]
 const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
   { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
@@ -307,6 +366,26 @@ function getDeckFxElements(deckIndex: WaveformDeckIndex): DeckFxElements {
     outputs,
   }
 }
+function getDeckLibraryElements(deckIndex: 0 | 1): DeckLibraryElements {
+  const assistant = requiredElement<HTMLDivElement>(
+    document,
+    `[data-deck-assistant="${deckIndex}"]`,
+  )
+  const view = requiredElement<HTMLElement>(assistant, '[data-deck-library-view]')
+  return {
+    assistant,
+    trigger: requiredElement<HTMLButtonElement>(assistant, `[data-deck-library="${deckIndex}"]`),
+    view,
+    search: requiredElement<HTMLInputElement>(view, '[data-deck-library-search]'),
+    grid: requiredElement<HTMLDivElement>(view, '[data-deck-library-grid]'),
+    list: requiredElement<HTMLDivElement>(view, '[data-deck-library-list]'),
+    count: requiredElement<HTMLSpanElement>(view, '[data-deck-library-count]'),
+    error: requiredElement<HTMLDivElement>(view, '[data-deck-library-error]'),
+    back: requiredElement<HTMLButtonElement>(view, '[data-deck-library-back]'),
+    load: requiredElement<HTMLButtonElement>(view, '[data-deck-library-load]'),
+    sortButtons: Array.from(view.querySelectorAll<HTMLButtonElement>('[data-library-sort]')),
+  }
+}
 const statusDot = el<HTMLSpanElement>('status-dot')
 const statusText = el<HTMLSpanElement>('status-text')
 const statusUser = el<HTMLDivElement>('status-user')
@@ -319,6 +398,12 @@ const btnOpenAudiotool = el<HTMLButtonElement>('btn-open-audiotool')
 const btnAudioCapture = el<HTMLButtonElement>('btn-audio-capture')
 const audioCaptureDot = el<HTMLSpanElement>('audio-capture-dot')
 const audioCaptureLabel = el<HTMLSpanElement>('audio-capture-label')
+const musicLibraryDot = el<HTMLSpanElement>('music-library-dot')
+const musicLibraryStatus = el<HTMLSpanElement>('music-library-status')
+const btnMusicLibraryChoose = el<HTMLButtonElement>('btn-music-library-choose')
+const btnMusicLibraryRefresh = el<HTMLButtonElement>('btn-music-library-refresh')
+const btnMusicLibraryChange = el<HTMLButtonElement>('btn-music-library-change')
+const musicLibraryFallbackInput = el<HTMLInputElement>('music-library-fallback')
 const inputProjectUrl = el<HTMLInputElement>('input-project-url')
 const magentaUrl = el<HTMLInputElement>('magenta-url')
 const btnGenerate = el<HTMLButtonElement>('btn-generate')
@@ -329,6 +414,194 @@ const magicStemRoleInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="magic-stem-role"]'),
 )
 const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
+
+// ── Music library ────────────────────────────────────────────────────────────
+function openMusicLibraryDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(MUSIC_LIBRARY_DB_NAME, 1)
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(MUSIC_LIBRARY_STORE_NAME)) {
+        request.result.createObjectStore(MUSIC_LIBRARY_STORE_NAME)
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Music library database failed'))
+  })
+}
+
+async function loadStoredMusicDirectoryHandle(): Promise<MusicDirectoryHandle | null> {
+  const database = await openMusicLibraryDatabase()
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database
+        .transaction(MUSIC_LIBRARY_STORE_NAME, 'readonly')
+        .objectStore(MUSIC_LIBRARY_STORE_NAME)
+        .get(MUSIC_LIBRARY_ROOT_KEY)
+      request.onsuccess = () => resolve((request.result as MusicDirectoryHandle | undefined) ?? null)
+      request.onerror = () => reject(request.error ?? new Error('Stored music folder could not be read'))
+    })
+  } finally {
+    database.close()
+  }
+}
+
+async function storeMusicDirectoryHandle(handle: MusicDirectoryHandle) {
+  const database = await openMusicLibraryDatabase()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = database
+        .transaction(MUSIC_LIBRARY_STORE_NAME, 'readwrite')
+        .objectStore(MUSIC_LIBRARY_STORE_NAME)
+        .put(handle, MUSIC_LIBRARY_ROOT_KEY)
+      request.onsuccess = () => resolve()
+      request.onerror = () => reject(request.error ?? new Error('Music folder could not be remembered'))
+    })
+  } finally {
+    database.close()
+  }
+}
+
+function directoryPickerAvailable() {
+  return typeof (window as DirectoryPickerWindow).showDirectoryPicker === 'function'
+}
+
+function renderMusicLibrarySetup() {
+  musicLibraryDot.className = `dot ${musicLibraryConnectionState === 'ready'
+    ? 'connected'
+    : musicLibraryConnectionState === 'busy'
+      ? 'connecting'
+      : musicLibraryConnectionState === 'error'
+        ? 'error'
+        : 'idle'}`
+  musicLibraryStatus.textContent = musicLibraryStatusMessage
+  const ready = musicLibraryConnectionState === 'ready'
+  const reconnect = musicLibraryConnectionState === 'reconnect'
+  const busy = musicLibraryConnectionState === 'busy'
+  btnMusicLibraryChoose.classList.toggle('is-hidden', ready)
+  btnMusicLibraryChoose.textContent = reconnect ? 'RECONNECT' : 'CHOOSE FOLDER'
+  btnMusicLibraryChoose.disabled = busy
+  btnMusicLibraryRefresh.classList.toggle('is-hidden', !ready)
+  btnMusicLibraryRefresh.textContent = musicLibraryUsesFallback ? 'RESELECT' : 'REFRESH'
+  btnMusicLibraryRefresh.disabled = busy
+  btnMusicLibraryChange.classList.toggle('is-hidden', !ready && !reconnect)
+  btnMusicLibraryChange.disabled = busy
+  if (activeLibraryDeckIndex !== null) renderDeckLibraryView(activeLibraryDeckIndex)
+  renderDeckLibraryAvailability()
+}
+
+function setMusicLibrarySetupState(
+  state: MusicLibraryConnectionState,
+  message: string,
+) {
+  musicLibraryConnectionState = state
+  musicLibraryStatusMessage = message
+  renderMusicLibrarySetup()
+}
+
+async function scanMusicDirectory(handle: MusicDirectoryHandle) {
+  setMusicLibrarySetupState('busy', `INDEXING ${handle.name.toUpperCase()}…`)
+  try {
+    const entries = await indexMusicDirectory(handle)
+    musicLibraryDirectoryHandle = handle
+    musicLibraryFolderName = handle.name
+    musicLibraryEntries = entries
+    musicLibraryUsesFallback = false
+    setMusicLibrarySetupState(
+      'ready',
+      `${handle.name.toUpperCase()} · ${entries.length} ${entries.length === 1 ? 'TRACK' : 'TRACKS'}`,
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    setMusicLibrarySetupState('error', `INDEX FAILED · ${message.toUpperCase()}`)
+  }
+}
+
+async function chooseMusicDirectory() {
+  if (!directoryPickerAvailable()) {
+    musicLibraryFallbackInput.value = ''
+    musicLibraryFallbackInput.click()
+    return
+  }
+  try {
+    const handle = await (window as DirectoryPickerWindow).showDirectoryPicker!({
+      id: 'magic-deck-music-library',
+      mode: 'read',
+      startIn: 'music',
+    })
+    try {
+      await storeMusicDirectoryHandle(handle)
+    } catch (error) {
+      console.warn('[MUSIC LIBRARY] Folder handle will be available for this session only:', error)
+    }
+    await scanMusicDirectory(handle)
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return
+    const message = error instanceof Error ? error.message : String(error)
+    setMusicLibrarySetupState('error', `FOLDER SELECTION FAILED · ${message.toUpperCase()}`)
+  }
+}
+
+async function reconnectMusicDirectory() {
+  const handle = musicLibraryDirectoryHandle
+  if (!handle) {
+    await chooseMusicDirectory()
+    return
+  }
+  try {
+    const permission = await handle.requestPermission({ mode: 'read' })
+    if (permission !== 'granted') {
+      setMusicLibrarySetupState('reconnect', `${handle.name.toUpperCase()} · ACCESS REQUIRED`)
+      return
+    }
+    await scanMusicDirectory(handle)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    setMusicLibrarySetupState('error', `RECONNECT FAILED · ${message.toUpperCase()}`)
+  }
+}
+
+async function refreshMusicLibrary() {
+  if (musicLibraryUsesFallback) {
+    musicLibraryFallbackInput.value = ''
+    musicLibraryFallbackInput.click()
+    return
+  }
+  if (!musicLibraryDirectoryHandle) {
+    await chooseMusicDirectory()
+    return
+  }
+  const permission = await musicLibraryDirectoryHandle.queryPermission({ mode: 'read' })
+  if (permission !== 'granted') {
+    await reconnectMusicDirectory()
+    return
+  }
+  await scanMusicDirectory(musicLibraryDirectoryHandle)
+}
+
+async function restoreMusicLibrary() {
+  if (!directoryPickerAvailable()) {
+    renderMusicLibrarySetup()
+    return
+  }
+  try {
+    const handle = await loadStoredMusicDirectoryHandle()
+    if (!handle) {
+      renderMusicLibrarySetup()
+      return
+    }
+    musicLibraryDirectoryHandle = handle
+    musicLibraryFolderName = handle.name
+    const permission = await handle.queryPermission({ mode: 'read' })
+    if (permission === 'granted') {
+      await scanMusicDirectory(handle)
+    } else {
+      setMusicLibrarySetupState('reconnect', `${handle.name.toUpperCase()} · ACCESS REQUIRED`)
+    }
+  } catch (error) {
+    console.warn('[MUSIC LIBRARY] Stored folder could not be restored:', error)
+    renderMusicLibrarySetup()
+  }
+}
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 function setStatus(state: 'idle' | 'connecting' | 'connected' | 'error', msg: string) {
@@ -396,6 +669,7 @@ function showBarAssistantNow(
   purpose: BarAssistantPurpose,
 ): Promise<number | null> {
   if (activeFxDeckIndex !== null) closeDeckFxAssistant()
+  if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
   return new Promise((resolve) => {
     const deckNumber = deckIndex + 1
     const assistant = el<HTMLDivElement>(
@@ -757,6 +1031,7 @@ async function connectProject() {
 }
 
 function resetTempoMasterSession() {
+  if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
   tempoSessionId += 1
   projectConnected = false
   currentProjectId = null
@@ -2284,6 +2559,8 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   renderDeckTransport(deckIndex)
   renderCueControls(deckIndex)
   updateManualBpmReportUi(deckIndex)
+  if (activeLibraryDeckIndex === deckIndex) renderDeckLibraryView(deckIndex)
+  renderDeckLibraryAvailability()
 }
 
 function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
@@ -2347,10 +2624,13 @@ function updateManualBpmReportUi(deckIndex: 0 | 1) {
   const available = canReportManualBpm(deckIndex)
   controls.trigger.classList.toggle('is-hidden', !available || state.editing)
   controls.form.classList.toggle('is-hidden', !available || !state.editing)
-  controls.trigger.disabled = state.pending || activeFxDeckIndex === deckIndex
+  controls.trigger.disabled = state.pending
+    || activeFxDeckIndex === deckIndex
+    || activeLibraryDeckIndex === deckIndex
   controls.input.disabled = state.pending
   controls.apply.disabled = state.pending
   controls.cancel.disabled = state.pending
+  renderDeckLibraryAvailability()
 }
 
 function resetManualBpmReport(deckIndex: 0 | 1) {
@@ -3247,6 +3527,7 @@ function resetBpmDialogue(deckIndex: number) {
 }
 
 function showBpmAnalyzing(deckNum: number) {
+  if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
   const prefix = `deck${deckNum}-bpm`
   el<HTMLDivElement>(`${prefix}-dialogue`).classList.remove('is-hidden')
   el<HTMLDivElement>(`${prefix}-form`).classList.add('is-hidden')
@@ -3256,6 +3537,7 @@ function showBpmAnalyzing(deckNum: number) {
 }
 
 function showBpmDialogue(deckNum: number, estimate?: AubioBpmResult): Promise<BpmResolution | null> {
+  if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
   return new Promise((resolve) => {
     const deckIndex = deckNum - 1
     const prefix = `deck${deckNum}-bpm`
@@ -5160,6 +5442,314 @@ async function applyDeckFx(
   }
 }
 
+function formatLibraryFileSize(size: number) {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatLibraryModified(lastModified: number) {
+  if (!lastModified) return '—'
+  return new Date(lastModified).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: '2-digit',
+  })
+}
+
+function visibleMusicLibraryEntries(deckIndex: 0 | 1) {
+  const state = musicLibraryPickerStates[deckIndex]
+  return sortMusicEntries(
+    filterMusicEntries(musicLibraryEntries, state.query),
+    state.sortKey,
+    state.sortDirection,
+  )
+}
+
+function focusSelectedMusicLibraryRow(deckIndex: 0 | 1) {
+  const controls = getDeckLibraryElements(deckIndex)
+  const selected = controls.list.querySelector<HTMLElement>('[aria-selected="true"]')
+  if (selected) {
+    selected.focus()
+    selected.scrollIntoView({ block: 'nearest' })
+  } else {
+    controls.search.focus()
+  }
+}
+
+function selectMusicLibraryEntry(deckIndex: 0 | 1, entryId: string, focus = false) {
+  const state = musicLibraryPickerStates[deckIndex]
+  state.selectedId = entryId
+  const controls = getDeckLibraryElements(deckIndex)
+  const rows = Array.from(controls.list.querySelectorAll<HTMLElement>('.deck-library-row'))
+  if (rows.length === 0) {
+    renderDeckLibraryView(deckIndex)
+  } else {
+    rows.forEach((row) => {
+      const selected = row.dataset.libraryEntryId === entryId
+      row.setAttribute('aria-selected', String(selected))
+      row.tabIndex = selected ? 0 : -1
+    })
+    controls.load.disabled = !projectConnected || nexus === null
+  }
+  if (focus) focusSelectedMusicLibraryRow(deckIndex)
+}
+
+function handleMusicLibraryRowKey(
+  event: KeyboardEvent,
+  deckIndex: 0 | 1,
+  entryId: string,
+) {
+  const controls = getDeckLibraryElements(deckIndex)
+  if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'f') {
+    event.preventDefault()
+    controls.search.focus()
+    controls.search.select()
+    return
+  }
+  if (event.key === '/') {
+    event.preventDefault()
+    controls.search.focus()
+    controls.search.select()
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    selectMusicLibraryEntry(deckIndex, entryId)
+    void loadSelectedMusicLibraryEntry(deckIndex)
+    return
+  }
+  if (!['ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return
+  event.preventDefault()
+  const entries = visibleMusicLibraryEntries(deckIndex)
+  const currentIndex = Math.max(0, entries.findIndex(({ id }) => id === entryId))
+  const nextIndex = nextMusicSelectionIndex(
+    currentIndex,
+    event.key,
+    entries.length,
+    MUSIC_LIBRARY_PAGE_SIZE,
+  )
+  const nextEntry = entries[nextIndex]
+  if (nextEntry) selectMusicLibraryEntry(deckIndex, nextEntry.id, true)
+}
+
+function renderDeckLibraryView(deckIndex: 0 | 1) {
+  const controls = getDeckLibraryElements(deckIndex)
+  const state = musicLibraryPickerStates[deckIndex]
+  const entries = visibleMusicLibraryEntries(deckIndex)
+  if (!entries.some(({ id }) => id === state.selectedId)) {
+    state.selectedId = entries[0]?.id ?? null
+  }
+  controls.search.value = state.query
+  controls.count.textContent = `${entries.length}/${musicLibraryEntries.length}`
+  controls.grid.setAttribute('aria-rowcount', String(entries.length + 1))
+  controls.list.replaceChildren()
+
+  if (entries.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'deck-library-empty'
+    empty.textContent = musicLibraryEntries.length === 0
+      ? 'NO MP3 OR WAV FILES FOUND'
+      : 'NO MATCHING TRACKS'
+    controls.list.append(empty)
+  } else {
+    entries.forEach((entry, index) => {
+      const row = document.createElement('div')
+      const selected = entry.id === state.selectedId
+      row.className = 'deck-library-row'
+      row.id = `deck${deckIndex + 1}-library-row-${index}`
+      row.setAttribute('role', 'row')
+      row.setAttribute('aria-rowindex', String(index + 2))
+      row.setAttribute('aria-selected', String(selected))
+      row.setAttribute('aria-label', `${entry.name}, folder ${entry.folder || 'library root'}`)
+      row.dataset.libraryEntryId = entry.id
+      row.tabIndex = selected ? 0 : -1
+
+      const values = [
+        entry.name,
+        entry.folder || '—',
+        formatLibraryFileSize(entry.size),
+        formatLibraryModified(entry.lastModified),
+      ]
+      values.forEach((value, cellIndex) => {
+        const cell = document.createElement('div')
+        cell.className = 'deck-library-cell'
+        cell.setAttribute('role', 'gridcell')
+        cell.setAttribute('aria-colindex', String(cellIndex + 1))
+        cell.textContent = value
+        cell.title = value
+        row.append(cell)
+      })
+      row.addEventListener('click', () => selectMusicLibraryEntry(deckIndex, entry.id, true))
+      row.addEventListener('dblclick', () => { void loadSelectedMusicLibraryEntry(deckIndex) })
+      row.addEventListener('keydown', (event) => handleMusicLibraryRowKey(event, deckIndex, entry.id))
+      controls.list.append(row)
+    })
+  }
+
+  const sortLabels: Record<MusicLibrarySortKey, string> = {
+    name: 'FILE',
+    folder: 'FOLDER',
+    size: 'SIZE',
+    modified: 'MODIFIED',
+  }
+  controls.sortButtons.forEach((button) => {
+    const key = button.dataset.librarySort as MusicLibrarySortKey
+    const active = key === state.sortKey
+    button.textContent = `${sortLabels[key]}${active ? state.sortDirection === 'ascending' ? ' ▲' : ' ▼' : ''}`
+    if (active) button.setAttribute('aria-sort', state.sortDirection)
+    else button.removeAttribute('aria-sort')
+  })
+
+  const operation = deckOperationStates[deckIndex]
+  controls.load.textContent = isSourceDeckSynchronized(deckIndex) ? 'REPLACE' : 'LOAD'
+  controls.load.disabled = state.selectedId === null
+    || !projectConnected
+    || nexus === null
+    || operation.pendingCount > 0
+  controls.load.title = projectConnected ? '' : 'Connect an Audiotool project before loading audio'
+}
+
+function renderDeckLibraryAvailability() {
+  for (const deckIndex of [0, 1] as const) {
+    const controls = getDeckLibraryElements(deckIndex)
+    const operation = deckOperationStates[deckIndex]
+    const bpmFormOpen = !el<HTMLDivElement>(`deck${deckIndex + 1}-bpm-form`).classList.contains('is-hidden')
+    const bpmReportOpen = manualBpmReportStates[deckIndex].editing
+    const barFormOpen = controls.assistant.classList.contains('bar-assistant-active')
+    controls.trigger.disabled = operation.pendingCount > 0
+      || decks[deckIndex].tempoUpdatePending
+      || bpmFormOpen
+      || bpmReportOpen
+      || barFormOpen
+      || activeFxDeckIndex !== null
+      || activeLibraryDeckIndex === deckIndex
+      || musicLibraryConnectionState === 'busy'
+  }
+}
+
+function closeDeckLibraryAssistant(restoreFocus = true) {
+  const deckIndex = activeLibraryDeckIndex
+  if (deckIndex === null) return
+  const controls = getDeckLibraryElements(deckIndex)
+  activeLibraryDeckIndex = null
+  controls.assistant.classList.remove('is-library-view')
+  controls.view.classList.add('is-hidden')
+  controls.error.textContent = ''
+  renderDeckLibraryAvailability()
+  renderDeckFxAvailability()
+  if (restoreFocus) controls.trigger.focus()
+}
+
+function showDeckLibraryAssistant(deckIndex: 0 | 1) {
+  if (musicLibraryConnectionState !== 'ready') {
+    setStatus('connected', 'CHOOSE A GLOBAL MUSIC FOLDER BEFORE BROWSING THE LIBRARY')
+    btnMusicLibraryChoose.focus()
+    return
+  }
+  if (activeFxDeckIndex !== null) closeDeckFxAssistant(false)
+  if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
+  const controls = getDeckLibraryElements(deckIndex)
+  activeLibraryDeckIndex = deckIndex
+  controls.error.textContent = ''
+  controls.assistant.classList.add('is-library-view')
+  controls.view.classList.remove('is-hidden')
+  renderDeckLibraryView(deckIndex)
+  renderDeckLibraryAvailability()
+  renderDeckFxAvailability()
+  controls.assistant.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  requestAnimationFrame(() => focusSelectedMusicLibraryRow(deckIndex))
+}
+
+async function loadSelectedMusicLibraryEntry(deckIndex: 0 | 1) {
+  if (activeLibraryDeckIndex !== deckIndex) return
+  const controls = getDeckLibraryElements(deckIndex)
+  const entry = musicLibraryEntries.find(
+    ({ id }) => id === musicLibraryPickerStates[deckIndex].selectedId,
+  )
+  if (!entry) return
+  if (!projectConnected || !nexus) {
+    controls.error.textContent = 'CONNECT AN AUDIOTOOL PROJECT BEFORE LOADING'
+    return
+  }
+
+  closeDeckLibraryAssistant(false)
+  setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: CAPTURING AUDIOTOOL BAR…`)
+  try {
+    const placement = await captureDeckInsertionPlacement(deckIndex)
+    if (!placement) {
+      setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: LOAD CANCELLED — PROJECT CONTENT PRESERVED`)
+      return
+    }
+    const file = entry.fileHandle ? await entry.fileHandle.getFile() : entry.file
+    if (!file) throw new Error('The selected track is no longer available')
+    if (!isSupportedMusicFile(file.name)) throw new Error('Only MP3 and WAV files are supported')
+    queueDeckLoad(deckIndex, file, placement)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    showDeckLibraryAssistant(deckIndex)
+    getDeckLibraryElements(deckIndex).error.textContent = `${message.toUpperCase()} · REFRESH THE MUSIC LIBRARY`
+    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: LOAD FAILED — ${message}`)
+  }
+}
+
+function setupDeckLibraryPicker(deckIndex: 0 | 1) {
+  const controls = getDeckLibraryElements(deckIndex)
+  controls.trigger.addEventListener('click', () => showDeckLibraryAssistant(deckIndex))
+  controls.back.addEventListener('click', () => closeDeckLibraryAssistant())
+  controls.load.addEventListener('click', () => { void loadSelectedMusicLibraryEntry(deckIndex) })
+  controls.search.addEventListener('input', () => {
+    musicLibraryPickerStates[deckIndex].query = controls.search.value
+    renderDeckLibraryView(deckIndex)
+  })
+  controls.search.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      focusSelectedMusicLibraryRow(deckIndex)
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      if (controls.search.value) {
+        musicLibraryPickerStates[deckIndex].query = ''
+        renderDeckLibraryView(deckIndex)
+        controls.search.focus()
+      } else {
+        closeDeckLibraryAssistant()
+      }
+    }
+  })
+  controls.view.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented) return
+    if (
+      event.target !== controls.search
+      && (event.key === '/'
+        || ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'f'))
+    ) {
+      event.preventDefault()
+      controls.search.focus()
+      controls.search.select()
+      return
+    }
+    if (event.key === 'Escape' && event.target !== controls.search) {
+      event.preventDefault()
+      closeDeckLibraryAssistant()
+    }
+  })
+  controls.sortButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const state = musicLibraryPickerStates[deckIndex]
+      const key = button.dataset.librarySort as MusicLibrarySortKey
+      if (state.sortKey === key) {
+        state.sortDirection = state.sortDirection === 'ascending' ? 'descending' : 'ascending'
+      } else {
+        state.sortKey = key
+        state.sortDirection = 'ascending'
+      }
+      renderDeckLibraryView(deckIndex)
+      focusSelectedMusicLibraryRow(deckIndex)
+    })
+  })
+}
+
 function setDeckFxAssistantView(
   deckIndex: WaveformDeckIndex,
   visible: boolean,
@@ -5199,6 +5789,7 @@ function handleDeckFxAssistantKey(event: KeyboardEvent) {
 }
 
 async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
+  if (activeLibraryDeckIndex !== null) closeDeckLibraryAssistant(false)
   const projectDocument = nexus
   const expectedSession = tempoSessionId
   if (!projectDocument || !projectConnected) {
@@ -5249,7 +5840,10 @@ async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
 function renderDeckFxAvailability() {
   document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
     const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
-    button.disabled = !projectConnected || nexus === null || activeFxDeckIndex === deckIndex
+    button.disabled = !projectConnected
+      || nexus === null
+      || activeFxDeckIndex === deckIndex
+      || activeLibraryDeckIndex !== null
   })
   if (!projectConnected && activeFxDeckIndex !== null) closeDeckFxAssistant()
   if (activeFxDeckIndex !== null) {
@@ -6156,6 +6750,32 @@ function initApp() {
   btnAudioCapture.onclick = () => { void ensureLiveAudioCapture().catch(() => {}) }
   resetAudioCaptureAvailability()
   el<HTMLButtonElement>('btn-create-project').onclick = () => createNewProject()
+
+  btnMusicLibraryChoose.onclick = () => {
+    void (musicLibraryConnectionState === 'reconnect'
+      ? reconnectMusicDirectory()
+      : chooseMusicDirectory())
+  }
+  btnMusicLibraryRefresh.onclick = () => { void refreshMusicLibrary() }
+  btnMusicLibraryChange.onclick = () => { void chooseMusicDirectory() }
+  musicLibraryFallbackInput.addEventListener('change', () => {
+    const files = Array.from(musicLibraryFallbackInput.files ?? [])
+    if (files.length === 0) return
+    const entries = indexMusicFiles(files)
+    const relativePath = files[0].webkitRelativePath
+    musicLibraryFolderName = relativePath.split('/').filter(Boolean)[0] || 'SELECTED FOLDER'
+    musicLibraryDirectoryHandle = null
+    musicLibraryEntries = entries
+    musicLibraryUsesFallback = true
+    setMusicLibrarySetupState(
+      'ready',
+      `${musicLibraryFolderName.toUpperCase()} · ${entries.length} ${entries.length === 1 ? 'TRACK' : 'TRACKS'} · SESSION ONLY`,
+    )
+  })
+  setupDeckLibraryPicker(0)
+  setupDeckLibraryPicker(1)
+  renderMusicLibrarySetup()
+  void restoreMusicLibrary()
 
   setupDropZone('drop-1', 0)
   setupDropZone('drop-2', 1)
