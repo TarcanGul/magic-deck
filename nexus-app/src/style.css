@@ -658,6 +658,105 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 .magic-deck-assistant { grid-column: 1 / -1; min-width: 200px; }
 
+.bpm-dialogue.is-fx-view {
+  justify-content: flex-start;
+  overflow: hidden;
+}
+.bpm-dialogue.is-fx-view .deck-assistant-normal {
+  display: none;
+}
+.bpm-dialogue.is-fx-view .bpm-dialogue-header-actions button.is-hidden {
+  display: inline-block !important;
+}
+.bpm-dialogue.is-fx-view .bpm-dialogue-header-actions button:disabled {
+  cursor: not-allowed;
+}
+.bpm-dialogue.is-fx-loading .bpm-dialogue-header-actions button:disabled {
+  cursor: wait;
+}
+.deck-fx-view {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-columns: minmax(64px, 0.7fr) minmax(0, 2fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'title knobs actions'
+    'error knobs actions';
+  align-items: center;
+  gap: 3px 6px;
+}
+.deck-fx-title {
+  grid-area: title;
+  color: var(--red);
+  font-family: var(--font-header);
+  font-size: 12px;
+  letter-spacing: 1px;
+  line-height: 1.1;
+}
+.deck-fx-copy {
+  display: none;
+}
+.fx-knob-grid {
+  grid-area: knobs;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 3px;
+}
+.fx-knob-wrap {
+  min-width: 0;
+  padding: 3px 2px;
+  border: 1px solid var(--grey-light);
+  border-radius: 5px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.58), rgba(20,20,20,0.8));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+.fx-knob {
+  width: 36px;
+  height: auto;
+  max-width: 100%;
+  aspect-ratio: 1;
+  cursor: ns-resize;
+}
+.fx-label {
+  color: var(--white);
+  font-family: var(--font-data);
+  font-size: 6px;
+  letter-spacing: 0.3px;
+}
+.fx-value {
+  color: var(--red);
+  font-family: var(--font-live);
+  font-size: 9px;
+}
+.deck-fx-error {
+  grid-area: error;
+  min-width: 0;
+  max-height: 2.4em;
+  overflow: auto;
+  color: var(--red);
+  font-family: var(--font-data);
+  font-size: 7px;
+  letter-spacing: 0.3px;
+  line-height: 1.2;
+}
+.deck-fx-actions {
+  grid-area: actions;
+  display: flex;
+  justify-content: flex-end;
+}
+.deck-fx-back {
+  padding: 5px 8px;
+}
+.bpm-dialogue.is-fx-loading .fx-knob-grid {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 @media (max-width: 560px) {
   .drop-zone.loaded .drop-loaded-summary { align-items: flex-start; flex-direction: column; gap: 7px; }
   .controls-row { gap: 10px; }
@@ -671,6 +770,14 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   .tempo-module { flex-basis: 100%; }
   .cue-pads { grid-template-columns: repeat(5, minmax(48px, 1fr)); gap: 4px; }
   .cue-pad > button:first-child { padding-left: 3px; padding-right: 13px; font-size: 7px; }
+  .deck-fx-view {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'knobs actions'
+      'error actions';
+  }
+  .deck-fx-title { display: none; }
+  .fx-knob-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 /* ============================  MAGIC DECK  ============================ */
@@ -1046,22 +1153,6 @@ input[type="range"]:not(.v-fader):not(.tempo-fader)::-moz-range-thumb {
   margin-left: 4px;
 }
 .modal-hint { min-height: 1.2em; margin: 8px 0 0; color: var(--grey-text); font-family: var(--font-data); font-size: 11px; }
-.modal-copy {
-  margin: 0 0 4px;
-  color: var(--grey-text);
-  font-family: var(--font-data);
-  font-size: 12px;
-  line-height: 1.6;
-}
-.modal-error {
-  min-height: 1.4em;
-  margin-top: 4px;
-  color: var(--red);
-  font-family: var(--font-data);
-  font-size: 11px;
-  letter-spacing: 0.5px;
-}
-
 .modal-input {
   width: 100%;
   background: var(--black);
@@ -1101,47 +1192,4 @@ input[type="range"]:not(.v-fader):not(.tempo-fader)::-moz-range-thumb {
   outline: 2px solid var(--red);
   outline-offset: 3px;
   border-radius: 50%;
-}
-
-.fx-modal { width: min(620px, 100%); }
-.fx-knob-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 14px;
-}
-.fx-knob-wrap {
-  min-width: 0;
-  padding: 14px 8px 10px;
-  border: 1px solid var(--grey-light);
-  border-radius: 6px;
-  background: linear-gradient(180deg, rgba(0,0,0,0.58), rgba(20,20,20,0.8));
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 5px;
-}
-.fx-knob { width: 72px; height: 72px; max-width: 100%; cursor: ns-resize; }
-.fx-label {
-  color: var(--white);
-  font-family: var(--font-data);
-  font-size: 9px;
-  letter-spacing: 1px;
-}
-.fx-value {
-  color: var(--red);
-  font-family: var(--font-live);
-  font-size: 12px;
-}
-.fx-note {
-  margin-top: 8px;
-  color: var(--grey-text);
-  font-family: var(--font-data);
-  font-size: 9px;
-  letter-spacing: 0.8px;
-  text-align: right;
-}
-
-@media (max-width: 560px) {
-  .fx-knob-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

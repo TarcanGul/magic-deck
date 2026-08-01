@@ -163,7 +163,7 @@
                 <div class="tempo-error" id="d1-tempo-error" aria-live="polite"></div>
               </div>
             </div>
-            <div class="bpm-dialogue" id="deck1-bpm-dialogue" aria-live="polite">
+            <div class="bpm-dialogue" id="deck1-bpm-dialogue" data-deck-assistant="0" aria-live="polite">
               <div class="bpm-dialogue-header">
                 <div class="bpm-dialogue-header-actions" aria-label="Deck A assistant actions">
                   <span class="deck-assistant-kicker">DECK ASSISTANT</span>
@@ -171,9 +171,9 @@
                   <button class="bpm-report-trigger is-hidden" id="deck1-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
                   <button class="assistant-fx-trigger" data-deck-fx="0" type="button" aria-label="Open Deck A effects">FX</button>
                 </div>
-                <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck1-bpm-title"></div>
+                <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck1-bpm-title"></div>
               </div>
-              <div class="bpm-dialogue-form is-hidden" id="deck1-bpm-form">
+              <div class="bpm-dialogue-form deck-assistant-normal is-hidden" id="deck1-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
                   <input type="number" id="deck1-bpm-input" class="bpm-dialogue-input" min="40" max="240" step="0.01" placeholder="BPM" inputmode="decimal" aria-label="Deck A source BPM">
@@ -182,7 +182,7 @@
                 </div>
                 <div class="bpm-dialogue-error" id="deck1-bpm-error"></div>
               </div>
-              <div class="bpm-report-form is-hidden" id="deck1-bpm-report-form">
+              <div class="bpm-report-form deck-assistant-normal is-hidden" id="deck1-bpm-report-form">
                 <div class="bpm-dialogue-hint">CORRECT SOURCE BPM (40–240)</div>
                 <div class="bpm-report-actions">
                   <input type="number" id="deck1-bpm-report-input" class="bpm-dialogue-input" min="40" max="240" step="1" placeholder="BPM" inputmode="numeric" aria-label="Correct Deck A source BPM">
@@ -191,7 +191,7 @@
                 </div>
                 <div class="bpm-dialogue-error" id="deck1-bpm-report-error"></div>
               </div>
-              <div class="bar-assistant-form is-hidden" id="deck1-bar-assistant" role="group" aria-labelledby="deck1-bar-assistant-title">
+              <div class="bar-assistant-form deck-assistant-normal is-hidden" id="deck1-bar-assistant" role="group" aria-labelledby="deck1-bar-assistant-title">
                 <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                 <div class="bar-assistant-title" id="deck1-bar-assistant-title"></div>
                 <p class="bar-assistant-copy" id="deck1-bar-assistant-copy"></p>
@@ -203,6 +203,18 @@
                 </div>
                 <div class="bar-assistant-error" id="deck1-bar-assistant-error" aria-live="polite"></div>
               </div>
+              <section class="deck-fx-view is-hidden" data-deck-fx-view aria-label="Deck A effects">
+                <div class="deck-fx-title">DECK A EFFECTS</div>
+                <p class="deck-fx-copy">PROJECT-SYNCHRONIZED SIGNAL PATH</p>
+                <div class="fx-knob-grid">
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="delay"></canvas><span class="fx-label">DELAY</span><output class="fx-value" data-fx-value="delay">0%</output></div>
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="reverb"></canvas><span class="fx-label">REVERB</span><output class="fx-value" data-fx-value="reverb">0%</output></div>
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="distortion"></canvas><span class="fx-label">DISTORTION</span><output class="fx-value" data-fx-value="distortion">0%</output></div>
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="flanger"></canvas><span class="fx-label">FLANGER</span><output class="fx-value" data-fx-value="flanger">0%</output></div>
+                </div>
+                <div class="deck-fx-error" data-deck-fx-error aria-live="polite"></div>
+                <div class="deck-fx-actions"><button class="btn-primary deck-fx-back" data-deck-fx-back type="button">⬡ BACK</button></div>
+              </section>
             </div>
           </div>
         </div>
@@ -321,7 +333,7 @@
                 <div class="tempo-error" id="d2-tempo-error" aria-live="polite"></div>
               </div>
             </div>
-            <div class="bpm-dialogue" id="deck2-bpm-dialogue" aria-live="polite">
+            <div class="bpm-dialogue" id="deck2-bpm-dialogue" data-deck-assistant="1" aria-live="polite">
               <div class="bpm-dialogue-header">
                 <div class="bpm-dialogue-header-actions" aria-label="Deck B assistant actions">
                   <span class="deck-assistant-kicker">DECK ASSISTANT</span>
@@ -329,9 +341,9 @@
                   <button class="bpm-report-trigger is-hidden" id="deck2-bpm-report-trigger" type="button">REPORT BPM MANUALLY</button>
                   <button class="assistant-fx-trigger" data-deck-fx="1" type="button" aria-label="Open Deck B effects">FX</button>
                 </div>
-                <div class="bpm-dialogue-title bpm-dialogue-title-idle" id="deck2-bpm-title"></div>
+                <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck2-bpm-title"></div>
               </div>
-              <div class="bpm-dialogue-form is-hidden" id="deck2-bpm-form">
+              <div class="bpm-dialogue-form deck-assistant-normal is-hidden" id="deck2-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>
                 <div class="bpm-dialogue-actions">
                   <input type="number" id="deck2-bpm-input" class="bpm-dialogue-input" min="40" max="240" step="0.01" placeholder="BPM" inputmode="decimal" aria-label="Deck B source BPM">
@@ -340,7 +352,7 @@
                 </div>
                 <div class="bpm-dialogue-error" id="deck2-bpm-error"></div>
               </div>
-              <div class="bpm-report-form is-hidden" id="deck2-bpm-report-form">
+              <div class="bpm-report-form deck-assistant-normal is-hidden" id="deck2-bpm-report-form">
                 <div class="bpm-dialogue-hint">CORRECT SOURCE BPM (40–240)</div>
                 <div class="bpm-report-actions">
                   <input type="number" id="deck2-bpm-report-input" class="bpm-dialogue-input" min="40" max="240" step="1" placeholder="BPM" inputmode="numeric" aria-label="Correct Deck B source BPM">
@@ -349,7 +361,7 @@
                 </div>
                 <div class="bpm-dialogue-error" id="deck2-bpm-report-error"></div>
               </div>
-              <div class="bar-assistant-form is-hidden" id="deck2-bar-assistant" role="group" aria-labelledby="deck2-bar-assistant-title">
+              <div class="bar-assistant-form deck-assistant-normal is-hidden" id="deck2-bar-assistant" role="group" aria-labelledby="deck2-bar-assistant-title">
                 <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                 <div class="bar-assistant-title" id="deck2-bar-assistant-title"></div>
                 <p class="bar-assistant-copy" id="deck2-bar-assistant-copy"></p>
@@ -361,6 +373,18 @@
                 </div>
                 <div class="bar-assistant-error" id="deck2-bar-assistant-error" aria-live="polite"></div>
               </div>
+              <section class="deck-fx-view is-hidden" data-deck-fx-view aria-label="Deck B effects">
+                <div class="deck-fx-title">DECK B EFFECTS</div>
+                <p class="deck-fx-copy">PROJECT-SYNCHRONIZED SIGNAL PATH</p>
+                <div class="fx-knob-grid">
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="delay"></canvas><span class="fx-label">DELAY</span><output class="fx-value" data-fx-value="delay">0%</output></div>
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="reverb"></canvas><span class="fx-label">REVERB</span><output class="fx-value" data-fx-value="reverb">0%</output></div>
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="distortion"></canvas><span class="fx-label">DISTORTION</span><output class="fx-value" data-fx-value="distortion">0%</output></div>
+                  <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="flanger"></canvas><span class="fx-label">FLANGER</span><output class="fx-value" data-fx-value="flanger">0%</output></div>
+                </div>
+                <div class="deck-fx-error" data-deck-fx-error aria-live="polite"></div>
+                <div class="deck-fx-actions"><button class="btn-primary deck-fx-back" data-deck-fx-back type="button">⬡ BACK</button></div>
+              </section>
             </div>
           </div>
         </div>
@@ -514,14 +538,26 @@
                 </div>
                 <div class="tempo-error" id="d3-tempo-error" aria-live="polite"></div>
               </div>
-              <div class="bpm-dialogue magic-deck-assistant" aria-label="Magic Deck assistant actions">
+              <div class="bpm-dialogue magic-deck-assistant" data-deck-assistant="2" aria-label="Magic Deck assistant actions">
                 <div class="bpm-dialogue-header">
                   <div class="bpm-dialogue-header-actions">
                     <span class="deck-assistant-kicker">DECK ASSISTANT</span>
                     <button class="assistant-fx-trigger" data-deck-fx="2" type="button" aria-label="Open Magic Deck effects">FX</button>
                   </div>
-                  <div class="bpm-dialogue-title bpm-dialogue-title-idle">CONTROL MAGIC DECK PROJECT EFFECTS</div>
+                  <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal">CONTROL MAGIC DECK PROJECT EFFECTS</div>
                 </div>
+                <section class="deck-fx-view is-hidden" data-deck-fx-view aria-label="Magic Deck effects">
+                  <div class="deck-fx-title">MAGIC DECK EFFECTS</div>
+                  <p class="deck-fx-copy">PROJECT-SYNCHRONIZED SIGNAL PATH</p>
+                  <div class="fx-knob-grid">
+                    <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="delay"></canvas><span class="fx-label">DELAY</span><output class="fx-value" data-fx-value="delay">0%</output></div>
+                    <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="reverb"></canvas><span class="fx-label">REVERB</span><output class="fx-value" data-fx-value="reverb">0%</output></div>
+                    <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="distortion"></canvas><span class="fx-label">DISTORTION</span><output class="fx-value" data-fx-value="distortion">0%</output></div>
+                    <div class="fx-knob-wrap"><canvas class="fx-knob" width="72" height="72" data-value="0" data-fx="flanger"></canvas><span class="fx-label">FLANGER</span><output class="fx-value" data-fx-value="flanger">0%</output></div>
+                  </div>
+                  <div class="deck-fx-error" data-deck-fx-error aria-live="polite"></div>
+                  <div class="deck-fx-actions"><button class="btn-primary deck-fx-back" data-deck-fx-back type="button">⬡ BACK</button></div>
+                </section>
               </div>
             </div>
           </div>
@@ -552,44 +588,5 @@
   </div>
 </div>
 
-<!-- Deck Assistant project-synchronized effects -->
-<div id="fx-modal" class="modal-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="fx-modal-title">
-  <div class="modal fx-modal">
-    <div class="modal-header">
-      <span class="modal-kicker">DECK ASSISTANT · FX</span>
-      <h2 class="modal-title" id="fx-modal-title">Deck Effects</h2>
-    </div>
-    <div class="modal-body">
-      <p class="modal-copy">These controls update Audiotool devices in this deck's synchronized project signal path.</p>
-      <div class="fx-knob-grid">
-        <div class="fx-knob-wrap">
-          <canvas class="fx-knob" id="fx-delay" width="72" height="72" data-value="0" data-fx="delay"></canvas>
-          <span class="fx-label">DELAY</span>
-          <output class="fx-value" id="fx-delay-value">0%</output>
-        </div>
-        <div class="fx-knob-wrap">
-          <canvas class="fx-knob" id="fx-reverb" width="72" height="72" data-value="0" data-fx="reverb"></canvas>
-          <span class="fx-label">REVERB</span>
-          <output class="fx-value" id="fx-reverb-value">0%</output>
-        </div>
-        <div class="fx-knob-wrap">
-          <canvas class="fx-knob" id="fx-distortion" width="72" height="72" data-value="0" data-fx="distortion"></canvas>
-          <span class="fx-label">DISTORTION</span>
-          <output class="fx-value" id="fx-distortion-value">0%</output>
-        </div>
-        <div class="fx-knob-wrap">
-          <canvas class="fx-knob" id="fx-flanger" width="72" height="72" data-value="0" data-fx="flanger"></canvas>
-          <span class="fx-label">FLANGER</span>
-          <output class="fx-value" id="fx-flanger-value">0%</output>
-        </div>
-      </div>
-      <p class="fx-note">CONTROLS AUDIOTOOL STOCK EFFECT DEVICES.</p>
-      <div class="modal-error" id="fx-modal-error" aria-live="polite"></div>
-    </div>
-    <div class="modal-actions">
-      <button id="fx-modal-close" class="btn-primary" type="button">⬡ DONE</button>
-    </div>
-  </div>
-</div>
 </body>
 </html>

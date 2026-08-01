@@ -80,6 +80,7 @@ type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
 type EqBand = 'hi' | 'mid' | 'low'
 type DeckFxKind = 'delay' | 'reverb' | 'distortion' | 'flanger'
+const DECK_FX_KINDS: readonly DeckFxKind[] = ['delay', 'reverb', 'distortion', 'flanger']
 type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
 type CuePointSlots = [number | null, number | null, number | null, number | null, number | null]
 interface StoredCuePoints {
@@ -196,6 +197,15 @@ interface DeckFxGraph {
     NexusEntity<'desktopAudioCable'>,
   ]
 }
+interface DeckFxElements {
+  assistant: HTMLDivElement
+  view: HTMLElement
+  error: HTMLDivElement
+  back: HTMLButtonElement
+  headerButtons: HTMLButtonElement[]
+  knobs: Record<DeckFxKind, HTMLCanvasElement>
+  outputs: Record<DeckFxKind, HTMLOutputElement>
+}
 interface ResolvedDeckContentGraph {
   region: NexusEntity<'audioRegion'>
   sample: NexusEntity<'sample'>
@@ -230,6 +240,7 @@ let barAssistantQueue: Promise<void> = Promise.resolve()
 let sessionLaunchPositionTicks: number | null = null
 let activeFxDeckIndex: WaveformDeckIndex | null = null
 let activeFxTrigger: HTMLButtonElement | null = null
+let deckFxAssistantRequestId = 0
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 let suppressMagicProjectRemovalSync = false
@@ -264,6 +275,35 @@ const knobState: Map<HTMLCanvasElement, { value: number; dragging: boolean; star
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
+function requiredElement<T extends Element>(root: ParentNode, selector: string): T {
+  const element = root.querySelector<T>(selector)
+  if (!element) throw new Error(`Missing required element: ${selector}`)
+  return element
+}
+function getDeckFxElements(deckIndex: WaveformDeckIndex): DeckFxElements {
+  const assistant = requiredElement<HTMLDivElement>(
+    document,
+    `[data-deck-assistant="${deckIndex}"]`,
+  )
+  const view = requiredElement<HTMLElement>(assistant, '[data-deck-fx-view]')
+  const knobs = {} as Record<DeckFxKind, HTMLCanvasElement>
+  const outputs = {} as Record<DeckFxKind, HTMLOutputElement>
+  DECK_FX_KINDS.forEach((kind) => {
+    knobs[kind] = requiredElement<HTMLCanvasElement>(view, `[data-fx="${kind}"]`)
+    outputs[kind] = requiredElement<HTMLOutputElement>(view, `[data-fx-value="${kind}"]`)
+  })
+  return {
+    assistant,
+    view,
+    error: requiredElement<HTMLDivElement>(view, '[data-deck-fx-error]'),
+    back: requiredElement<HTMLButtonElement>(view, '[data-deck-fx-back]'),
+    headerButtons: Array.from(
+      assistant.querySelectorAll<HTMLButtonElement>('.bpm-dialogue-header-actions button'),
+    ),
+    knobs,
+    outputs,
+  }
+}
 const statusDot = el<HTMLSpanElement>('status-dot')
 const statusText = el<HTMLSpanElement>('status-text')
 const statusUser = el<HTMLDivElement>('status-user')
@@ -352,6 +392,7 @@ function showBarAssistantNow(
   deckIndex: WaveformDeckIndex,
   purpose: BarAssistantPurpose,
 ): Promise<number | null> {
+  if (activeFxDeckIndex !== null) closeDeckFxAssistant()
   return new Promise((resolve) => {
     const deckNumber = deckIndex + 1
     const assistant = el<HTMLDivElement>(
@@ -1550,7 +1591,8 @@ function clearDeckContentEntities(deck: DeckState) {
   }
 }
 
-function clearDeckRoutingEntities(deck: DeckState) {
+function clearDeckRoutingEntities(deck: DeckState, preserveFxAssistant = false) {
+  const deckIndex = decks.indexOf(deck)
   deck.routingSubscriptions.forEach((subscription) => subscription.terminate())
   deck.routingSubscriptions = []
   deck.trackEntity = null
@@ -1558,6 +1600,11 @@ function clearDeckRoutingEntities(deck: DeckState) {
   deck.mixerChannelEntity = null
   deck.cableEntity = null
   deck.fxGraph = null
+  if (
+    !preserveFxAssistant
+    && deckIndex >= 0
+    && activeFxDeckIndex === deckIndex
+  ) closeDeckFxAssistant()
 }
 
 function clearDeckProjectEntities(deck: DeckState) {
@@ -2229,7 +2276,7 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   metadataBpm.textContent = bpm === null ? '—' : String(bpm)
   metadataDuration.textContent = loaded ? formatDuration(deck.sampleMeta?.durationSeconds) : '—'
   unload.classList.toggle('is-hidden', !loaded)
-  unload.disabled = pending || !projectConnected
+  unload.disabled = pending || !projectConnected || activeFxDeckIndex === deckIndex
   renderTempoControls(deckIndex)
   renderDeckTransport(deckIndex)
   renderCueControls(deckIndex)
@@ -2297,7 +2344,7 @@ function updateManualBpmReportUi(deckIndex: 0 | 1) {
   const available = canReportManualBpm(deckIndex)
   controls.trigger.classList.toggle('is-hidden', !available || state.editing)
   controls.form.classList.toggle('is-hidden', !available || !state.editing)
-  controls.trigger.disabled = state.pending
+  controls.trigger.disabled = state.pending || activeFxDeckIndex === deckIndex
   controls.input.disabled = state.pending
   controls.apply.disabled = state.pending
   controls.cancel.disabled = state.pending
@@ -4323,14 +4370,34 @@ function watchDeckRouting(
   )
   if (routing.fxGraph) {
     const { delay, reverb, distortion, flanger } = routing.fxGraph
+    const graphIsCurrent = () => {
+      const currentGraph = decks[deckIndex].fxGraph
+      return currentGraph?.delay.id === delay.id
+        && currentGraph.reverb.id === reverb.id
+        && currentGraph.distortion.id === distortion.id
+        && currentGraph.flanger.id === flanger.id
+    }
     const hydrateIfCurrent = () => {
       if (
         nexus !== projectDocument
         || expectedSession !== tempoSessionId
         || activeFxDeckIndex !== deckIndex
-        || decks[deckIndex].fxGraph?.delay.id !== delay.id
+        || !graphIsCurrent()
       ) return
-      hydrateDeckFxControls(routing.fxGraph!)
+      hydrateDeckFxControls(deckIndex, routing.fxGraph!)
+    }
+    const handleFxRoutingRemoval = () => {
+      if (
+        nexus !== projectDocument
+        || expectedSession !== tempoSessionId
+        || !graphIsCurrent()
+      ) return
+      clearDeckRoutingEntities(deck)
+      renderDeckFxAvailability()
+      setStatus(
+        'error',
+        `${placementDeckLabel(deckIndex).toUpperCase()}: SYNCHRONIZED FX ROUTING IS UNAVAILABLE`,
+      )
     }
     deck.routingSubscriptions.push(
       projectDocument.events.onUpdate(delay.fields.mix, hydrateIfCurrent),
@@ -4341,6 +4408,12 @@ function watchDeckRouting(
       projectDocument.events.onUpdate(distortion.fields.isActive, hydrateIfCurrent),
       projectDocument.events.onUpdate(flanger.fields.lfoModulationDepth, hydrateIfCurrent),
       projectDocument.events.onUpdate(flanger.fields.isActive, hydrateIfCurrent),
+      projectDocument.events.onRemove(delay, handleFxRoutingRemoval),
+      projectDocument.events.onRemove(reverb, handleFxRoutingRemoval),
+      projectDocument.events.onRemove(distortion, handleFxRoutingRemoval),
+      projectDocument.events.onRemove(flanger, handleFxRoutingRemoval),
+      ...routing.fxGraph.cables.map((cable) =>
+        projectDocument.events.onRemove(cable, handleFxRoutingRemoval)),
     )
   }
 }
@@ -4464,7 +4537,7 @@ function bindDeckFxRoutingGraph(
   expectedSession: number,
 ) {
   const deck = decks[deckIndex]
-  clearDeckRoutingEntities(deck)
+  clearDeckRoutingEntities(deck, true)
   deck.trackEntity = routing.track
   deck.audioDeviceEntity = routing.audioDevice
   deck.mixerChannelEntity = routing.mixerChannel
@@ -4963,21 +5036,25 @@ function deckFxValues(fxGraph: DeckFxGraph): Record<DeckFxKind, number> {
   }
 }
 
-function setDeckFxKnobValue(kind: DeckFxKind, value: number) {
-  const canvas = el<HTMLCanvasElement>(`fx-${kind}`)
+function setDeckFxKnobValue(
+  deckIndex: WaveformDeckIndex,
+  kind: DeckFxKind,
+  value: number,
+) {
+  const controls = getDeckFxElements(deckIndex)
+  const canvas = controls.knobs[kind]
   const state = knobState.get(canvas)
   if (!state) return
   state.value = clampUnit(value)
   drawKnob(canvas, state.value)
   canvas.setAttribute('aria-valuenow', String(Math.round(state.value * 100)))
-  el<HTMLOutputElement>(`fx-${kind}-value`).value = `${Math.round(state.value * 100)}%`
+  controls.outputs[kind].value = `${Math.round(state.value * 100)}%`
 }
 
-function hydrateDeckFxControls(fxGraph: DeckFxGraph) {
+function hydrateDeckFxControls(deckIndex: WaveformDeckIndex, fxGraph: DeckFxGraph) {
   const values = deckFxValues(fxGraph)
-  const kinds = Object.keys(values) as DeckFxKind[]
-  kinds.forEach((kind) => {
-    setDeckFxKnobValue(kind, values[kind])
+  DECK_FX_KINDS.forEach((kind) => {
+    setDeckFxKnobValue(deckIndex, kind, values[kind])
   })
 }
 
@@ -4989,7 +5066,12 @@ async function applyDeckFx(
   const projectDocument = nexus
   const fxGraph = decks[deckIndex].fxGraph
   const expectedSession = tempoSessionId
-  if (!projectDocument || !projectConnected || !fxGraph) return
+  if (
+    !projectDocument
+    || !projectConnected
+    || !fxGraph
+    || activeFxDeckIndex !== deckIndex
+  ) return
   const normalizedValue = clampUnit(value)
 
   try {
@@ -5031,31 +5113,59 @@ async function applyDeckFx(
       nexus !== projectDocument
       || !projectConnected
       || expectedSession !== tempoSessionId
+      || activeFxDeckIndex !== deckIndex
     ) return
-    el<HTMLDivElement>('fx-modal-error').textContent = ''
+    getDeckFxElements(deckIndex).error.textContent = ''
   } catch (error) {
     if (
       nexus !== projectDocument
       || !projectConnected
       || expectedSession !== tempoSessionId
+      || activeFxDeckIndex !== deckIndex
     ) return
     const message = error instanceof Error ? error.message : String(error)
-    el<HTMLDivElement>('fx-modal-error').textContent = `FX UPDATE FAILED: ${message.toUpperCase()}`
+    getDeckFxElements(deckIndex).error.textContent =
+      `FX UPDATE FAILED: ${message.toUpperCase()}`
     setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX UPDATE FAILED — ${message}`)
   }
 }
 
-function closeDeckFxAssistant() {
-  const trigger = activeFxTrigger
-  activeFxDeckIndex = null
-  activeFxTrigger = null
-  el<HTMLDivElement>('fx-modal').classList.add('is-hidden')
-  document.removeEventListener('keydown', handleDeckFxModalKey)
-  if (trigger && !trigger.disabled && trigger.isConnected) trigger.focus()
+function setDeckFxAssistantView(
+  deckIndex: WaveformDeckIndex,
+  visible: boolean,
+  loading = false,
+) {
+  const controls = getDeckFxElements(deckIndex)
+  if (visible && !controls.assistant.classList.contains('is-fx-view')) {
+    controls.assistant.style.height = `${controls.assistant.getBoundingClientRect().height}px`
+  }
+  controls.assistant.classList.toggle('is-fx-view', visible)
+  controls.assistant.classList.toggle('is-fx-loading', visible && loading)
+  controls.assistant.setAttribute('aria-busy', String(visible && loading))
+  controls.view.classList.toggle('is-hidden', !visible)
+  controls.headerButtons.forEach((button) => { button.disabled = visible })
+  if (!visible) controls.assistant.style.height = ''
 }
 
-function handleDeckFxModalKey(event: KeyboardEvent) {
-  if (event.key === 'Escape') closeDeckFxAssistant()
+function closeDeckFxAssistant(restoreFocus = true) {
+  const deckIndex = activeFxDeckIndex
+  const trigger = activeFxTrigger
+  deckFxAssistantRequestId += 1
+  activeFxDeckIndex = null
+  activeFxTrigger = null
+  if (deckIndex !== null) {
+    setDeckFxAssistantView(deckIndex, false)
+    if (deckIndex < 2) updateSourceDeckUi(deckIndex as 0 | 1)
+  }
+  document.removeEventListener('keydown', handleDeckFxAssistantKey)
+  renderDeckFxAvailability()
+  if (restoreFocus && trigger && !trigger.disabled && trigger.isConnected) trigger.focus()
+}
+
+function handleDeckFxAssistantKey(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || activeFxDeckIndex === null) return
+  event.preventDefault()
+  closeDeckFxAssistant()
 }
 
 async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
@@ -5065,8 +5175,20 @@ async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
     setStatus('error', 'CONNECT AN AUDIOTOOL PROJECT TO OPEN DECK FX')
     return
   }
+  if (activeFxDeckIndex === deckIndex) return
+  if (activeFxDeckIndex !== null) closeDeckFxAssistant(false)
+
   const trigger = document.querySelector<HTMLButtonElement>(`[data-deck-fx="${deckIndex}"]`)
-  if (trigger) trigger.disabled = true
+  const controls = getDeckFxElements(deckIndex)
+  const requestId = deckFxAssistantRequestId + 1
+  deckFxAssistantRequestId = requestId
+  activeFxDeckIndex = deckIndex
+  activeFxTrigger = trigger ?? null
+  controls.error.textContent = ''
+  setDeckFxAssistantView(deckIndex, true, true)
+  document.removeEventListener('keydown', handleDeckFxAssistantKey)
+  document.addEventListener('keydown', handleDeckFxAssistantKey)
+  controls.assistant.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: PREPARING PROJECT FX…`)
 
   try {
@@ -5077,29 +5199,34 @@ async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
       || expectedSession !== tempoSessionId
       || !routing.fxGraph
     ) throw new Error('Project connection changed while opening FX')
+    if (activeFxDeckIndex !== deckIndex || deckFxAssistantRequestId !== requestId) return
     bindDeckFxRoutingGraph(deckIndex, projectDocument, routing, expectedSession)
-    activeFxDeckIndex = deckIndex
-    activeFxTrigger = trigger ?? null
-    hydrateDeckFxControls(routing.fxGraph)
-    el<HTMLHeadingElement>('fx-modal-title').textContent = `${placementDeckLabel(deckIndex)} Effects`
-    el<HTMLDivElement>('fx-modal-error').textContent = ''
-    el<HTMLDivElement>('fx-modal').classList.remove('is-hidden')
-    document.addEventListener('keydown', handleDeckFxModalKey)
+    if (activeFxDeckIndex !== deckIndex || deckFxAssistantRequestId !== requestId) return
+    hydrateDeckFxControls(deckIndex, routing.fxGraph)
+    setDeckFxAssistantView(deckIndex, true)
     setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: FX READY ↔ PROJECT SYNCED`)
-    el<HTMLCanvasElement>('fx-delay').focus()
+    controls.knobs.delay.focus()
   } catch (error) {
+    if (activeFxDeckIndex !== deckIndex || deckFxAssistantRequestId !== requestId) return
     const message = error instanceof Error ? error.message : String(error)
+    setDeckFxAssistantView(deckIndex, true)
+    controls.error.textContent = `FX PREPARATION FAILED: ${message.toUpperCase()}`
     setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: FX FAILED — ${message}`)
-  } finally {
-    if (trigger) trigger.disabled = !projectConnected
+    controls.back.focus()
   }
 }
 
 function renderDeckFxAvailability() {
   document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
-    button.disabled = !projectConnected || nexus === null
+    const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
+    button.disabled = !projectConnected || nexus === null || activeFxDeckIndex === deckIndex
   })
   if (!projectConnected && activeFxDeckIndex !== null) closeDeckFxAssistant()
+  if (activeFxDeckIndex !== null) {
+    getDeckFxElements(activeFxDeckIndex).headerButtons.forEach((button) => {
+      button.disabled = true
+    })
+  }
 }
 
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
@@ -5266,13 +5393,20 @@ function getDeckEqControl(canvas: HTMLCanvasElement): { deckIndex: WaveformDeckI
   if (!match) return null
   return { deckIndex: Number(match[1]) - 1 as WaveformDeckIndex, band: match[2] as EqBand }
 }
-function getDeckFxControl(canvas: HTMLCanvasElement): DeckFxKind | null {
+function getDeckFxControl(
+  canvas: HTMLCanvasElement,
+): { deckIndex: WaveformDeckIndex; kind: DeckFxKind } | null {
   const kind = canvas.dataset.fx
-  return kind === 'delay'
+  const assistant = canvas.closest<HTMLElement>('[data-deck-assistant]')
+  const deckIndex = Number(assistant?.dataset.deckAssistant)
+  const validKind = kind === 'delay'
     || kind === 'reverb'
     || kind === 'distortion'
     || kind === 'flanger'
     ? kind
+    : null
+  return validKind && (deckIndex === 0 || deckIndex === 1 || deckIndex === 2)
+    ? { deckIndex, kind: validKind }
     : null
 }
 function initKnob(canvas: HTMLCanvasElement) {
@@ -5288,8 +5422,13 @@ function initKnob(canvas: HTMLCanvasElement) {
   canvas.setAttribute('aria-valuenow', String(Math.round(init * 100)))
   const label = canvas.id.match(/^d(\d)-(hi|mid|low)$/)
   if (label) canvas.setAttribute('aria-label', `Deck ${label[1]} ${label[2].toUpperCase()} EQ`)
-  const fxKind = getDeckFxControl(canvas)
-  if (fxKind) canvas.setAttribute('aria-label', `${fxKind} effect amount`)
+  const fxControl = getDeckFxControl(canvas)
+  if (fxControl) {
+    canvas.setAttribute(
+      'aria-label',
+      `${placementDeckLabel(fxControl.deckIndex)} ${fxControl.kind} effect amount`,
+    )
+  }
 
   const updateValue = (newValue: number) => {
     const s = knobState.get(canvas)!
@@ -5299,9 +5438,10 @@ function initKnob(canvas: HTMLCanvasElement) {
     const control = getDeckEqControl?.(canvas)
     if (control) void applyDeckEq?.(control.deckIndex, control.band, s.value)
     const effect = getDeckFxControl(canvas)
-    if (effect && activeFxDeckIndex !== null) {
-      el<HTMLOutputElement>(`fx-${effect}-value`).value = `${Math.round(s.value * 100)}%`
-      void applyDeckFx(activeFxDeckIndex, effect, s.value)
+    if (effect && activeFxDeckIndex === effect.deckIndex) {
+      getDeckFxElements(effect.deckIndex).outputs[effect.kind].value =
+        `${Math.round(s.value * 100)}%`
+      void applyDeckFx(effect.deckIndex, effect.kind, s.value)
     }
   }
 
@@ -6004,7 +6144,12 @@ function initApp() {
     const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
     button.addEventListener('click', () => { void showDeckFxAssistant(deckIndex) })
   })
-  el<HTMLButtonElement>('fx-modal-close').addEventListener('click', closeDeckFxAssistant)
+  const deckFxIndices = [0, 1, 2] as const
+  deckFxIndices.forEach((deckIndex) => {
+    getDeckFxElements(deckIndex).back.addEventListener('click', () => {
+      if (activeFxDeckIndex === deckIndex) closeDeckFxAssistant()
+    })
+  })
   renderDeckFxAvailability()
 
   btnGenerate.addEventListener('click', generateMagicAudio)
