@@ -100,3 +100,71 @@ export function planResizedCueOffsets({
     loopDurationTicks: scale(loopDurationTicks),
   }
 }
+
+export function cuePositionForBar(bar, ticksPerBar, fullDurationTicks) {
+  if (!Number.isSafeInteger(bar) || bar < 1) {
+    throw new RangeError('Cue bar must be a one-based whole number')
+  }
+  if (!Number.isSafeInteger(ticksPerBar) || ticksPerBar <= 0) {
+    throw new RangeError('Ticks per bar must be a positive whole number')
+  }
+  if (!Number.isSafeInteger(fullDurationTicks) || fullDurationTicks <= 0) {
+    throw new RangeError('Track duration must be a positive whole number')
+  }
+  const cueOffsetTicks = (bar - 1) * ticksPerBar
+  if (!Number.isSafeInteger(cueOffsetTicks)) {
+    throw new RangeError('Cue bar exceeds the safe tick range')
+  }
+  if (cueOffsetTicks >= fullDurationTicks) {
+    throw new RangeError('Cue bar must start strictly before the track end')
+  }
+  return cueOffsetTicks / fullDurationTicks
+}
+
+export function cueBarForPosition(position, ticksPerBar, fullDurationTicks) {
+  if (typeof position !== 'number' || !Number.isFinite(position) || position < 0 || position >= 1) {
+    throw new RangeError('Cue position must be a finite number in [0, 1)')
+  }
+  if (!Number.isSafeInteger(ticksPerBar) || ticksPerBar <= 0) {
+    throw new RangeError('Ticks per bar must be a positive whole number')
+  }
+  if (!Number.isSafeInteger(fullDurationTicks) || fullDurationTicks <= 0) {
+    throw new RangeError('Track duration must be a positive whole number')
+  }
+  return Math.floor((position * fullDurationTicks) / ticksPerBar) + 1
+}
+
+export function planLegacyCueChainCollapse(segments) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    throw new RangeError('A legacy cue chain is required')
+  }
+  const sorted = [...segments].sort((left, right) =>
+    left.positionTicks - right.positionTicks || left.id.localeCompare(right.id))
+  let endTicks = sorted[0].positionTicks
+  sorted.forEach((segment) => {
+    if (
+      typeof segment.id !== 'string'
+      || !Number.isSafeInteger(segment.positionTicks)
+      || !Number.isSafeInteger(segment.durationTicks)
+      || segment.durationTicks <= 0
+      || segment.positionTicks !== endTicks
+    ) throw new RangeError('Legacy cue regions must form a contiguous positive chain')
+    endTicks += segment.durationTicks
+    if (!Number.isSafeInteger(endTicks)) throw new RangeError('Legacy cue chain exceeds safe ticks')
+  })
+  return {
+    keepId: sorted[0].id,
+    durationTicks: endTicks - sorted[0].positionTicks,
+    collapsedRegion: {
+      ...sorted[0],
+      durationTicks: endTicks - sorted[0].positionTicks,
+      ...(sorted.at(-1).fadeOutDurationTicks === undefined
+        ? {}
+        : { fadeOutDurationTicks: sorted.at(-1).fadeOutDurationTicks }),
+      ...(sorted.at(-1).fadeOutSlope === undefined
+        ? {}
+        : { fadeOutSlope: sorted.at(-1).fadeOutSlope }),
+    },
+    removeIds: sorted.slice(1).map((segment) => segment.id),
+  }
+}

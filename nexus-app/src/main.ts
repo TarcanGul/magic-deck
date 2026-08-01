@@ -46,10 +46,25 @@ import type { TimelineRegionSnapshot } from './deck-project-utils.js'
 import { staleOAuthCallbackUrl } from './auth-utils.js'
 import {
   buildIndependentAudioRegionCopy,
+  cueBarForPosition,
+  cuePositionForBar,
   cuePositionsFromSegments,
+  planLegacyCueChainCollapse,
   planAudioRegionSplit,
   planResizedCueOffsets,
 } from './cue-utils.js'
+import {
+  emptyCuePointSlots,
+  loadCuePointMetadata,
+  parseCueRecordV1,
+  reconcileLegacyCuePoints,
+  saveCuePointMetadata,
+} from './cue-storage-utils.js'
+import type {
+  CuePointSlots,
+  StoredCuePointsV1,
+  StoredCuePointsV2,
+} from './cue-storage-utils.js'
 import {
   buildMusicLibraryTree,
   findMusicLibraryNode,
@@ -86,6 +101,7 @@ interface DeckState {
   audioCtx: AudioContext | null; audioBuffer: AudioBuffer | null
   cueLoadId: number
   audioFootprint: string | null; cuePoints: CuePointSlots; cuePosition: number; cueLoading: boolean
+  armedCueSlot: number | null; scheduledCuePosition: number; cuePersistenceWarning: boolean
   fileName: string | null
   baseBpm: number | null; pitchPercent: number; playbackRate: number
   tempoPercent: number; tempoRange: TempoRange; tempoSync: boolean
@@ -109,12 +125,6 @@ type EqBand = 'hi' | 'mid' | 'low'
 type DeckFxKind = 'delay' | 'reverb' | 'distortion' | 'flanger'
 const DECK_FX_KINDS: readonly DeckFxKind[] = ['delay', 'reverb', 'distortion', 'flanger']
 type StemRole = 'auto' | 'drums' | 'bass' | 'melody' | 'texture'
-type CuePointSlots = [number | null, number | null, number | null, number | null, number | null]
-interface StoredCuePoints {
-  version: 1
-  audioFootprint: string
-  points: CuePointSlots
-}
 interface ReferenceAudio {
   blob: Blob
   fileName: string
@@ -288,6 +298,8 @@ const DECK_PROJECT_NAMES = ['DECK 1', 'DECK 2', 'MAGIC DECK'] as const
 const CUE_STORAGE_PREFIX = 'magic-deck:cues:v1:'
 const MUSIC_LIBRARY_DB_NAME = 'magic-deck-library'
 const MUSIC_LIBRARY_STORE_NAME = 'settings'
+const CUE_DATABASE_STORE_NAME = 'cue-points'
+const MUSIC_LIBRARY_DB_VERSION = 2
 const MUSIC_LIBRARY_ROOT_KEY = 'music-root'
 const MUSIC_LIBRARY_PAGE_SIZE = 3
 
@@ -345,9 +357,9 @@ const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperatio
   { pendingCount: 0, activeKind: null, uploading: false, suppressProjectRemovalSync: false },
 ]
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, armedCueSlot: null, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, armedCueSlot: null, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, armedCueSlot: null, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -437,14 +449,18 @@ const magicWaveform = el<HTMLCanvasElement>('magic-waveform')
 // ── Music library ────────────────────────────────────────────────────────────
 function openMusicLibraryDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(MUSIC_LIBRARY_DB_NAME, 1)
+    const request = indexedDB.open(MUSIC_LIBRARY_DB_NAME, MUSIC_LIBRARY_DB_VERSION)
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(MUSIC_LIBRARY_STORE_NAME)) {
         request.result.createObjectStore(MUSIC_LIBRARY_STORE_NAME)
       }
+      if (!request.result.objectStoreNames.contains(CUE_DATABASE_STORE_NAME)) {
+        request.result.createObjectStore(CUE_DATABASE_STORE_NAME, { keyPath: 'audioFootprint' })
+      }
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error ?? new Error('Music library database failed'))
+    request.onblocked = () => reject(new Error('Music library database upgrade was blocked'))
   })
 }
 
@@ -1027,6 +1043,8 @@ async function connectProject() {
       if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
       projectConnected = connected
       if (connected) {
+        resetDeckCueSelection(0)
+        resetDeckCueSelection(1)
         updateSourceDeckUi(0)
         updateSourceDeckUi(1)
       } else {
@@ -1948,49 +1966,85 @@ function formatDuration(seconds: number | null | undefined) {
 }
 
 function emptyCuePoints(): CuePointSlots {
-  return [null, null, null, null, null]
+  return emptyCuePointSlots()
 }
 
 function cueStorageKey(audioFootprint: string) {
   return `${CUE_STORAGE_PREFIX}${audioFootprint}`
 }
 
-function validCuePosition(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 1
-}
-
-function loadStoredCuePoints(audioFootprint: string): CuePointSlots {
+async function readPersistentCueRecord(audioFootprint: string) {
+  const database = await openMusicLibraryDatabase()
   try {
-    const raw = sessionStorage.getItem(cueStorageKey(audioFootprint))
-    if (!raw) return emptyCuePoints()
-    const stored = JSON.parse(raw) as Partial<StoredCuePoints>
-    if (
-      stored.version !== 1
-      || stored.audioFootprint !== audioFootprint
-      || !Array.isArray(stored.points)
-      || stored.points.length !== 5
-      || !stored.points.every((point) => point === null || validCuePosition(point))
-    ) return emptyCuePoints()
-    return [...stored.points] as CuePointSlots
-  } catch (error) {
-    console.warn('[CUES] session restore:', error)
-    return emptyCuePoints()
+    return await new Promise<unknown>((resolve, reject) => {
+      const request = database
+        .transaction(CUE_DATABASE_STORE_NAME, 'readonly')
+        .objectStore(CUE_DATABASE_STORE_NAME)
+        .get(audioFootprint)
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error ?? new Error('Cue record could not be read'))
+    })
+  } finally {
+    database.close()
   }
 }
 
-function persistCuePoints(deckIndex: WaveformDeckIndex) {
+async function writePersistentCueRecord(record: StoredCuePointsV2) {
+  const database = await openMusicLibraryDatabase()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(CUE_DATABASE_STORE_NAME, 'readwrite')
+      const request = transaction.objectStore(CUE_DATABASE_STORE_NAME).put(record)
+      request.onerror = () => reject(request.error ?? new Error('Cue record could not be saved'))
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = () => reject(transaction.error ?? new Error('Cue record could not be saved'))
+      transaction.onabort = () => reject(transaction.error ?? new Error('Cue record save was aborted'))
+    })
+  } finally {
+    database.close()
+  }
+}
+
+function readSessionCueRecord(audioFootprint: string) {
+  const raw = sessionStorage.getItem(cueStorageKey(audioFootprint))
+  return Promise.resolve(raw ? JSON.parse(raw) as unknown : null)
+}
+
+function writeSessionCueRecord(audioFootprint: string, record: StoredCuePointsV1) {
+  sessionStorage.setItem(cueStorageKey(audioFootprint), JSON.stringify(record))
+  return Promise.resolve()
+}
+
+function removeSessionCueRecord(audioFootprint: string) {
+  sessionStorage.removeItem(cueStorageKey(audioFootprint))
+  return Promise.resolve()
+}
+
+async function persistCuePoints(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   if (!deck.audioFootprint) return
-  const stored: StoredCuePoints = {
-    version: 1,
-    audioFootprint: deck.audioFootprint,
-    points: [...deck.cuePoints] as CuePointSlots,
-  }
   try {
-    sessionStorage.setItem(cueStorageKey(deck.audioFootprint), JSON.stringify(stored))
+    if (deckIndex === 2) {
+      await writeSessionCueRecord(deck.audioFootprint, {
+        version: 1,
+        audioFootprint: deck.audioFootprint,
+        points: [...deck.cuePoints] as CuePointSlots,
+      })
+      return
+    }
+    const result = await saveCuePointMetadata({
+      audioFootprint: deck.audioFootprint,
+      points: deck.cuePoints,
+      writePersistent: writePersistentCueRecord,
+      writeSession: (record) => writeSessionCueRecord(deck.audioFootprint!, record),
+    })
+    deck.cuePersistenceWarning = result.persistence === 'session'
+    if (result.error) console.warn('[CUES] IndexedDB save; using session fallback:', result.error)
   } catch (error) {
     console.warn('[CUES] session save:', error)
-    setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUES COULD NOT BE SAVED IN THIS SESSION`)
+    deck.cuePersistenceWarning = true
+  } finally {
+    renderCueControls(deckIndex)
   }
 }
 
@@ -2198,6 +2252,56 @@ function updateDeckRegionChainTiming(
   return regions
 }
 
+function collapseLegacyCueChain(
+  t: SafeTransactionBuilder,
+  anchor: NexusEntity<'audioRegion'>,
+) {
+  const regions = contiguousAudioRegions(t.entities, anchor)
+  if (regions.length <= 1) return regions[0] ?? anchor
+  const plan = planLegacyCueChainCollapse(regions.map((region) => ({
+    id: region.id,
+    positionTicks: region.fields.region.fields.positionTicks.value,
+    durationTicks: region.fields.region.fields.durationTicks.value,
+  })))
+  const keep = regions.find((region) => region.id === plan.keepId)
+  const last = regions.at(-1)
+  if (!keep || !last) throw new Error('Legacy cue chain changed before collapse')
+  t.update(keep.fields.region.fields.durationTicks, plan.durationTicks)
+  t.update(keep.fields.fadeOutDurationTicks, last.fields.fadeOutDurationTicks.value)
+  t.update(keep.fields.fadeOutSlope, last.fields.fadeOutSlope.value)
+  plan.removeIds.forEach((regionId) => {
+    const redundant = regions.find((region) => region.id === regionId)
+    if (redundant) t.remove(redundant)
+  })
+  return keep
+}
+
+function applySourceDeckLaunchPlan(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+  plan: ReturnType<typeof planRegionLaunch>,
+  fullDurationTicks: number,
+) {
+  const scheduledRegion = collapseLegacyCueChain(t, region)
+  const fields = scheduledRegion.fields.region.fields
+  t.update(fields.positionTicks, plan.positionTicks)
+  t.update(fields.collectionOffsetTicks, plan.cueOffsetTicks)
+  t.update(fields.durationTicks, plan.durationTicks)
+  t.update(fields.loopDurationTicks, fullDurationTicks)
+  if (!fields.isEnabled.value) t.update(fields.isEnabled, true)
+  if (scheduledRegion.fields.fadeInDurationTicks.value > plan.durationTicks) {
+    t.update(scheduledRegion.fields.fadeInDurationTicks, plan.durationTicks)
+  }
+  const maximumFadeOutTicks = Math.max(
+    0,
+    plan.durationTicks - Math.min(scheduledRegion.fields.fadeInDurationTicks.value, plan.durationTicks),
+  )
+  if (scheduledRegion.fields.fadeOutDurationTicks.value > maximumFadeOutTicks) {
+    t.update(scheduledRegion.fields.fadeOutDurationTicks, maximumFadeOutTicks)
+  }
+  return scheduledRegion
+}
+
 function deckCueRegions(entities: EntityQuery, deckIndex: WaveformDeckIndex) {
   const regionId = decks[deckIndex].regionEntity?.id
   if (!regionId) return []
@@ -2213,30 +2317,6 @@ function projectCuePositions(entities: EntityQuery, deckIndex: WaveformDeckIndex
   }))).slice(0, 5)
 }
 
-function reconcileCueSlots(
-  storedPoints: CuePointSlots,
-  authoritativePoints: number[],
-): CuePointSlots {
-  const reconciled = emptyCuePoints()
-  const remaining = [...authoritativePoints]
-  storedPoints.forEach((storedPoint, slot) => {
-    if (storedPoint === null) return
-    const closest = remaining
-      .map((point, index) => ({ difference: Math.abs(point - storedPoint), index }))
-      .sort((a, b) => a.difference - b.difference)[0]
-    const matchIndex = closest && closest.difference < 0.000_5
-      ? closest.index
-      : -1
-    if (matchIndex < 0) return
-    reconciled[slot] = remaining.splice(matchIndex, 1)[0]
-  })
-  remaining.forEach((point) => {
-    const emptySlot = reconciled.findIndex((candidate) => candidate === null)
-    if (emptySlot >= 0) reconciled[emptySlot] = point
-  })
-  return reconciled
-}
-
 function resetDeckCueState(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   deck.cueLoadId += 1
@@ -2244,6 +2324,16 @@ function resetDeckCueState(deckIndex: WaveformDeckIndex) {
   deck.cuePoints = emptyCuePoints()
   deck.cuePosition = 0
   deck.cueLoading = false
+  deck.armedCueSlot = null
+  deck.scheduledCuePosition = 0
+  deck.cuePersistenceWarning = false
+  renderCueControls(deckIndex)
+}
+
+function resetDeckCueSelection(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  deck.armedCueSlot = null
+  deck.cuePosition = 0
   renderCueControls(deckIndex)
 }
 
@@ -2277,14 +2367,37 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
   const controls = getCueElements(deckIndex)
   const loaded = isCueDeckLoaded(deckIndex)
   const ready = loaded && deck.audioFootprint !== null && !deck.cueLoading
+  const fullDurationTicks = deckIndex < 2
+    ? getSynchronizedDeckFullDurationTicks(deckIndex)
+    : null
   controls.module.classList.toggle('is-disabled', !loaded)
   controls.slider.disabled = !ready
-  controls.slider.value = String(Math.round(deck.cuePosition * 1000))
-  controls.position.value = formatCueTime(deckIndex, deck.cuePosition)
+  if (deckIndex < 2 && fullDurationTicks !== null) {
+    const maximumBar = Math.floor((fullDurationTicks - 1) / Ticks.Bars(1)) + 1
+    controls.slider.min = '1'
+    controls.slider.max = String(maximumBar)
+    controls.slider.step = '1'
+    controls.slider.value = String(cueBarForPosition(
+      deck.cuePosition,
+      Ticks.Bars(1),
+      fullDurationTicks,
+    ))
+    controls.position.value = `B${controls.slider.value} · ${formatCueTime(deckIndex, deck.cuePosition)}`
+  } else {
+    controls.slider.min = '0'
+    controls.slider.max = '999'
+    controls.slider.step = '1'
+    controls.slider.value = String(Math.round(deck.cuePosition * 1000))
+    controls.position.value = formatCueTime(deckIndex, deck.cuePosition)
+  }
   controls.status.textContent = deck.cueLoading
-    ? 'SYNCING PROJECT CUTS…'
+    ? deckIndex < 2 ? 'LOADING CUE METADATA…' : 'SYNCING PROJECT CUTS…'
     : ready
-      ? 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
+      ? deckIndex < 2
+        ? deck.cuePersistenceWarning
+          ? 'CUES ARE SESSION-ONLY · INDEXEDDB PERSISTENCE UNAVAILABLE'
+          : 'CHOOSE A TRACK BAR · SET OR SELECT A PAD TO ARM IT'
+        : 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
       : loaded
         ? 'CUES UNAVAILABLE'
         : 'LOAD A TRACK TO ADD CUES'
@@ -2292,14 +2405,19 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     const point = deck.cuePoints[slot]
     trigger.disabled = !ready
     trigger.classList.toggle('is-set', point !== null)
+    trigger.classList.toggle('is-selected', deckIndex < 2 && deck.armedCueSlot === slot)
     trigger.textContent = point === null
       ? `CUE ${slot + 1}\nSET`
       : `CUE ${slot + 1}\n${formatCueTime(deckIndex, point)}`
     trigger.setAttribute(
       'aria-label',
       point === null
-        ? `Create Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, deck.cuePosition)}`
-        : `Select Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, point)}`,
+        ? deckIndex < 2
+          ? `Set and arm cue ${slot + 1} at track bar ${controls.slider.value}`
+          : `Create Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, deck.cuePosition)}`
+        : deckIndex < 2
+          ? `Arm cue ${slot + 1} at track bar ${fullDurationTicks === null ? '—' : cueBarForPosition(point, Ticks.Bars(1), fullDurationTicks)}`
+          : `Select Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, point)}`,
     )
     clear.disabled = !ready || point === null
     clear.classList.toggle('is-hidden', point === null)
@@ -2316,17 +2434,42 @@ async function initializeDeckCues(
   deck.cuePoints = emptyCuePoints()
   deck.cuePosition = 0
   deck.cueLoading = true
+  deck.armedCueSlot = null
+  deck.cuePersistenceWarning = false
   renderCueControls(deckIndex)
   try {
     const audioFootprint = await sampleAudioFootprint(sampleMeta)
     if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
     deck.audioFootprint = audioFootprint
-    const storedPoints = loadStoredCuePoints(audioFootprint)
     const authoritativePoints = nexus
       ? projectCuePositions(nexus.queryEntities, deckIndex)
       : []
-    deck.cuePoints = reconcileCueSlots(storedPoints, authoritativePoints)
-    persistCuePoints(deckIndex)
+    const result = deckIndex < 2
+      ? await loadCuePointMetadata({
+          audioFootprint,
+          authoritativePoints,
+          readPersistent: () => readPersistentCueRecord(audioFootprint),
+          readSession: () => readSessionCueRecord(audioFootprint),
+          writePersistent: writePersistentCueRecord,
+          writeSession: (record) => writeSessionCueRecord(audioFootprint, record),
+          removeSession: () => removeSessionCueRecord(audioFootprint),
+        })
+      : {
+          points: reconcileLegacyCuePoints(
+            parseCueRecordV1(await readSessionCueRecord(audioFootprint), audioFootprint)
+              ?? emptyCuePoints(),
+            authoritativePoints,
+          ),
+          persistence: 'session' as const,
+          migrated: false,
+        }
+    if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
+    deck.cuePoints = result.points
+    deck.cuePersistenceWarning = deckIndex < 2 && result.persistence === 'session'
+    if ('error' in result && result.error) {
+      console.warn('[CUES] IndexedDB unavailable; using session fallback:', result.error)
+    }
+    if (deckIndex === 2) await persistCuePoints(deckIndex)
   } catch (error) {
     if (loadId !== deck.cueLoadId) return
     console.warn(`[CUES] ${placementDeckLabel(deckIndex)} initialization:`, error)
@@ -2340,6 +2483,22 @@ async function initializeDeckCues(
 
 async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
   const deck = decks[deckIndex]
+  if (deckIndex < 2) {
+    const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+    if (fullDurationTicks === null) throw new Error('The synchronized track duration is unavailable')
+    const position = cuePositionForBar(
+      cueBarForPosition(deck.cuePosition, Ticks.Bars(1), fullDurationTicks),
+      Ticks.Bars(1),
+      fullDurationTicks,
+    )
+    deck.cuePoints[slot] = position
+    deck.cuePosition = position
+    deck.armedCueSlot = slot
+    renderCueControls(deckIndex)
+    await persistCuePoints(deckIndex)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} ARMED AT TRACK BAR ${cueBarForPosition(position, Ticks.Bars(1), fullDurationTicks)}`)
+    return
+  }
   const projectDocument = nexus
   const expectedSession = tempoSessionId
   const regionId = deck.regionEntity?.id
@@ -2439,7 +2598,7 @@ async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
     ) return
     deck.cuePoints[slot] = result.cuePosition
     deck.cuePosition = result.cuePosition
-    persistCuePoints(deckIndex)
+    void persistCuePoints(deckIndex)
     setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT IN AUDIOTOOL AT ${formatCueTime(deckIndex, result.cuePosition)}`)
   } finally {
     if (deck.cueLoadId === operationId) {
@@ -2451,6 +2610,18 @@ async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
 
 async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
   const deck = decks[deckIndex]
+  if (deckIndex < 2) {
+    if (deck.cuePoints[slot] === null) return
+    deck.cuePoints[slot] = null
+    if (deck.armedCueSlot === slot) {
+      deck.armedCueSlot = null
+      deck.cuePosition = 0
+    }
+    renderCueControls(deckIndex)
+    await persistCuePoints(deckIndex)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CLEARED · TRACK START ARMED`)
+    return
+  }
   const projectDocument = nexus
   const expectedSession = tempoSessionId
   const regionId = deck.regionEntity?.id
@@ -2522,8 +2693,8 @@ async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
       || deck.cueLoadId !== operationId
     ) return
     deck.cuePoints[slot] = null
-    deck.cuePoints = reconcileCueSlots(deck.cuePoints, authoritativePoints)
-    persistCuePoints(deckIndex)
+    deck.cuePoints = reconcileLegacyCuePoints(deck.cuePoints, authoritativePoints)
+    void persistCuePoints(deckIndex)
     setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT JOINED IN AUDIOTOOL`)
   } finally {
     if (deck.cueLoadId === operationId) {
@@ -2537,7 +2708,17 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   const controls = getCueElements(deckIndex)
   controls.slider.addEventListener('input', () => {
-    deck.cuePosition = Number(controls.slider.value) / 1000
+    if (deckIndex < 2) {
+      const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+      if (fullDurationTicks === null) return
+      deck.cuePosition = cuePositionForBar(
+        Number(controls.slider.value),
+        Ticks.Bars(1),
+        fullDurationTicks,
+      )
+    } else {
+      deck.cuePosition = Number(controls.slider.value) / 1000
+    }
     renderCueControls(deckIndex)
   })
   controls.pads.forEach(({ trigger, clear }, slot) => {
@@ -2551,8 +2732,11 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
         return
       }
       deck.cuePosition = point
+      if (deckIndex < 2) deck.armedCueSlot = slot
       renderCueControls(deckIndex)
-      setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SELECTED — PLAYBACK REMAINS IN AUDIOTOOL`)
+      setStatus('connected', deckIndex < 2
+        ? `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} ARMED FOR THE NEXT LAUNCH`
+        : `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SELECTED — PLAYBACK REMAINS IN AUDIOTOOL`)
     })
     clear.addEventListener('click', () => {
       void removeProjectCueCut(deckIndex, slot).catch((error: unknown) => {
@@ -2884,6 +3068,7 @@ function applyNativeSourceTiming(
   projectBpm: number,
   guardedIds: string[],
   percent = 0,
+  scheduledCuePosition = 0,
 ): NativeTimingResult {
   const nativeDurationTicks = secondsToTicks(sampleDurationSeconds, projectBpm)
   if (!Number.isFinite(nativeDurationTicks) || nativeDurationTicks <= 0) {
@@ -2915,6 +3100,26 @@ function applyNativeSourceTiming(
     contiguousRegions.forEach((candidate) => {
       t.update(candidate.fields.timestretchMode, 2)
     })
+    return { durationTicks, replacementRegion: null }
+  }
+  if (scheduledCuePosition > 0) {
+    const scheduledPlan = planRegionLaunch(durationTicks, 0, scheduledCuePosition)
+    t.update(region.fields.region.fields.collectionOffsetTicks, scheduledPlan.cueOffsetTicks)
+    t.update(region.fields.region.fields.durationTicks, scheduledPlan.durationTicks)
+    t.update(region.fields.region.fields.loopDurationTicks, durationTicks)
+    t.update(terminalEvent.fields.positionTicks, durationTicks)
+    t.update(region.fields.timestretchMode, 2)
+    if (region.fields.fadeInDurationTicks.value > scheduledPlan.durationTicks) {
+      t.update(region.fields.fadeInDurationTicks, scheduledPlan.durationTicks)
+    }
+    const maximumFadeOutTicks = Math.max(
+      0,
+      scheduledPlan.durationTicks
+        - Math.min(region.fields.fadeInDurationTicks.value, scheduledPlan.durationTicks),
+    )
+    if (region.fields.fadeOutDurationTicks.value > maximumFadeOutTicks) {
+      t.update(region.fields.fadeOutDurationTicks, maximumFadeOutTicks)
+    }
     return { durationTicks, replacementRegion: null }
   }
   const previousRegionDurationTicks = region.fields.region.fields.durationTicks.value
@@ -3054,6 +3259,7 @@ async function applyDeckTempoUpdate(
               projectBpm,
               guardedIds,
               percent,
+              deck.scheduledCuePosition,
             )
           : applyMagicTempoTiming(
               t,
@@ -3088,7 +3294,11 @@ async function applyDeckTempoUpdate(
           replacements,
           mappedDurationTicks: timingResult.durationTicks,
           regionDurationTicks: deckIndex < 2
-            ? timingResult.durationTicks
+            ? planRegionLaunch(
+                timingResult.durationTicks,
+                0,
+                deck.scheduledCuePosition,
+              ).durationTicks
             : region.fields.region.fields.durationTicks.value,
         }
       })
@@ -3279,6 +3489,7 @@ async function remapLoadedSourceRegions(
               projectBpm,
               guardedIds,
               source.desiredPercent,
+              decks[source.deckIndex].scheduledCuePosition,
             )
           : applyMagicTempoTiming(
               t,
@@ -3296,7 +3507,11 @@ async function remapLoadedSourceRegions(
           deckIndex: source.deckIndex,
           mappedDurationTicks: result.durationTicks,
           regionDurationTicks: source.deckIndex < 2
-            ? result.durationTicks
+            ? planRegionLaunch(
+                result.durationTicks,
+                0,
+                decks[source.deckIndex].scheduledCuePosition,
+              ).durationTicks
             : getMagicLoopDurationTicks(t, durationOverrides),
         })
         if (result.replacementRegion) {
@@ -3404,6 +3619,7 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
           effectiveProjectBpm,
           guardedIds,
           desiredPercent,
+          deck.scheduledCuePosition,
         )
         const replacements: SourceTimingReplacement[] = []
         if (timingResult.replacementRegion) {
@@ -3461,7 +3677,11 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
         percent: transactionResult.desiredPercent,
         playbackRate: deck.playbackRate,
         mappedDurationTicks: transactionResult.mappedDurationTicks,
-        regionDurationTicks: transactionResult.mappedDurationTicks,
+        regionDurationTicks: planRegionLaunch(
+          transactionResult.mappedDurationTicks,
+          0,
+          deck.scheduledCuePosition,
+        ).durationTicks,
       }
       if (transactionResult.projectTempoUpdated) {
         updateDeckBpmLabels(correctedBpm)
@@ -3847,7 +4067,14 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
     ?? region.fields.region.fields.positionTicks.value
   const durationTicks = audioRegionChainDuration(regions)
   const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
-  if (fullDurationTicks !== null && durationTicks < fullDurationTicks) {
+  const naturalDurationTicks = fullDurationTicks === null
+    ? null
+    : planRegionLaunch(
+        fullDurationTicks,
+        0,
+        deckIndex < 2 ? decks[deckIndex].scheduledCuePosition : 0,
+      ).durationTicks
+  if (naturalDurationTicks !== null && durationTicks < naturalDurationTicks) {
     controls.status.textContent = `STOP · BAR ${tickToBar(positionTicks + durationTicks, Ticks.Bars(1))}`
     return
   }
@@ -4305,6 +4532,9 @@ async function mutateDeckCrossfade(
   ) {
     throw new Error('Both crossfade decks need synchronized regions and routing')
   }
+  const incomingCuePosition = incomingDeckIndex < 2
+    ? incomingDeck.cuePoints[incomingDeck.armedCueSlot ?? -1] ?? 0
+    : 0
   const targetTicks = await resolveDeckLaunchTarget(
     incomingDeckIndex,
     action,
@@ -4340,17 +4570,32 @@ async function mutateDeckCrossfade(
     if (!outgoingRegion.fields.region.fields.isEnabled.value) {
       throw new Error('The outgoing deck is not enabled on the project timeline')
     }
-    const incomingPlan = planRegionLaunch(
-      getDeckFullDurationTicks(t, incomingDeckIndex, incomingRegion),
-      targetTicks,
-    )
-    const incomingRegions = updateDeckRegionChainTiming(
+    const incomingFullDurationTicks = getDeckFullDurationTicks(
       t,
+      incomingDeckIndex,
       incomingRegion,
-      incomingPlan.positionTicks,
-      incomingPlan.durationTicks,
     )
-    updateAudioRegionChainEnabled(t, incomingRegions, incomingPlan.isEnabled)
+    const incomingPlan = planRegionLaunch(
+      incomingFullDurationTicks,
+      targetTicks,
+      incomingCuePosition,
+    )
+    if (incomingDeckIndex < 2) {
+      applySourceDeckLaunchPlan(
+        t,
+        incomingRegion,
+        incomingPlan,
+        incomingFullDurationTicks,
+      )
+    } else {
+      const incomingRegions = updateDeckRegionChainTiming(
+        t,
+        incomingRegion,
+        incomingPlan.positionTicks,
+        incomingPlan.durationTicks,
+      )
+      updateAudioRegionChainEnabled(t, incomingRegions, incomingPlan.isEnabled)
+    }
 
     const fadeEndTicks = targetTicks + fadeDurationTicks
     if (!Number.isSafeInteger(fadeEndTicks)) throw new Error('Crossfade boundary exceeds the safe tick range')
@@ -4358,10 +4603,20 @@ async function mutateDeckCrossfade(
     const outgoingPositionTicks =
       outgoingRegions[0]?.fields.region.fields.positionTicks.value
       ?? outgoingRegion.fields.region.fields.positionTicks.value
+    const outgoingFullDurationTicks = getDeckFullDurationTicks(
+      t,
+      outgoingDeckIndex,
+      outgoingRegion,
+    )
+    const outgoingNaturalDurationTicks = planRegionLaunch(
+      outgoingFullDurationTicks,
+      0,
+      outgoingDeckIndex < 2 ? outgoingDeck.scheduledCuePosition : 0,
+    ).durationTicks
     const outgoingPlan = planRegionStop(
       outgoingPositionTicks,
       audioRegionChainDuration(outgoingRegions),
-      getDeckFullDurationTicks(t, outgoingDeckIndex, outgoingRegion),
+      outgoingNaturalDurationTicks,
       true,
       targetTicks,
       fadeEndTicks,
@@ -4400,6 +4655,7 @@ async function mutateDeckCrossfade(
     throw new Error('Project connection changed after crossfade scheduling')
   }
   sessionLaunchPositionTicks = targetTicks
+  if (incomingDeckIndex < 2) incomingDeck.scheduledCuePosition = incomingCuePosition
   return true
 }
 
@@ -4416,6 +4672,9 @@ async function mutateDeckLaunch(
   if (!projectDocument || !regionId || !trackId || !audioDeviceId) {
     throw new Error('The synchronized deck region and routing graph are required')
   }
+  const cuePosition = deckIndex < 2
+    ? deck.cuePoints[deck.armedCueSlot ?? -1] ?? 0
+    : 0
   const targetTicks = await resolveDeckLaunchTarget(
     deckIndex,
     action,
@@ -4446,22 +4705,29 @@ async function mutateDeckLaunch(
     if (!region || !track || !audioDevice || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region or routing graph changed before launch')
     }
+    const fullDurationTicks = getDeckFullDurationTicks(t, deckIndex, region)
     const plan = planRegionLaunch(
-      getDeckFullDurationTicks(t, deckIndex, region),
+      fullDurationTicks,
       targetTicks,
+      cuePosition,
     )
-    const regions = updateDeckRegionChainTiming(
-      t,
-      region,
-      plan.positionTicks,
-      plan.durationTicks,
-    )
-    updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
+    if (deckIndex < 2) {
+      applySourceDeckLaunchPlan(t, region, plan, fullDurationTicks)
+    } else {
+      const regions = updateDeckRegionChainTiming(
+        t,
+        region,
+        plan.positionTicks,
+        plan.durationTicks,
+      )
+      updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
+    }
   }))
   if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
     throw new Error('Project connection changed after launch scheduling')
   }
   sessionLaunchPositionTicks = targetTicks
+  if (deckIndex < 2) deck.scheduledCuePosition = cuePosition
   return true
 }
 
@@ -4528,10 +4794,16 @@ async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: num
     const regions = contiguousAudioRegions(t.entities, region)
     const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
       ?? region.fields.region.fields.positionTicks.value
+    const fullDurationTicks = getDeckFullDurationTicks(t, deckIndex, region)
+    const naturalDurationTicks = planRegionLaunch(
+      fullDurationTicks,
+      0,
+      deckIndex < 2 ? deck.scheduledCuePosition : 0,
+    ).durationTicks
     const plan = planRegionStop(
       positionTicks,
       audioRegionChainDuration(regions),
-      getDeckFullDurationTicks(t, deckIndex, region),
+      naturalDurationTicks,
       region.fields.region.fields.isEnabled.value,
       transport.guardedTicks,
       transport.targetTicks,
@@ -4813,6 +5085,23 @@ function watchSourceDeckContent(
     projectDocument.events.onUpdate(region.fields.region.fields.loopDurationTicks, () => {
       if (deck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(deckIndex)
     }),
+    projectDocument.events.onUpdate(region.fields.region.fields.collectionOffsetTicks, () => {
+      if (
+        deck.regionEntity?.id !== region.id
+        || deckOperationStates[deckIndex].pendingCount > 0
+        || deck.tempoUpdatePending
+      ) return
+      const terminal = getExpectedPlaybackTerminalEvent(
+        { entities: projectDocument.queryEntities },
+        region,
+      )
+      const fullDurationTicks = terminal?.fields.positionTicks.value
+      const collectionOffsetTicks = region.fields.region.fields.collectionOffsetTicks.value
+      deck.scheduledCuePosition = fullDurationTicks && collectionOffsetTicks > 0
+        ? Math.min((fullDurationTicks - 1) / fullDurationTicks, collectionOffsetTicks / fullDurationTicks)
+        : 0
+      renderDeckTransport(deckIndex)
+    }),
     projectDocument.events.onRemove(region, () => {
       if (deck.regionEntity?.id !== region.id) return
       if (guardedRegionRemovalIds.has(region.id)) return
@@ -4918,12 +5207,24 @@ function bindDeckContentGraph(
   expectedSession: number,
 ) {
   const deck = decks[deckIndex]
+  const replacingBoundContent = deck.regionEntity !== null
   deck.contentSubscriptions.forEach((subscription) => subscription.terminate())
   deck.contentSubscriptions = []
   deck.regionEntity = content.region
   deck.sampleEntity = content.sample
   deck.automationCollectionEntity = content.automationCollection
   if (deckIndex < 2) {
+    if (!replacingBoundContent) {
+      const terminalEvent = getExpectedPlaybackTerminalEvent(
+        { entities: projectDocument.queryEntities },
+        content.region,
+      )
+      const fullDurationTicks = terminalEvent?.fields.positionTicks.value
+      const collectionOffsetTicks = content.region.fields.region.fields.collectionOffsetTicks.value
+      deck.scheduledCuePosition = fullDurationTicks && collectionOffsetTicks > 0
+        ? Math.min((fullDurationTicks - 1) / fullDurationTicks, collectionOffsetTicks / fullDurationTicks)
+        : 0
+    }
     watchSourceDeckContent(
       deckIndex as 0 | 1,
       projectDocument,
@@ -5096,6 +5397,9 @@ async function insertSampleIntoProject(
   }
 
   bindDeckRoutingGraph(deckIndex, projectDocument, inserted.routing, expectedSession)
+  deck.armedCueSlot = null
+  deck.scheduledCuePosition = 0
+  deck.cuePosition = 0
   deck.sampleBpm = bpm
   deck.baseBpm = bpm
   deck.sampleMeta = sample
@@ -6106,6 +6410,7 @@ async function loadAudioFile(
 function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPlacement) {
   const operation = deckOperationStates[deckIndex]
   const expectedSession = tempoSessionId
+  resetDeckCueSelection(deckIndex)
   operation.pendingCount += 1
   updateSourceDeckUi(deckIndex)
   deckLoadQueue = deckLoadQueue

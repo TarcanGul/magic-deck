@@ -110,6 +110,7 @@ export function tickToBar(tick: number, ticksPerBar: number): number
 export type RegionLaunchPlan = {
   kind: 'launch'
   positionTicks: number
+  cueOffsetTicks: number
   durationTicks: number
   isEnabled: true
 }
@@ -121,7 +122,11 @@ export type RegionStopPlan =
   | { kind: 'stop'; durationTicks: number }
   | { kind: 'noop'; reason: 'region-disabled' | 'natural-end-first' }
 
-export function planRegionLaunch(fullDurationTicks: number, targetTicks: number): RegionLaunchPlan
+export function planRegionLaunch(
+  fullDurationTicks: number,
+  targetTicks: number,
+  cuePosition?: number,
+): RegionLaunchPlan
 export function planRegionCancel(regionStartTicks: number, guardedTicks: number): RegionCancelPlan
 export function planRegionStop(
   regionStartTicks: number,

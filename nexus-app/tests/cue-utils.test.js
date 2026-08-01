@@ -2,8 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildIndependentAudioRegionCopy,
+  cueBarForPosition,
+  cuePositionForBar,
   cuePositionsFromSegments,
   planAudioRegionSplit,
+  planLegacyCueChainCollapse,
   planResizedCueOffsets,
 } from '../src/cue-utils.js'
 
@@ -157,4 +160,46 @@ test('keeps cue-cut source alignment when region and loop durations scale differ
     left.loopOffsetTicks - left.collectionOffsetTicks,
     3_000 + right.loopOffsetTicks - right.collectionOffsetTicks,
   )
+})
+
+test('converts track-relative bars to normalized cue positions', () => {
+  assert.equal(cuePositionForBar(1, 1_000, 4_500), 0)
+  assert.equal(cuePositionForBar(3, 1_000, 4_500), 2_000 / 4_500)
+  assert.equal(cueBarForPosition(2_000 / 4_500, 1_000, 4_500), 3)
+  assert.throws(() => cuePositionForBar(5, 1_000, 4_000), /strictly before/)
+  assert.throws(() => cuePositionForBar(1.5, 1_000, 4_000), /whole number/)
+  assert.throws(() => cueBarForPosition(1, 1_000, 4_000), /\[0, 1\)/)
+})
+
+test('preserves exact normalized cue positions across duration changes', () => {
+  const position = cuePositionForBar(3, 1_000, 7_001)
+  assert.equal(Math.round(position * 7_001), 2_000)
+  assert.equal(Math.round(position * 9_503), 2_715)
+  assert.equal(position, 2_000 / 7_001)
+})
+
+test('plans legacy cue chain collapse from the earliest aligned region', () => {
+  const result = planLegacyCueChainCollapse([
+    {
+      id: 'tail', positionTicks: 4_000, durationTicks: 2_000,
+      collectionOffsetTicks: 3_120, loopOffsetTicks: 80,
+      fadeOutDurationTicks: 240, fadeOutSlope: 0.5,
+    },
+    {
+      id: 'head', positionTicks: 1_000, durationTicks: 3_000,
+      collectionOffsetTicks: 120, loopOffsetTicks: 80,
+      displayName: 'Deck A', gain: 0.75, pitchShiftSemitones: -2,
+      fadeOutDurationTicks: 0, fadeOutSlope: 0,
+    },
+  ])
+  assert.equal(result.keepId, 'head')
+  assert.equal(result.durationTicks, 5_000)
+  assert.deepEqual(result.removeIds, ['tail'])
+  assert.equal(result.collapsedRegion.collectionOffsetTicks, 120)
+  assert.equal(result.collapsedRegion.loopOffsetTicks, 80)
+  assert.equal(result.collapsedRegion.displayName, 'Deck A')
+  assert.equal(result.collapsedRegion.gain, 0.75)
+  assert.equal(result.collapsedRegion.pitchShiftSemitones, -2)
+  assert.equal(result.collapsedRegion.fadeOutDurationTicks, 240)
+  assert.equal(result.collapsedRegion.fadeOutSlope, 0.5)
 })

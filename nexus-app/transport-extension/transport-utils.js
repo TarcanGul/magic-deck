@@ -312,14 +312,29 @@ export function tickToBar(tick, ticksPerBar) {
   return Math.floor(tick / ticksPerBar) + 1
 }
 
-export function planRegionLaunch(fullDurationTicks, targetTicks) {
+export function planRegionLaunch(fullDurationTicks, targetTicks, cuePosition = 0) {
   if (!Number.isSafeInteger(fullDurationTicks) || fullDurationTicks <= 0) {
     throw new RangeError('Full region duration must be positive')
   }
   if (!Number.isSafeInteger(targetTicks) || targetTicks < 0) {
     throw new RangeError('Launch tick must be non-negative')
   }
-  return { kind: 'launch', positionTicks: targetTicks, durationTicks: fullDurationTicks, isEnabled: true }
+  if (
+    typeof cuePosition !== 'number'
+    || !Number.isFinite(cuePosition)
+    || cuePosition < 0
+    || cuePosition >= 1
+  ) throw new RangeError('Cue position must be a finite number in [0, 1)')
+  const cueOffsetTicks = Math.round(cuePosition * fullDurationTicks)
+  const durationTicks = fullDurationTicks - cueOffsetTicks
+  if (durationTicks <= 0) throw new RangeError('Cue leaves no playable region duration')
+  return {
+    kind: 'launch',
+    positionTicks: targetTicks,
+    cueOffsetTicks,
+    durationTicks,
+    isEnabled: true,
+  }
 }
 
 export function planRegionCancel(regionStartTicks, guardedTicks) {

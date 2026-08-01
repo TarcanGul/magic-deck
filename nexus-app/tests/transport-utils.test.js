@@ -287,6 +287,7 @@ test('plans launch restoration, cancellation, and quantized stopping', () => {
   assert.deepEqual(planRegionLaunch(bar * 8, bar * 12), {
     kind: 'launch',
     positionTicks: bar * 12,
+    cueOffsetTicks: 0,
     durationTicks: bar * 8,
     isEnabled: true,
   })
@@ -314,4 +315,35 @@ test('plans launch restoration, cancellation, and quantized stopping', () => {
     kind: 'noop',
     reason: 'natural-end-first',
   })
+})
+
+test('plans cue launches with rounded source offsets and natural remaining duration', () => {
+  assert.deepEqual(planRegionLaunch(10_001, 50_000, 0.25), {
+    kind: 'launch',
+    positionTicks: 50_000,
+    cueOffsetTicks: 2_500,
+    durationTicks: 7_501,
+    isEnabled: true,
+  })
+  assert.deepEqual(planRegionLaunch(10_001, 60_000, 0.75), {
+    kind: 'launch',
+    positionTicks: 60_000,
+    cueOffsetTicks: 7_501,
+    durationTicks: 2_500,
+    isEnabled: true,
+  })
+  assert.throws(() => planRegionLaunch(1, 0, 0.999), /no playable/)
+  assert.throws(() => planRegionLaunch(10, 0, 1), /\[0, 1\)/)
+})
+
+test('stops cue-launched regions before their natural remaining end', () => {
+  const launch = planRegionLaunch(8_000, 20_000, 0.25)
+  assert.deepEqual(
+    planRegionStop(launch.positionTicks, launch.durationTicks, launch.durationTicks, true, 21_000, 24_000),
+    { kind: 'stop', durationTicks: 4_000 },
+  )
+  assert.deepEqual(
+    planRegionStop(launch.positionTicks, 2_000, launch.durationTicks, true, 21_000, 24_000),
+    { kind: 'noop', reason: 'natural-end-first' },
+  )
 })

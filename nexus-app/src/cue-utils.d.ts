@@ -72,3 +72,29 @@ export function planResizedCueOffsets(input: CueOffsetResizeInput): {
   loopOffsetTicks: number
   loopDurationTicks: number
 }
+
+export function cuePositionForBar(
+  bar: number,
+  ticksPerBar: number,
+  fullDurationTicks: number,
+): number
+
+export function cueBarForPosition(
+  position: number,
+  ticksPerBar: number,
+  fullDurationTicks: number,
+): number
+
+export interface LegacyCueChainSegment {
+  id: string
+  positionTicks: number
+  durationTicks: number
+  [field: string]: unknown
+}
+
+export function planLegacyCueChainCollapse(segments: LegacyCueChainSegment[]): {
+  keepId: string
+  durationTicks: number
+  collapsedRegion: LegacyCueChainSegment
+  removeIds: string[]
+}
