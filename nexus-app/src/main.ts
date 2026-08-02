@@ -420,6 +420,8 @@ let musicLibraryStatusMessage = 'NO MUSIC FOLDER SELECTED'
 let musicLibraryUsesFallback = false
 let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
+const cueWaveformPeaks: [number[] | null, number[] | null, number[] | null] = [null, null, null]
+const cueAudioBufferPeakCache = new WeakMap<AudioBuffer, number[]>()
 let suppressMagicProjectRemovalSync = false
 let liveAudioStream: MediaStream | null = null
 let liveAudioContext: AudioContext | null = null
@@ -2044,6 +2046,12 @@ async function restoreSourceDecksFromProject(
               / logicalGroup.totalFrames,
         )
         updateSourceDeckUi(deckIndex)
+        void loadRestoredCueWaveform(
+          deckIndex,
+          chunks.map((chunk) => chunk.sample),
+          projectDocument,
+          expectedSession,
+        )
         void initializeDeckCues(deckIndex, deck.sampleMeta, logicalGroup.audioFootprint)
         continue
       }
@@ -2067,6 +2075,7 @@ async function restoreSourceDecksFromProject(
     deck.sampleMeta = sampleMeta
     bindDeckContentGraph(deckIndex, projectDocument, selected.content, expectedSession)
     updateSourceDeckUi(deckIndex)
+    void loadRestoredCueWaveform(deckIndex, [sampleMeta], projectDocument, expectedSession)
     void initializeDeckCues(deckIndex, sampleMeta)
   }
 }
@@ -2090,7 +2099,7 @@ function restoredMagicPrompt(graphDisplayName: string, sampleMeta: SampleMeta) {
   ) ?? ''
 }
 
-async function fetchMagicWaveformPeaks(sampleMeta: SampleMeta) {
+async function fetchWaveformPeaks(sampleMeta: SampleMeta) {
   try {
     const response = await fetch(sampleMeta.getWaveformUrl({
       resolution: 1920,
@@ -2105,9 +2114,46 @@ async function fetchMagicWaveformPeaks(sampleMeta: SampleMeta) {
     if (peaks.length === 0) throw new Error('Waveform response was empty')
     return peaks
   } catch (error) {
-    console.warn('[NEXUS] Magic Deck waveform restore:', error)
+    console.warn('[NEXUS] Waveform restore:', error)
     return null
   }
+}
+
+function resampleWaveformPeaks(peaks: readonly number[], targetLength: number) {
+  const result = new Array<number>(targetLength).fill(0)
+  for (let targetIndex = 0; targetIndex < targetLength; targetIndex++) {
+    const start = Math.floor(targetIndex * peaks.length / targetLength)
+    const end = Math.max(start + 1, Math.floor((targetIndex + 1) * peaks.length / targetLength))
+    for (let sourceIndex = start; sourceIndex < end && sourceIndex < peaks.length; sourceIndex++) {
+      result[targetIndex] = Math.max(result[targetIndex], peaks[sourceIndex])
+    }
+  }
+  return result
+}
+
+async function loadRestoredCueWaveform(
+  deckIndex: WaveformDeckIndex,
+  samples: readonly SampleMeta[],
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  const expectedRegionId = decks[deckIndex].regionEntity?.id
+  const totalDuration = samples.reduce((total, sample) => total + sample.durationSeconds, 0)
+  const peakGroups = await Promise.all(samples.map(fetchWaveformPeaks))
+  if (
+    nexus !== projectDocument
+    || !projectConnected
+    || expectedSession !== tempoSessionId
+    || decks[deckIndex].regionEntity?.id !== expectedRegionId
+  ) return
+
+  cueWaveformPeaks[deckIndex] = peakGroups.every((peaks) => peaks !== null)
+    ? peakGroups.flatMap((peaks, index) => resampleWaveformPeaks(
+        peaks ?? [],
+        Math.max(1, Math.round(1920 * samples[index].durationSeconds / Math.max(totalDuration, 0.001))),
+      ))
+    : null
+  renderCueControls(deckIndex)
 }
 
 async function restoreMagicDeckFromProject(
@@ -2140,7 +2186,7 @@ async function restoreMagicDeckFromProject(
     return
   }
 
-  const peaks = await fetchMagicWaveformPeaks(sampleMeta)
+  const peaks = await fetchWaveformPeaks(sampleMeta)
   if (
     nexus !== projectDocument
     || !projectConnected
@@ -2164,6 +2210,7 @@ async function restoreMagicDeckFromProject(
   magicDeck.baseBpm = magicDeck.sampleBpm ?? (isSupportedBpm(projectBpm) ? projectBpm : null)
   magicDeck.sampleMeta = sampleMeta
   magicWaveformPeaks = peaks
+  cueWaveformPeaks[2] = peaks
   bindDeckContentGraph(2, projectDocument, selected.content, expectedSession)
   updateDeckBpmLabel(2)
   void initializeDeckCues(2, sampleMeta)
@@ -2842,6 +2889,7 @@ function resetDeckCueState(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   deck.cueLoadId += 1
   deck.audioFootprint = null
+  cueWaveformPeaks[deckIndex] = null
   deck.cuePoints = emptyCuePoints()
   deck.cuePosition = 0
   deck.cueLoading = false
@@ -2866,6 +2914,7 @@ function getCueElements(deckIndex: WaveformDeckIndex) {
   const prefix = `d${deckIndex + 1}-cue`
   return {
     module: el<HTMLDivElement>(`${prefix}-module`),
+    waveform: el<HTMLCanvasElement>(`${prefix}-waveform`),
     slider: el<HTMLInputElement>(`${prefix}-position`),
     position: el<HTMLOutputElement>(`${prefix}-position-value`),
     status: el<HTMLSpanElement>(`${prefix}-status`),
@@ -2874,6 +2923,87 @@ function getCueElements(deckIndex: WaveformDeckIndex) {
       clear: el<HTMLButtonElement>(`${prefix}-${slot + 1}-clear`),
     })),
   }
+}
+
+function audioBufferCuePeaks(buffer: AudioBuffer) {
+  const cached = cueAudioBufferPeakCache.get(buffer)
+  if (cached) return cached
+
+  const peakCount = 1200
+  const peaks = new Array<number>(peakCount).fill(0)
+  const framesPerPeak = Math.max(1, Math.ceil(buffer.length / peakCount))
+  for (let channelIndex = 0; channelIndex < buffer.numberOfChannels; channelIndex++) {
+    const channel = buffer.getChannelData(channelIndex)
+    for (let peakIndex = 0; peakIndex < peakCount; peakIndex++) {
+      const end = Math.min(channel.length, (peakIndex + 1) * framesPerPeak)
+      let peak = peaks[peakIndex]
+      for (let frame = peakIndex * framesPerPeak; frame < end; frame++) {
+        peak = Math.max(peak, Math.abs(channel[frame]))
+      }
+      peaks[peakIndex] = peak
+    }
+  }
+  cueAudioBufferPeakCache.set(buffer, peaks)
+  return peaks
+}
+
+function drawCueWaveform(deckIndex: WaveformDeckIndex) {
+  const deck = decks[deckIndex]
+  const canvas = getCueElements(deckIndex).waveform
+  const context = canvas.getContext('2d')
+  if (!context) return
+
+  const width = canvas.width
+  const height = canvas.height
+  const peaks = deck.audioBuffer
+    ? audioBufferCuePeaks(deck.audioBuffer)
+    : cueWaveformPeaks[deckIndex]
+  context.fillStyle = '#080000'
+  context.fillRect(0, 0, width, height)
+
+  context.strokeStyle = '#381014'
+  context.lineWidth = 1
+  context.beginPath()
+  context.moveTo(0, height - 0.5)
+  context.lineTo(width, height - 0.5)
+  context.stroke()
+
+  if (peaks?.length) {
+    const peakMaximum = Math.max(...peaks, 0.0001)
+    for (let x = 0; x < width; x++) {
+      const start = Math.floor(x * peaks.length / width)
+      const end = Math.max(start + 1, Math.floor((x + 1) * peaks.length / width))
+      let peak = 0
+      for (let index = start; index < end && index < peaks.length; index++) {
+        peak = Math.max(peak, peaks[index])
+      }
+      const waveformHeight = peak / peakMaximum * (height - 5)
+      context.strokeStyle = `rgb(${Math.round(92 + x / width * 130)}, 10, 16)`
+      context.beginPath()
+      context.moveTo(x + 0.5, height)
+      context.lineTo(x + 0.5, height - waveformHeight)
+      context.stroke()
+    }
+  }
+
+  const currentX = Math.min(width - 0.5, Math.max(0.5, deck.cuePosition * width))
+  context.strokeStyle = '#d40000'
+  context.lineWidth = 2
+  context.beginPath()
+  context.moveTo(currentX, 0)
+  context.lineTo(currentX, height)
+  context.stroke()
+
+  context.strokeStyle = '#fff'
+  context.lineWidth = 2
+  deck.cuePoints.forEach((point) => {
+    if (point === null) return
+    const x = Math.min(width - 0.5, Math.max(0.5, point * width))
+    context.beginPath()
+    context.moveTo(x, 0)
+    context.lineTo(x, height)
+    context.stroke()
+  })
 }
 
 function isCueDeckLoaded(deckIndex: WaveformDeckIndex) {
@@ -2896,6 +3026,10 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     ? getSynchronizedDeckFullDurationTicks(deckIndex)
     : null
   controls.module.classList.toggle('is-disabled', !loaded)
+  controls.waveform.setAttribute(
+    'aria-label',
+    `${placementDeckLabel(deckIndex)} top-half waveform with ${deck.cuePoints.filter((point) => point !== null).length} saved cue markers`,
+  )
   controls.slider.disabled = !ready
   if (deckIndex < 2 && fullDurationTicks !== null) {
     const maximumBar = Math.floor((fullDurationTicks - 1) / Ticks.Bars(1)) + 1
@@ -2952,6 +3086,7 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     clear.disabled = !ready || point === null
     clear.classList.toggle('is-hidden', point === null)
   })
+  drawCueWaveform(deckIndex)
 }
 
 async function initializeDeckCues(
@@ -3701,6 +3836,7 @@ function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
   deck.detectedBpm = null
   deck.playbackRate = 1
   sourceChunkGroups[deckIndex] = null
+  renderCueControls(deckIndex)
 }
 
 function clearMagicDeckLocalMedia() {
@@ -3716,6 +3852,7 @@ function clearMagicDeckLocalMedia() {
   magicWaveformPeaks = null
   renderTempoControls(2)
   renderDeckTransport(2)
+  renderCueControls(2)
   drawMagicIdle()
 }
 
