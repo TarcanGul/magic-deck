@@ -955,6 +955,21 @@ function projectHasLoadedTimelineContent(projectDocument: SyncedDocument) {
   return projectHasTimelineContent(projectDocument.queryEntities)
 }
 
+function projectHasLoadedSourceDeckContent(projectDocument: SyncedDocument) {
+  const entities = projectDocument.queryEntities
+  const sourceDeckTrackIds = new Set(entities.ofTypes('audioTrack').get().flatMap((track) => {
+    const audioDevice = entities
+      .ofTypes('audioDevice')
+      .getEntity(track.fields.player.value.entityId)
+    const deckIndex = audioDevice
+      ? deckIndexFromDisplayName(audioDevice.fields.displayName.value)
+      : null
+    return deckIndex === 0 || deckIndex === 1 ? [track.id] : []
+  }))
+  return entities.ofTypes('audioRegion').get().some((region) =>
+    sourceDeckTrackIds.has(region.fields.track.value.entityId))
+}
+
 async function captureDeckInsertionPlacement(
   deckIndex: WaveformDeckIndex,
 ): Promise<DeckInsertionPlacement | null> {
@@ -962,7 +977,10 @@ async function captureDeckInsertionPlacement(
   if (!projectConnected || !projectDocument) {
     throw new Error('Connect an Audiotool project before loading audio')
   }
-  if (!projectHasLoadedTimelineContent(projectDocument)) {
+  if (
+    !projectHasLoadedTimelineContent(projectDocument)
+    || (deckIndex < 2 && !projectHasLoadedSourceDeckContent(projectDocument))
+  ) {
     const placement: DeckInsertionPlacement = {
       deckIndex,
       bar: 1,
