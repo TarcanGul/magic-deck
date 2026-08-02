@@ -108,15 +108,21 @@ import type {
 import {
   aggregateChunkProgress,
   audioChannelsSlice,
+  createSourceChunkManifest,
   encodePcm16Wav,
+  formatSourceChunkManifest,
   loadSourceUploadSettings,
   mapWithConcurrency,
+  parseSourceChunkManifest,
   planSourceChunks,
+  planSourceChunkSuffix,
   prioritizeSourceChunks,
+  reconstructLogicalChunkGroups,
   retryWithBackoff,
   saveSourceUploadSettings,
 } from './source-chunk-utils.js'
 import type {
+  SourceChunkManifest,
   SourceChunkPlan,
   SourceUploadSettings,
 } from './source-chunk-utils.js'
@@ -236,12 +242,13 @@ interface SourceChunkProgressItem {
   attempts: number
 }
 interface SourceChunkProgressSnapshot {
-  phase: 'decoding' | 'uploading' | 'chunks-ready' | 'consolidating' | 'ready' | 'failed'
+  phase: 'decoding' | 'uploading' | 'chunks-ready' | 'ready' | 'failed'
   chunks: SourceChunkProgressItem[]
   message?: string
 }
 interface UploadedSourceChunk {
   plan: SourceChunkPlan
+  manifest: SourceChunkManifest
   uploadName: string
   sample: SampleMeta
   region?: NexusEntity<'audioRegion'>
@@ -250,13 +257,18 @@ interface UploadedSourceChunk {
 }
 interface SourceChunkGroup {
   sessionId: number
+  groupId: string
+  audioFootprint: string
   placement: DeckInsertionPlacement
   fileName: string
   durationSeconds: number
+  totalFrames: number
+  sampleRate: number
   totalChunks: number
   chunks: UploadedSourceChunk[]
-  flattened: boolean
-  flattenFailed: boolean
+  ready: boolean
+  cuePoints: CuePointSlots
+  cuePersistenceWarning: boolean
   presentation: SourceRegionPresentation | null
 }
 interface SourceRegionPresentation {
@@ -811,7 +823,7 @@ function currentDeckRegionPositionTicks(deckIndex: WaveformDeckIndex) {
     .ofTypes('audioRegion')
     .getEntity(controlledRegion.id)
   if (!currentRegion) return 0
-  return contiguousAudioRegions(projectDocument.queryEntities, currentRegion)[0]
+  return controlledDeckRegions(projectDocument.queryEntities, deckIndex, currentRegion)[0]
     ?.fields.region.fields.positionTicks.value
     ?? currentRegion.fields.region.fields.positionTicks.value
 }
@@ -1863,17 +1875,165 @@ async function restoreSourceDecksFromProject(
     bindDeckRoutingGraph(deckIndex, projectDocument, selected.routing, expectedSession)
     if (!selected.content) continue
 
-    const sampleMeta = await client.samples.get(selected.content.sample).catch((error: unknown) =>
-      error instanceof Error ? error : new Error(String(error)),
-    )
+    const trackRegions = projectDocument.queryEntities.ofTypes('audioRegion').get().filter((region) =>
+      region.fields.track.value.entityId === selected.routing.track.id)
+    const allSamples = projectDocument.queryEntities.ofTypes('sample').get()
+    const sampleMetadataPairs = await Promise.all(allSamples.map(async (sample) => {
+      const metadata = await client.samples.get(sample).catch((error: unknown) =>
+        error instanceof Error ? error : new Error(String(error)),
+      )
+      return { sample, metadata }
+    }))
     if (
       nexus !== projectDocument
       || !projectConnected
       || expectedSession !== tempoSessionId
-      || !isDeckGraphCurrent(projectDocument, deckIndex, selected)
     ) return
-    if (sampleMeta instanceof Error) {
-      console.warn(`[NEXUS] Deck ${deckIndex + 1} sample metadata restore:`, sampleMeta)
+    const sampleMetadata = new Map(sampleMetadataPairs.flatMap(({ sample, metadata }) =>
+      metadata instanceof Error ? [] : [[sample.id, metadata] as const]))
+    const logicalGroups = reconstructLogicalChunkGroups(trackRegions.flatMap((region) => {
+      const sampleId = region.fields.sample.value.entityId
+      const metadata = sampleMetadata.get(sampleId)
+      return metadata ? [{
+        regionId: region.id,
+        sampleId,
+        positionTicks: region.fields.region.fields.positionTicks.value,
+        durationTicks: region.fields.region.fields.durationTicks.value,
+        logicalDurationTicks: (() => {
+          const terminal = getExpectedPlaybackTerminalEvent(
+            { entities: projectDocument.queryEntities },
+            region,
+          )?.fields.positionTicks.value
+          return terminal === undefined
+            ? undefined
+            : terminal - region.fields.region.fields.collectionOffsetTicks.value
+        })(),
+        description: metadata.description,
+        displayName: region.fields.region.fields.displayName.value || metadata.displayName,
+        durationSeconds: metadata.durationSeconds,
+      }] : []
+    }), { allowSuffixes: true })
+    const logicalGroup = logicalGroups.find((candidate) =>
+      candidate.regions.some((region) => region.regionId === selected.content?.region.id))
+    if (logicalGroup) {
+      const activeRegionByPart = new Map(logicalGroup.regions.map((logicalRegion) => [
+        logicalRegion.manifest.partIndex,
+        trackRegions.find((region) => region.id === logicalRegion.regionId)!,
+      ]))
+      const catalogByPart = new Map<number, {
+        manifest: SourceChunkManifest
+        sample: NexusEntity<'sample'>
+        metadata: SampleMeta
+      }>()
+      logicalGroup.regions.forEach((logicalRegion) => {
+        const sample = allSamples.find((candidate) => candidate.id === logicalRegion.sampleId)
+        const metadata = sampleMetadata.get(logicalRegion.sampleId)
+        if (sample && metadata) catalogByPart.set(logicalRegion.manifest.partIndex, {
+          manifest: logicalRegion.manifest,
+          sample,
+          metadata,
+        })
+      })
+      sampleMetadataPairs.forEach(({ sample, metadata }) => {
+        if (metadata instanceof Error) return
+        const manifest = parseSourceChunkManifest(metadata.description)
+        if (manifest?.groupId === logicalGroup.groupId && !catalogByPart.has(manifest.partIndex)) {
+          catalogByPart.set(manifest.partIndex, { manifest, sample, metadata })
+        }
+      })
+      if (catalogByPart.size === logicalGroup.partCount) {
+        const firstLogicalRegion = logicalGroup.regions[0]
+        const openingRegion = activeRegionByPart.get(firstLogicalRegion.manifest.partIndex)
+        const openingCatalog = catalogByPart.get(firstLogicalRegion.manifest.partIndex)
+        if (!openingRegion || !openingCatalog) continue
+        const chunks: UploadedSourceChunk[] = Array.from(catalogByPart.values())
+          .sort((left, right) => left.manifest.partIndex - right.manifest.partIndex)
+          .map(({ manifest, sample, metadata }) => {
+            const region = activeRegionByPart.get(manifest.partIndex)
+            const automationCollection = region
+              ? projectDocument.queryEntities.ofTypes('automationCollection').getEntity(
+                  region.fields.playbackAutomationCollection.value.entityId,
+                )
+              : undefined
+            return {
+              manifest,
+              plan: {
+                index: manifest.partIndex,
+                startFrame: manifest.startFrame,
+                endFrame: manifest.endFrame,
+                frameLength: manifest.endFrame - manifest.startFrame,
+                startSeconds: manifest.startFrame / manifest.sampleRate,
+                durationSeconds: (manifest.endFrame - manifest.startFrame) / manifest.sampleRate,
+                cueSlots: [],
+              },
+              uploadName: metadata.name,
+              sample: metadata,
+              region,
+              sampleEntity: sample,
+              automationCollection,
+            }
+          })
+        const openingAutomation = chunks.find((chunk) => chunk.region?.id === openingRegion.id)
+          ?.automationCollection
+        if (!openingAutomation) continue
+        const deck = decks[deckIndex]
+        const restoredFileName = cleanSourceDisplayName(logicalGroup.fileName, deckIndex)
+          || logicalGroup.fileName
+        const runtimeGroup: SourceChunkGroup = {
+          sessionId: sourceLoadSessionIds[deckIndex],
+          groupId: logicalGroup.groupId,
+          audioFootprint: logicalGroup.audioFootprint,
+          placement: {
+            deckIndex,
+            bar: tickToBar(firstLogicalRegion.positionTicks, Ticks.Bars(1)),
+            positionTicks: firstLogicalRegion.positionTicks,
+            source: 'project-start',
+            capturedAt: Date.now(),
+          },
+          fileName: restoredFileName,
+          durationSeconds: logicalGroup.durationSeconds,
+          totalFrames: logicalGroup.totalFrames,
+          sampleRate: logicalGroup.sampleRate,
+          totalChunks: logicalGroup.partCount,
+          chunks,
+          ready: true,
+          cuePoints: emptyCuePoints(),
+          cuePersistenceWarning: false,
+          presentation: sourceRegionPresentation(openingRegion),
+        }
+        sourceChunkGroups[deckIndex] = runtimeGroup
+        const metadataBpm = normalizeBpm(openingCatalog.metadata.bpm)
+        deck.fileName = restoredFileName
+        deck.sampleBpm = isSupportedBpm(metadataBpm) ? metadataBpm : null
+        deck.baseBpm = deck.sampleBpm ?? (isSupportedBpm(projectBpm) ? projectBpm : null)
+        deck.sampleMeta = { ...openingCatalog.metadata, durationSeconds: logicalGroup.durationSeconds }
+        bindDeckContentGraph(deckIndex, projectDocument, {
+          region: openingRegion,
+          sample: openingCatalog.sample,
+          automationCollection: openingAutomation,
+        }, expectedSession)
+        const openingTerminal = getExpectedPlaybackTerminalEvent(
+          { entities: projectDocument.queryEntities },
+          openingRegion,
+        )?.fields.positionTicks.value
+        const localPosition = openingTerminal
+          ? openingRegion.fields.region.fields.collectionOffsetTicks.value / openingTerminal
+          : 0
+        deck.scheduledCuePosition = Math.min(
+          (logicalGroup.totalFrames - 1) / logicalGroup.totalFrames,
+          (firstLogicalRegion.manifest.startFrame
+            + localPosition * (firstLogicalRegion.manifest.endFrame - firstLogicalRegion.manifest.startFrame))
+              / logicalGroup.totalFrames,
+        )
+        updateSourceDeckUi(deckIndex)
+        void initializeDeckCues(deckIndex, deck.sampleMeta, logicalGroup.audioFootprint)
+        continue
+      }
+    }
+
+    const sampleMeta = sampleMetadata.get(selected.content.sample.id)
+    if (!sampleMeta) {
+      console.warn(`[NEXUS] Deck ${deckIndex + 1} sample metadata restore unavailable`)
       continue
     }
 
@@ -2328,6 +2488,16 @@ function audioRegionChainDuration(regions: NexusEntity<'audioRegion'>[]) {
     - first.fields.region.fields.positionTicks.value
 }
 
+function enabledAudioRegionSpan(regions: NexusEntity<'audioRegion'>[]) {
+  const firstPositionTicks = regions[0]?.fields.region.fields.positionTicks.value
+  if (firstPositionTicks === undefined) return 0
+  return regions.reduce((span, region) => {
+    const fields = region.fields.region.fields
+    if (!fields.isEnabled.value) return span
+    return Math.max(span, fields.positionTicks.value + fields.durationTicks.value - firstPositionTicks)
+  }, 0)
+}
+
 function updateAudioRegionChainEnabled(
   t: SafeTransactionBuilder,
   regions: NexusEntity<'audioRegion'>[],
@@ -2421,6 +2591,181 @@ function deckCueRegions(entities: EntityQuery, deckIndex: WaveformDeckIndex) {
   if (!regionId) return []
   const anchor = entities.ofTypes('audioRegion').getEntity(regionId)
   return anchor ? contiguousAudioRegions(entities, anchor) : []
+}
+
+function sourceChunkGroupRegions(
+  entities: EntityQuery,
+  deckIndex: 0 | 1,
+  anchorOverride?: NexusEntity<'audioRegion'>,
+) {
+  const group = sourceChunkGroups[deckIndex]
+  const anchorId = anchorOverride?.id ?? decks[deckIndex].regionEntity?.id
+  if (!group || !anchorId || !group.chunks.some((chunk) => chunk.region?.id === anchorId)) return []
+  return group.chunks
+    .flatMap((chunk) => {
+      const region = chunk.region
+        ? entities.ofTypes('audioRegion').getEntity(chunk.region.id)
+        : undefined
+      return region ? [{ region, chunk }] : []
+    })
+    .sort((left, right) =>
+      left.region.fields.region.fields.positionTicks.value
+        - right.region.fields.region.fields.positionTicks.value
+      || left.chunk.manifest.partIndex - right.chunk.manifest.partIndex)
+}
+
+function controlledDeckRegions(
+  entities: EntityQuery,
+  deckIndex: WaveformDeckIndex,
+  anchor: NexusEntity<'audioRegion'>,
+) {
+  if (deckIndex < 2) {
+    const chunkRegions = sourceChunkGroupRegions(entities, deckIndex as 0 | 1, anchor)
+    if (chunkRegions.length) return chunkRegions.map(({ region }) => region)
+  }
+  return contiguousAudioRegions(entities, anchor)
+}
+
+function logicalRegionSetDuration(
+  t: SafeTransactionBuilder,
+  regions: NexusEntity<'audioRegion'>[],
+  durationTicks: number,
+) {
+  const ordered = regions.slice().sort((left, right) =>
+    left.fields.region.fields.positionTicks.value - right.fields.region.fields.positionTicks.value)
+  const firstPositionTicks = ordered[0]?.fields.region.fields.positionTicks.value
+  if (firstPositionTicks === undefined) return
+  ordered.forEach((region) => {
+    const fields = region.fields.region.fields
+    const relativeStart = fields.positionTicks.value - firstPositionTicks
+    const terminal = getExpectedPlaybackTerminalEvent(t, region)
+    const naturalDuration = terminal?.fields.positionTicks.value ?? fields.loopDurationTicks.value
+    const remaining = durationTicks - relativeStart
+    if (remaining <= 0) {
+      if (fields.isEnabled.value) t.update(fields.isEnabled, false)
+      return
+    }
+    const nextDuration = Math.min(naturalDuration - fields.collectionOffsetTicks.value, remaining)
+    if (nextDuration > 0 && fields.durationTicks.value !== nextDuration) {
+      t.update(fields.durationTicks, nextDuration)
+    }
+    t.update(fields.isEnabled, true)
+  })
+}
+
+function applySourceChunkGroupLaunch(
+  t: SafeTransactionBuilder,
+  deckIndex: 0 | 1,
+  targetPositionTicks: number,
+) {
+  const group = sourceChunkGroups[deckIndex]
+  const entries = sourceChunkGroupRegions(t.entities, deckIndex)
+  if (entries.length === 0) throw new Error('Logical source chunk group is unavailable')
+  if (!group) throw new Error('Logical source chunk manifest is unavailable')
+  const anchor = entries[0].region
+  const fullDurationTicks = getDeckFullDurationTicks(t, deckIndex, anchor)
+  let positionTicks = targetPositionTicks
+  const launched = group.chunks
+    .slice()
+    .sort((left, right) => left.manifest.partIndex - right.manifest.partIndex)
+    .map((chunk, index) => {
+    let region = chunk.region
+      ? t.entities.ofTypes('audioRegion').getEntity(chunk.region.id)
+      : undefined
+    const sample = chunk.sampleEntity
+      ? t.entities.ofTypes('sample').getEntity(chunk.sampleEntity.id)
+      : undefined
+    if (!sample) throw new Error('A logical source chunk sample is unavailable')
+    const naturalDurationTicks = Math.max(1,
+      Math.round((chunk.manifest.endFrame / group.totalFrames) * fullDurationTicks)
+        - Math.round((chunk.manifest.startFrame / group.totalFrames) * fullDurationTicks))
+    let automationCollection = region
+      ? t.entities.ofTypes('automationCollection').getEntity(
+          region.fields.playbackAutomationCollection.value.entityId,
+        )
+      : undefined
+    if (!region) {
+      automationCollection = t.create('automationCollection', {})
+      t.create('automationEvent', {
+        collection: automationCollection.location,
+        positionTicks: 0,
+        value: 0,
+        interpolation: 2,
+      })
+      t.create('automationEvent', {
+        collection: automationCollection.location,
+        positionTicks: naturalDurationTicks,
+        value: 1,
+      })
+      region = t.create('audioRegion', {
+        region: {
+          positionTicks,
+          durationTicks: naturalDurationTicks,
+          collectionOffsetTicks: 0,
+          loopOffsetTicks: 0,
+          loopDurationTicks: naturalDurationTicks,
+          isEnabled: true,
+          colorIndex: group.presentation?.colorIndex ?? anchor.fields.region.fields.colorIndex.value,
+          displayName: `DECK ${deckIndex + 1} — ${group.fileName} · PART ${chunk.manifest.partIndex + 1}/${group.totalChunks}`,
+        },
+        track: anchor.fields.track.value,
+        playbackAutomationCollection: automationCollection.location,
+        sample: sample.location,
+        gain: group.presentation?.gain ?? anchor.fields.gain.value,
+        fadeInDurationTicks: 0,
+        fadeInSlope: group.presentation?.fadeInSlope ?? anchor.fields.fadeInSlope.value,
+        fadeOutDurationTicks: 0,
+        fadeOutSlope: group.presentation?.fadeOutSlope ?? anchor.fields.fadeOutSlope.value,
+        timestretchMode: 2,
+        pitchShiftSemitones:
+          group.presentation?.pitchShiftSemitones ?? anchor.fields.pitchShiftSemitones.value,
+      })
+    }
+    if (!automationCollection) throw new Error('Chunk playback automation is unavailable')
+    const fields = region.fields.region.fields
+    const terminal = getExpectedPlaybackTerminalEvent(t, region)
+    if (!terminal) throw new Error('Chunk playback automation is not in the expected form')
+    const durationTicks = naturalDurationTicks
+    if (terminal.fields.positionTicks.value !== durationTicks) {
+      t.update(terminal.fields.positionTicks, durationTicks)
+    }
+    t.update(fields.positionTicks, positionTicks)
+    t.update(fields.collectionOffsetTicks, 0)
+    t.update(fields.loopOffsetTicks, 0)
+    t.update(fields.loopDurationTicks, durationTicks)
+    t.update(fields.durationTicks, durationTicks)
+    if (!fields.isEnabled.value) t.update(fields.isEnabled, true)
+    applySourceRegionPresentation(
+      t,
+      region,
+      group.presentation,
+      index === 0,
+      index === group.chunks.length - 1,
+    )
+    t.update(fields.isEnabled, true)
+    positionTicks += durationTicks
+    return { chunk, region, sample, automationCollection }
+  })
+  const opening = launched[0]
+  if (!opening) throw new Error('Logical source chunk group has no playable chunks')
+  return {
+    content: {
+      region: opening.region,
+      sample: opening.sample,
+      automationCollection: opening.automationCollection,
+    },
+    launched,
+  }
+}
+
+function commitSourceChunkGroupLaunch(
+  result: ReturnType<typeof applySourceChunkGroupLaunch>,
+) {
+  result.launched.forEach(({ chunk, region, sample, automationCollection }) => {
+    chunk.region = region
+    chunk.sampleEntity = sample
+    chunk.automationCollection = automationCollection
+  })
 }
 
 function sourceDeckInstances(
@@ -2524,7 +2869,6 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
   const loaded = isCueDeckLoaded(deckIndex)
   const operationPending = deckOperationStates[deckIndex].pendingCount > 0
     || deck.tempoUpdatePending
-    || (deckIndex < 2 && sourceChunkGroups[deckIndex as 0 | 1] !== null)
   const ready = projectConnected
     && loaded
     && deck.audioFootprint !== null
@@ -2564,9 +2908,7 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
             : 'CHOOSE A SOURCE BAR · SET A PAD OR SELECT A SAVED CUE TO SCHEDULE IT'
           : 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
         : loaded
-          ? deckIndex < 2 && sourceChunkGroups[deckIndex as 0 | 1]?.flattenFailed
-            ? 'CUES UNAVAILABLE UNTIL PLAYABLE CHUNKS ARE CONSOLIDATED'
-            : 'CUES UNAVAILABLE'
+          ? 'CUES UNAVAILABLE'
           : 'LOAD A TRACK TO ADD CUES'
   controls.pads.forEach(({ trigger, clear }, slot) => {
     const point = deck.cuePoints[slot]
@@ -2597,6 +2939,7 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
 async function initializeDeckCues(
   deckIndex: WaveformDeckIndex,
   sampleMeta: SampleMeta,
+  knownAudioFootprint?: string,
 ) {
   const deck = decks[deckIndex]
   const loadId = ++deck.cueLoadId
@@ -2607,7 +2950,7 @@ async function initializeDeckCues(
   deck.cuePersistenceWarning = false
   renderCueControls(deckIndex)
   try {
-    const audioFootprint = await sampleAudioFootprint(sampleMeta)
+    const audioFootprint = knownAudioFootprint ?? await sampleAudioFootprint(sampleMeta)
     if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
     deck.audioFootprint = audioFootprint
     const authoritativePoints = nexus
@@ -2648,6 +2991,18 @@ async function initializeDeckCues(
       renderCueControls(deckIndex)
     }
   }
+}
+
+async function loadSourceCuePointsForFootprint(audioFootprint: string) {
+  return loadCuePointMetadata({
+    audioFootprint,
+    authoritativePoints: [],
+    readPersistent: () => readPersistentCueRecord(audioFootprint),
+    readSession: () => readSessionCueRecord(audioFootprint),
+    writePersistent: writePersistentCueRecord,
+    writeSession: (record) => writeSessionCueRecord(audioFootprint, record),
+    removeSession: () => removeSessionCueRecord(audioFootprint),
+  })
 }
 
 async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
@@ -2868,6 +3223,157 @@ async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
   }
 }
 
+async function scheduleSourceChunkCueSuffix(
+  deckIndex: 0 | 1,
+  group: SourceChunkGroup,
+  cuePosition: number,
+  targetTicks: number,
+  projectDocument: SyncedDocument,
+  expectedSession: number,
+) {
+  const deck = decks[deckIndex]
+  const regionId = deck.regionEntity?.id
+  if (!regionId) throw new Error('The synchronized logical track is unavailable')
+  const guardedIds: string[] = []
+  try {
+    const created = await serializeSourceTiming(() => projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+        || deck.regionEntity?.id !== regionId
+        || sourceChunkGroups[deckIndex] !== group
+      ) throw new Error('Project or logical track changed before cue scheduling')
+      const anchor = t.entities.ofTypes('audioRegion').getEntity(regionId)
+      if (!anchor) throw new Error('The synchronized logical track is no longer available')
+      const fullDurationTicks = getDeckFullDurationTicks(t, deckIndex, anchor)
+      const plan = planSourceChunkSuffix({
+        chunks: group.chunks.map((chunk) => ({
+          manifest: chunk.manifest,
+          durationTicks: Math.max(1,
+            Math.round((chunk.manifest.endFrame / group.totalFrames) * fullDurationTicks)
+              - Math.round((chunk.manifest.startFrame / group.totalFrames) * fullDurationTicks)),
+        })),
+        cuePosition,
+        targetPositionTicks: targetTicks,
+      })
+      const trackId = anchor.fields.track.value.entityId
+      const destinationRegions = t.entities.ofTypes('audioRegion').get().filter((candidate) =>
+        candidate.fields.track.value.entityId === trackId)
+      const takeover = planNonOverlappingCueTakeover(
+        destinationRegions.map(regionSnapshot),
+        targetTicks,
+        plan.totalRemainingDurationTicks,
+      )
+      takeover.truncate.forEach((truncation) => {
+        const existing = t.entities.ofTypes('audioRegion').getEntity(truncation.id)
+        if (!existing || existing.fields.track.value.entityId !== trackId) {
+          throw new Error('Deck content changed during cue takeover planning')
+        }
+        t.update(existing.fields.region.fields.durationTicks, truncation.durationTicks)
+        t.update(existing.fields.fadeInDurationTicks, truncation.fadeInDurationTicks)
+        t.update(existing.fields.fadeOutDurationTicks, truncation.fadeOutDurationTicks)
+      })
+      const removedIds = new Set(takeover.removeRegionIds)
+      const removedAutomationIds = new Set<string>()
+      takeover.removeRegionIds.forEach((existingRegionId) => {
+        const existing = t.entities.ofTypes('audioRegion').getEntity(existingRegionId)
+        if (!existing || existing.fields.track.value.entityId !== trackId) {
+          throw new Error('Deck content changed during cue takeover planning')
+        }
+        removedAutomationIds.add(existing.fields.playbackAutomationCollection.value.entityId)
+        guardedRegionRemovalIds.add(existingRegionId)
+        guardedIds.push(existingRegionId)
+        t.remove(existing)
+      })
+      removedAutomationIds.forEach((collectionId) => {
+        const stillUsed = t.entities.ofTypes('audioRegion').get().some((candidate) =>
+          !removedIds.has(candidate.id)
+          && candidate.fields.playbackAutomationCollection.value.entityId === collectionId)
+        const collection = stillUsed
+          ? undefined
+          : t.entities.ofTypes('automationCollection').getEntity(collectionId)
+        if (collection) t.removeWithDependencies(collection)
+      })
+
+      return plan.chunks.map((planned) => {
+        const chunk = group.chunks.find((candidate) =>
+          candidate.manifest.partIndex === planned.manifest.partIndex)
+        if (!chunk?.sampleEntity) throw new Error('A logical source chunk sample is unavailable')
+        const sample = t.entities.ofTypes('sample').getEntity(chunk.sampleEntity.id)
+        if (!sample) throw new Error('A logical source chunk sample was removed')
+        const automationCollection = t.create('automationCollection', {})
+        t.create('automationEvent', {
+          collection: automationCollection.location,
+          positionTicks: 0,
+          value: 0,
+          interpolation: 2,
+        })
+        t.create('automationEvent', {
+          collection: automationCollection.location,
+          positionTicks: planned.automationTerminalTicks,
+          value: 1,
+        })
+        const region = t.create('audioRegion', {
+          region: {
+            positionTicks: planned.positionTicks,
+            durationTicks: planned.durationTicks,
+            collectionOffsetTicks: planned.collectionOffsetTicks,
+            loopOffsetTicks: 0,
+            loopDurationTicks: planned.automationTerminalTicks,
+            isEnabled: true,
+            colorIndex: group.presentation?.colorIndex ?? anchor.fields.region.fields.colorIndex.value,
+            displayName: `DECK ${deckIndex + 1} — ${group.fileName} · PART ${planned.manifest.partIndex + 1}/${group.totalChunks}`,
+          },
+          track: anchor.fields.track.value,
+          playbackAutomationCollection: automationCollection.location,
+          sample: sample.location,
+          gain: group.presentation?.gain ?? anchor.fields.gain.value,
+          fadeInDurationTicks: 0,
+          fadeInSlope: group.presentation?.fadeInSlope ?? anchor.fields.fadeInSlope.value,
+          fadeOutDurationTicks: 0,
+          fadeOutSlope: group.presentation?.fadeOutSlope ?? anchor.fields.fadeOutSlope.value,
+          timestretchMode: 2,
+          pitchShiftSemitones:
+            group.presentation?.pitchShiftSemitones ?? anchor.fields.pitchShiftSemitones.value,
+        })
+        applySourceRegionPresentation(
+          t,
+          region,
+          group.presentation,
+          planned.includeFadeIn,
+          planned.includeFadeOut,
+        )
+        t.update(region.fields.region.fields.isEnabled, true)
+        return { chunk, region, sample, automationCollection }
+      })
+    }))
+    if (
+      nexus !== projectDocument
+      || expectedSession !== tempoSessionId
+      || sourceChunkGroups[deckIndex] !== group
+    ) throw new Error('Project connection changed after cue scheduling')
+    group.chunks.forEach((chunk) => {
+      chunk.region = undefined
+      chunk.automationCollection = undefined
+    })
+    created.forEach(({ chunk, region, sample, automationCollection }) => {
+      chunk.region = region
+      chunk.sampleEntity = sample
+      chunk.automationCollection = automationCollection
+    })
+    const opening = created[0]
+    if (!opening) throw new Error('Cue suffix did not create a playable region')
+    bindDeckContentGraph(deckIndex, projectDocument, {
+      region: opening.region,
+      sample: opening.sample,
+      automationCollection: opening.automationCollection,
+    }, expectedSession)
+  } finally {
+    guardedIds.forEach((guardedId) => guardedRegionRemovalIds.delete(guardedId))
+  }
+}
+
 async function mutateSourceCueSchedule(
   deckIndex: 0 | 1,
   slot: number,
@@ -2904,6 +3410,22 @@ async function mutateSourceCueSchedule(
     throw new Error('Project or cue state changed during cue scheduling')
   }
   const targetTicks = barToPositionTicks(targetBar, Ticks.Bars(1))
+
+  const chunkGroup = sourceChunkGroups[deckIndex]
+  if (chunkGroup?.ready) {
+    await scheduleSourceChunkCueSuffix(
+      deckIndex,
+      chunkGroup,
+      cuePosition,
+      targetTicks,
+      projectDocument,
+      expectedSession,
+    )
+    deck.scheduledCuePosition = cuePosition
+    deck.cuePosition = cuePosition
+    renderCueControls(deckIndex)
+    return true
+  }
 
   const takeoverGuardedIds: string[] = []
   try {
@@ -3106,13 +3628,11 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
     ? chunkProgress.message ?? (
         chunkProgress.phase === 'decoding'
           ? 'DECODING SOURCE AUDIO'
-          : chunkProgress.phase === 'consolidating'
-            ? `CONSOLIDATING · ${aggregate?.ready ?? 0}/${aggregate?.total ?? 0} CHUNKS READY`
-            : chunkProgress.phase === 'ready'
-              ? 'CONSOLIDATED TRACK READY'
-              : chunkProgress.phase === 'failed'
-                ? 'CHUNK LOAD FAILED'
-                : `${aggregate?.ready ?? 0}/${aggregate?.total ?? 0} CHUNKS READY${aggregate?.retrying ? ` · ${aggregate.retrying} RETRYING` : ''}`
+          : chunkProgress.phase === 'ready'
+            ? 'LOGICAL TRACK READY'
+            : chunkProgress.phase === 'failed'
+              ? 'CHUNK LOAD FAILED'
+              : `${aggregate?.ready ?? 0}/${aggregate?.total ?? 0} CHUNKS READY${aggregate?.retrying ? ` · ${aggregate.retrying} RETRYING` : ''}`
       )
     : uploadProgressText(operation.uploadProgress)
 
@@ -3303,7 +3823,17 @@ function reconstructDeckTempoFromSynchronizedRegion(deckIndex: WaveformDeckIndex
   const terminalEvent = nexus
     ? getExpectedPlaybackTerminalEvent({ entities: nexus.queryEntities }, region)
     : null
-  const synchronizedDurationTicks = terminalEvent?.fields.positionTicks.value
+  const chunkGroup = deckIndex < 2
+    ? sourceChunkGroups[deckIndex as 0 | 1]
+    : null
+  const controlledChunk = chunkGroup?.chunks.find((chunk) => chunk.region?.id === region.id)
+  const synchronizedDurationTicks = controlledChunk && terminalEvent
+    ? Math.round(
+        terminalEvent.fields.positionTicks.value
+          * chunkGroup!.totalFrames
+          / (controlledChunk.manifest.endFrame - controlledChunk.manifest.startFrame),
+      )
+    : terminalEvent?.fields.positionTicks.value
     ?? (deckIndex < 2
       ? region.fields.region.fields.durationTicks.value
       : region.fields.region.fields.loopDurationTicks.value)
@@ -3523,6 +4053,68 @@ function applySourceDeckInstancesTiming(
   guardedIds: string[],
   percent: number,
 ): NativeTimingResult {
+  const chunkGroup = sourceChunkGroups[deckIndex]
+  const chunkEntries = sourceChunkGroupRegions(t.entities, deckIndex, controlledRegion)
+  if (chunkGroup && chunkEntries.length) {
+    const fullDurationTicks = mappedDurationTicks(
+      secondsToTicks(chunkGroup.durationSeconds, projectBpm),
+      percent,
+    )
+    const firstPositionTicks = chunkEntries[0].region.fields.region.fields.positionTicks.value
+    let nextPositionTicks = firstPositionTicks
+    let controlledRegionDurationTicks = 0
+    chunkEntries.forEach(({ region, chunk }) => {
+      const fields = region.fields.region.fields
+      const terminal = getExpectedPlaybackTerminalEvent(t, region)
+      if (!terminal) throw new Error('Chunk playback automation is not in the expected form')
+      const previousNaturalTicks = terminal.fields.positionTicks.value
+      const nextNaturalTicks = Math.max(1,
+        Math.round((chunk.manifest.endFrame / chunkGroup.totalFrames) * fullDurationTicks)
+          - Math.round((chunk.manifest.startFrame / chunkGroup.totalFrames) * fullDurationTicks))
+      const offsetRatio = previousNaturalTicks > 0
+        ? fields.collectionOffsetTicks.value / previousNaturalTicks
+        : 0
+      const nextOffsetTicks = Math.min(
+        nextNaturalTicks - 1,
+        Math.max(0, Math.round(offsetRatio * nextNaturalTicks)),
+      )
+      const previousRemainingTicks = Math.max(1,
+        previousNaturalTicks - fields.collectionOffsetTicks.value)
+      const nextRemainingTicks = nextNaturalTicks - nextOffsetTicks
+      const stoppedRatio = Math.min(1, fields.durationTicks.value / previousRemainingTicks)
+      const nextDurationTicks = Math.max(1, Math.round(nextRemainingTicks * stoppedRatio))
+      t.update(fields.positionTicks, nextPositionTicks)
+      t.update(fields.collectionOffsetTicks, nextOffsetTicks)
+      t.update(fields.loopOffsetTicks, 0)
+      t.update(fields.loopDurationTicks, nextNaturalTicks)
+      t.update(fields.durationTicks, nextDurationTicks)
+      t.update(terminal.fields.positionTicks, nextNaturalTicks)
+      t.update(region.fields.timestretchMode, 2)
+      if (region.fields.fadeInDurationTicks.value > nextDurationTicks) {
+        t.update(region.fields.fadeInDurationTicks, nextDurationTicks)
+      }
+      const maximumFadeOutTicks = Math.max(
+        0,
+        nextDurationTicks - Math.min(region.fields.fadeInDurationTicks.value, nextDurationTicks),
+      )
+      if (region.fields.fadeOutDurationTicks.value > maximumFadeOutTicks) {
+        t.update(region.fields.fadeOutDurationTicks, maximumFadeOutTicks)
+      }
+      if (fields.isEnabled.value) {
+        controlledRegionDurationTicks = Math.max(
+          controlledRegionDurationTicks,
+          nextPositionTicks - firstPositionTicks + nextDurationTicks,
+        )
+      }
+      nextPositionTicks += nextRemainingTicks
+    })
+    return {
+      durationTicks: fullDurationTicks,
+      replacementRegion: null,
+      controlledRegionDurationTicks,
+      replacements: [],
+    }
+  }
   const instances = sourceDeckInstances(t.entities, deckIndex, controlledRegion)
   let controlledInstanceId = instances.find((instance) =>
     contiguousAudioRegions(t.entities, instance)
@@ -4313,7 +4905,7 @@ async function startSampleUpload(
     kind: 'loop',
     bpm,
   }, signal)
-  if (upload instanceof Error) throw upload
+  if (upload instanceof Error) throw new Error(sourceUploadErrorMessage(upload))
   return upload
 }
 
@@ -4405,6 +4997,22 @@ function sourceUploadIsCurrent(
     && projectConnected
 }
 
+function sourceUploadErrorMessage(error: unknown) {
+  const messages: string[] = []
+  let current: unknown = error
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    if (current.message && !messages.includes(current.message)) messages.push(current.message)
+    current = current.cause
+  }
+  return messages.join(' — ') || String(error)
+}
+
+function createSourceChunkGroupId(audioFootprint: string, loadSessionId: number) {
+  const randomId = globalThis.crypto?.randomUUID?.()
+  return randomId?.replaceAll('-', '').slice(0, 16)
+    ?? `${audioFootprint.slice(0, 8)}${loadSessionId.toString(16)}${Date.now().toString(36)}`.slice(0, 16)
+}
+
 function decodedAudioChannels(buffer: AudioBuffer) {
   return Array.from({ length: buffer.numberOfChannels }, (_, channel) =>
     new Float32Array(buffer.getChannelData(channel)))
@@ -4446,11 +5054,19 @@ function getMagicLoopDurationTicks(
   t: SafeTransactionBuilder,
   durationOverrides?: ReadonlyMap<string, number>,
 ) {
-  return decks.slice(0, 2).reduce((durationTicks, deck) => {
+  return decks.slice(0, 2).reduce((durationTicks, deck, deckIndex) => {
     if (!deck.regionEntity) return durationTicks
     const durationOverride = durationOverrides?.get(deck.regionEntity.id)
     if (durationOverride !== undefined) {
       return Math.max(durationTicks, durationOverride)
+    }
+    const chunkGroup = sourceChunkGroups[deckIndex as 0 | 1]
+    const projectBpm = normalizeBpm(currentProjectBpm)
+    if (chunkGroup && isSupportedBpm(projectBpm)) {
+      return Math.max(durationTicks, mappedDurationTicks(
+        secondsToTicks(chunkGroup.durationSeconds, projectBpm),
+        deck.tempoPercent,
+      ))
     }
     const region = t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
     if (!region) return durationTicks
@@ -4467,6 +5083,14 @@ function getDeckFullDurationTicks(
   region: NexusEntity<'audioRegion'>,
 ) {
   if (deckIndex === 2) return getMagicLoopDurationTicks(t)
+  const chunkGroup = sourceChunkGroups[deckIndex as 0 | 1]
+  const projectBpm = normalizeBpm(currentProjectBpm)
+  if (chunkGroup && isSupportedBpm(projectBpm)) {
+    return mappedDurationTicks(
+      secondsToTicks(chunkGroup.durationSeconds, projectBpm),
+      decks[deckIndex].tempoPercent,
+    )
+  }
   const terminalEvent = getExpectedPlaybackTerminalEvent(t, region)
   if (!terminalEvent) {
     throw new Error('Deck playback automation is not in the expected synchronized form')
@@ -4492,6 +5116,14 @@ function getSynchronizedDeckFullDurationTicks(deckIndex: WaveformDeckIndex) {
           ?? sourceRegion.fields.region.fields.loopDurationTicks.value,
       )
     }, Ticks.Bars(MAGIC_DURATION_BARS))
+  }
+  const chunkGroup = sourceChunkGroups[deckIndex as 0 | 1]
+  const projectBpm = normalizeBpm(currentProjectBpm)
+  if (chunkGroup && isSupportedBpm(projectBpm)) {
+    return mappedDurationTicks(
+      secondsToTicks(chunkGroup.durationSeconds, projectBpm),
+      decks[deckIndex].tempoPercent,
+    )
   }
   return getExpectedPlaybackTerminalEvent(
     { entities: projectDocument.queryEntities },
@@ -4520,10 +5152,7 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
   const operation = deckOperationStates[deckIndex]
   const region = decks[deckIndex].regionEntity
   const available = projectConnected && nexus !== null && region !== null
-  const retainedChunkGroup = deckIndex < 2
-    ? sourceChunkGroups[deckIndex as 0 | 1]
-    : null
-  const pending = operation.pendingCount > 0 || retainedChunkGroup !== null
+  const pending = operation.pendingCount > 0
   const outgoingValue = controls.crossfadeFrom.value
   const outgoingDeckIndex = outgoingValue === ''
     ? null
@@ -4555,20 +5184,16 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
     controls.status.textContent = 'EMPTY'
     return
   }
-  if (retainedChunkGroup?.flattenFailed) {
-    controls.status.textContent = 'PLAYABLE CHUNKS · FLATTEN FAILED'
-    return
-  }
   if (!region.fields.region.fields.isEnabled.value) {
     controls.status.textContent = 'READY'
     return
   }
   const regions = nexus
-    ? contiguousAudioRegions(nexus.queryEntities, region)
+    ? controlledDeckRegions(nexus.queryEntities, deckIndex, region)
     : [region]
   const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
     ?? region.fields.region.fields.positionTicks.value
-  const durationTicks = audioRegionChainDuration(regions)
+  const durationTicks = enabledAudioRegionSpan(regions)
   const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
   const naturalDurationTicks = fullDurationTicks === null
     ? null
@@ -4667,7 +5292,7 @@ async function resolveDeckLaunchTarget(
     ? projectDocument.queryEntities.ofTypes('audioRegion').getEntity(controlledRegionId)
     : null
   const recoveredRegions = controlledRegion
-    ? contiguousAudioRegions(projectDocument.queryEntities, controlledRegion)
+    ? controlledDeckRegions(projectDocument.queryEntities, deckIndex, controlledRegion)
     : []
   const recoveredPositionTicks = recoveredRegions[0]?.fields.region.fields.positionTicks.value
     ?? controlledRegion?.fields.region.fields.positionTicks.value
@@ -5031,7 +5656,7 @@ async function mutateDeckCrossfade(
   )
   if (targetTicks === null) return false
   const fadeDurationTicks = Ticks.Bars(fadeBars)
-  await serializeSourceTiming(() => projectDocument.modify((t) => {
+  const launchedContent = await serializeSourceTiming(() => projectDocument.modify((t) => {
     assertDeckMutationContext(
       projectDocument,
       incomingDeckIndex,
@@ -5068,7 +5693,15 @@ async function mutateDeckCrossfade(
       targetTicks,
       0,
     )
-    if (incomingDeckIndex < 2) {
+    let incomingContent: ReturnType<typeof applySourceChunkGroupLaunch> | null = null
+    if (incomingDeckIndex < 2
+      && sourceChunkGroupRegions(t.entities, incomingDeckIndex as 0 | 1, incomingRegion).length) {
+      incomingContent = applySourceChunkGroupLaunch(
+        t,
+        incomingDeckIndex as 0 | 1,
+        targetTicks,
+      )
+    } else if (incomingDeckIndex < 2) {
       applySourceDeckLaunchPlan(
         t,
         incomingRegion,
@@ -5087,7 +5720,7 @@ async function mutateDeckCrossfade(
 
     const fadeEndTicks = targetTicks + fadeDurationTicks
     if (!Number.isSafeInteger(fadeEndTicks)) throw new Error('Crossfade boundary exceeds the safe tick range')
-    const outgoingRegions = contiguousAudioRegions(t.entities, outgoingRegion)
+    const outgoingRegions = controlledDeckRegions(t.entities, outgoingDeckIndex, outgoingRegion)
     const outgoingPositionTicks =
       outgoingRegions[0]?.fields.region.fields.positionTicks.value
       ?? outgoingRegion.fields.region.fields.positionTicks.value
@@ -5103,7 +5736,7 @@ async function mutateDeckCrossfade(
     ).durationTicks
     const outgoingPlan = planRegionStop(
       outgoingPositionTicks,
-      audioRegionChainDuration(outgoingRegions),
+      enabledAudioRegionSpan(outgoingRegions),
       outgoingNaturalDurationTicks,
       true,
       targetTicks,
@@ -5113,12 +5746,17 @@ async function mutateDeckCrossfade(
       throw new Error('The outgoing deck has not begun by the crossfade boundary')
     }
     if (outgoingPlan.kind === 'stop') {
-      updateDeckRegionChainTiming(
-        t,
-        outgoingRegion,
-        outgoingPositionTicks,
-        outgoingPlan.durationTicks,
-      )
+      if (outgoingDeckIndex < 2
+        && sourceChunkGroupRegions(t.entities, outgoingDeckIndex as 0 | 1, outgoingRegion).length) {
+        logicalRegionSetDuration(t, outgoingRegions, outgoingPlan.durationTicks)
+      } else {
+        updateDeckRegionChainTiming(
+          t,
+          outgoingRegion,
+          outgoingPositionTicks,
+          outgoingPlan.durationTicks,
+        )
+      }
     }
     replaceCrossfadeAutomation(
       t,
@@ -5138,9 +5776,19 @@ async function mutateDeckCrossfade(
       outgoingDevice.fields.gain.value,
       0,
     )
+    return incomingContent
   }))
   if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
     throw new Error('Project connection changed after crossfade scheduling')
+  }
+  if (launchedContent) {
+    commitSourceChunkGroupLaunch(launchedContent)
+    bindDeckContentGraph(
+      incomingDeckIndex,
+      projectDocument,
+      launchedContent.content,
+      expectedSession,
+    )
   }
   if (incomingDeckIndex < 2) incomingDeck.scheduledCuePosition = 0
   return true
@@ -5174,7 +5822,7 @@ async function mutateDeckLaunch(
     trackId,
     audioDeviceId,
   )
-  await serializeSourceTiming(() => projectDocument.modify((t) => {
+  const launchedContent = await serializeSourceTiming(() => projectDocument.modify((t) => {
     assertDeckMutationContext(
       projectDocument,
       deckIndex,
@@ -5195,7 +5843,9 @@ async function mutateDeckLaunch(
       targetTicks,
       0,
     )
-    if (deckIndex < 2) {
+    if (deckIndex < 2 && sourceChunkGroupRegions(t.entities, deckIndex as 0 | 1, region).length) {
+      return applySourceChunkGroupLaunch(t, deckIndex as 0 | 1, targetTicks)
+    } else if (deckIndex < 2) {
       applySourceDeckLaunchPlan(t, region, plan, fullDurationTicks)
     } else {
       const regions = updateDeckRegionChainTiming(
@@ -5206,9 +5856,14 @@ async function mutateDeckLaunch(
       )
       updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
     }
+    return null
   }))
   if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
     throw new Error('Project connection changed after launch scheduling')
+  }
+  if (launchedContent) {
+    commitSourceChunkGroupLaunch(launchedContent)
+    bindDeckContentGraph(deckIndex, projectDocument, launchedContent.content, expectedSession)
   }
   if (deckIndex < 2) deck.scheduledCuePosition = 0
   return true
@@ -5238,7 +5893,7 @@ async function mutateDeckCancel(deckIndex: WaveformDeckIndex, expectedSession: n
     if (!region || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region changed before cancellation')
     }
-    const regions = contiguousAudioRegions(t.entities, region)
+    const regions = controlledDeckRegions(t.entities, deckIndex, region)
     const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
       ?? region.fields.region.fields.positionTicks.value
     const plan = planRegionCancel(positionTicks, guardedTicks)
@@ -5274,7 +5929,7 @@ async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: num
     if (!region || region.fields.track.value.entityId !== trackId) {
       throw new Error('The deck region changed before stop scheduling')
     }
-    const regions = contiguousAudioRegions(t.entities, region)
+    const regions = controlledDeckRegions(t.entities, deckIndex, region)
     const positionTicks = regions[0]?.fields.region.fields.positionTicks.value
       ?? region.fields.region.fields.positionTicks.value
     const fullDurationTicks = getDeckFullDurationTicks(t, deckIndex, region)
@@ -5285,7 +5940,7 @@ async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: num
     ).durationTicks
     const plan = planRegionStop(
       positionTicks,
-      audioRegionChainDuration(regions),
+      enabledAudioRegionSpan(regions),
       naturalDurationTicks,
       region.fields.region.fields.isEnabled.value,
       transport.guardedTicks,
@@ -5294,7 +5949,11 @@ async function mutateDeckStop(deckIndex: WaveformDeckIndex, expectedSession: num
     if (plan.kind === 'cancel') {
       updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
     } else if (plan.kind === 'stop') {
-      updateDeckRegionChainTiming(t, region, positionTicks, plan.durationTicks)
+      if (deckIndex < 2 && sourceChunkGroupRegions(t.entities, deckIndex as 0 | 1, region).length) {
+        logicalRegionSetDuration(t, regions, plan.durationTicks)
+      } else {
+        updateDeckRegionChainTiming(t, region, positionTicks, plan.durationTicks)
+      }
     }
   }))
   return true
@@ -5368,6 +6027,24 @@ function handleExternalSourceContentRemoval(
 ) {
   if (nexus !== projectDocument || expectedSession !== tempoSessionId) return
   if (deckOperationStates[deckIndex].suppressProjectRemovalSync) return
+  const chunkGroup = sourceChunkGroups[deckIndex]
+  if (chunkGroup) {
+    const activeChunkRegions = chunkGroup.chunks.filter((chunk) => chunk.region)
+    const completeInstance = activeChunkRegions.length > 0 && activeChunkRegions.every((chunk) =>
+      projectDocument.queryEntities.ofTypes('audioRegion').getEntity(chunk.region!.id))
+    if (!completeInstance) {
+      const reportWasActive = manualBpmReportStates[deckIndex].editing
+      clearSourceDeckLocalMedia(deckIndex)
+      clearDeckContentEntities(decks[deckIndex])
+      updateSourceDeckUi(deckIndex)
+      void syncMagicLoopDuration(projectDocument, expectedSession)
+      setStatus(
+        reportWasActive ? 'error' : 'connected',
+        `DECK ${deckIndex + 1}: LOGICAL TRACK CHUNK REMOVED — CONTROL CLEARED`,
+      )
+      return
+    }
+  }
   const remaining = sourceDeckInstances(projectDocument.queryEntities, deckIndex)
     .sort((left, right) =>
       right.fields.region.fields.positionTicks.value
@@ -5634,6 +6311,34 @@ function watchSourceDeckContent(
         if (deck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(deckIndex)
       }),
     )
+  }
+  const chunkGroup = sourceChunkGroups[deckIndex]
+  if (chunkGroup?.chunks.some((chunk) => chunk.region?.id === region.id)) {
+    chunkGroup.chunks.forEach((chunk) => {
+      const sibling = chunk.region
+      if (!sibling || sibling.id === region.id) return
+      const renderIfCurrent = () => {
+        if (
+          nexus === projectDocument
+          && expectedSession === tempoSessionId
+          && sourceChunkGroups[deckIndex] === chunkGroup
+        ) renderDeckTransport(deckIndex)
+      }
+      deck.contentSubscriptions.push(
+        projectDocument.events.onUpdate(sibling.fields.region.fields.durationTicks, renderIfCurrent),
+        projectDocument.events.onUpdate(sibling.fields.region.fields.positionTicks, renderIfCurrent),
+        projectDocument.events.onUpdate(sibling.fields.region.fields.isEnabled, renderIfCurrent),
+        projectDocument.events.onRemove(sibling, () => {
+          if (
+            nexus !== projectDocument
+            || expectedSession !== tempoSessionId
+            || sourceChunkGroups[deckIndex] !== chunkGroup
+            || guardedRegionRemovalIds.has(sibling.id)
+          ) return
+          handleExternalSourceContentRemoval(deckIndex, projectDocument, expectedSession)
+        }),
+      )
+    })
   }
 }
 
@@ -6022,6 +6727,12 @@ async function removePendingSourceInsertion(
 function captureSourceRegionPresentation(deckIndex: 0 | 1): SourceRegionPresentation | null {
   const region = decks[deckIndex].regionEntity
   if (!region) return null
+  return sourceRegionPresentation(region)
+}
+
+function sourceRegionPresentation(
+  region: NexusEntity<'audioRegion'>,
+): SourceRegionPresentation {
   return {
     isEnabled: region.fields.region.fields.isEnabled.value,
     colorIndex: region.fields.region.fields.colorIndex.value,
@@ -6134,18 +6845,29 @@ async function insertSourceChunkSet(
         : undefined
       const replacementIds = new Set<string>()
       if (replacementRegion) {
-        sourceDeckInstanceRegions(t.entities, deckIndex, replacementRegion).forEach((region) => {
+        const existingChunkGroup = sourceChunkGroups[deckIndex]
+        const replacesChunkGroup = Boolean(existingChunkGroup
+          && existingChunkGroup.chunks.some((chunk) => chunk.region?.id === replacementRegion.id))
+        const replacementRegions = replacesChunkGroup
+          ? existingChunkGroup!.chunks.flatMap((chunk) => chunk.region ? [chunk.region] : [])
+          : sourceDeckInstanceRegions(t.entities, deckIndex, replacementRegion)
+        replacementRegions.forEach((region) => {
           replacementIds.add(region.id)
           guardedRegionRemovalIds.add(region.id)
           removedRegionIds.push(region.id)
         })
-        removeDeckContentInTransaction(
-          t,
-          replacementRegion.id,
-          deck.sampleEntity?.id,
-          deck.automationCollectionEntity?.id,
-          deckIndex,
-        )
+        if (replacesChunkGroup && existingChunkGroup) {
+          removeSourceChunkGroupInTransaction(t, existingChunkGroup)
+        }
+        else {
+          removeDeckContentInTransaction(
+            t,
+            replacementRegion.id,
+            deck.sampleEntity?.id,
+            deck.automationCollectionEntity?.id,
+            deckIndex,
+          )
+        }
       }
       if (replaceExisting) {
         applyForwardInsertionCollisionPlan(
@@ -6212,6 +6934,10 @@ function bindPlayableSourceChunkGroup(
   deck.fileName = group.fileName
   deck.audioBuffer = decoded
   deck.sampleMeta = { ...opening.sample, durationSeconds: group.durationSeconds }
+  deck.audioFootprint = group.audioFootprint
+  deck.cuePoints = [...group.cuePoints] as CuePointSlots
+  deck.cueLoading = false
+  deck.cuePersistenceWarning = group.cuePersistenceWarning
   deck.sampleBpm = normalizeBpm(currentProjectBpm)
   deck.baseBpm = normalizeBpm(currentProjectBpm)
   bindDeckContentGraph(deckIndex, projectDocument, {
@@ -6254,70 +6980,6 @@ async function removeIncompleteSourceChunkGroup(
     updateSourceDeckUi(deckIndex)
   }
   if (sourceChunkGroups[deckIndex] === group) sourceChunkGroups[deckIndex] = null
-}
-
-async function flattenSourceChunkGroup(
-  deckIndex: 0 | 1,
-  group: SourceChunkGroup,
-  consolidatedSample: SampleMeta,
-  decoded: AudioBuffer,
-  expectedSession: number,
-  loadSessionId: number,
-) {
-  const projectDocument = nexus
-  const deck = decks[deckIndex]
-  if (!projectDocument || !sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
-    throw new Error('Project connection changed before consolidation')
-  }
-  const trackId = deck.trackEntity?.id
-  if (!trackId) throw new Error('Deck track changed before consolidation')
-  const guardedIds = group.chunks.flatMap((chunk) => chunk.region ? [chunk.region.id] : [])
-  guardedIds.forEach((regionId) => guardedRegionRemovalIds.add(regionId))
-  deckOperationStates[deckIndex].suppressProjectRemovalSync = true
-  try {
-    const inserted = await serializeSourceTiming(() => projectDocument.modify((t) => {
-      const targetTrack = t.entities.ofTypes('audioTrack').getEntity(trackId)
-      if (!targetTrack) throw new Error('Deck track changed during consolidation')
-      group.chunks.forEach((chunk) => {
-        if (chunk.region) removeDeckContentInTransaction(t, chunk.region.id, undefined, undefined)
-      })
-      const projectBpm = normalizeBpm(currentProjectBpm)
-      if (!isSupportedBpm(projectBpm)) throw new Error('Project BPM is outside the supported range')
-      const durationTicks = secondsToTicks(group.durationSeconds, projectBpm)
-      const region = t.insertSample(consolidatedSample, {
-        sample: { musicDurationTicks: durationTicks },
-        region: {
-          positionTicks: group.placement.positionTicks,
-          durationTicks,
-        },
-        attachTo: targetTrack,
-        displayName: `DECK ${deckIndex + 1} — ${group.fileName}`,
-      })
-      applySourceRegionPresentation(t, region, group.presentation, true, true)
-      return { region, ...resolveInsertedProjectEntities(region, t) }
-    }))
-    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
-      throw new Error('Project connection changed after consolidation')
-    }
-    group.flattened = true
-    deck.fileName = group.fileName
-    deck.audioBuffer = decoded
-    deck.sampleMeta = consolidatedSample
-    deck.sampleBpm = normalizeBpm(currentProjectBpm)
-    deck.baseBpm = normalizeBpm(currentProjectBpm)
-    bindDeckContentGraph(deckIndex, projectDocument, {
-      region: inserted.region,
-      sample: inserted.sample,
-      automationCollection: inserted.automationCollection,
-    }, expectedSession)
-    sourceChunkGroups[deckIndex] = null
-    updateSourceDeckUi(deckIndex)
-    await Promise.allSettled(group.chunks.map((chunk) => cleanupRemoteSample(chunk.uploadName)))
-    return inserted
-  } finally {
-    guardedIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
-    deckOperationStates[deckIndex].suppressProjectRemovalSync = false
-  }
 }
 
 function logSourceBpmDiscrepancy(
@@ -6399,7 +7061,6 @@ async function uploadSourceToNexus(
     attempts: Array<Record<string, unknown>>
     firstPlayableMs?: number
     allChunksReadyMs?: number
-    consolidationMs?: number
     bpmMs?: number
     finalReadyMs?: number
     bpm?: BpmResolution | null
@@ -6511,10 +7172,17 @@ async function uploadSourceToNexus(
       bindDeckContentGraph(deckIndex, projectDocument, graph.content, expectedSession)
     }
     const presentation = captureSourceRegionPresentation(deckIndex)
-    const cueTemplate = [...deck.cuePoints]
     const decodeStartedAt = performance.now()
-    const decoded = await decodeLocalAudio(file, abortController.signal)
+    const [decoded, audioFootprint] = await Promise.all([
+      decodeLocalAudio(file, abortController.signal),
+      file.arrayBuffer().then(hashAudioFootprint),
+    ])
     structuredTiming.decodeMs = performance.now() - decodeStartedAt
+    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+      throw new Error('Source upload session changed during decoding')
+    }
+    const cueResult = await loadSourceCuePointsForFootprint(audioFootprint)
+    const cueTemplate = [...cueResult.points] as CuePointSlots
     const channels = decodedAudioChannels(decoded)
     const plans = planSourceChunks({
       durationFrames: decoded.length,
@@ -6529,15 +7197,21 @@ async function uploadSourceToNexus(
       state: 'queued',
       attempts: 0,
     }))
+    const groupId = createSourceChunkGroupId(audioFootprint, loadSessionId)
     group = {
       sessionId: loadSessionId,
+      groupId,
+      audioFootprint,
       placement,
       fileName: file.name,
       durationSeconds: decoded.duration,
+      totalFrames: decoded.length,
+      sampleRate: decoded.sampleRate,
       totalChunks: plans.length,
       chunks: [],
-      flattened: false,
-      flattenFailed: false,
+      ready: false,
+      cuePoints: cueTemplate,
+      cuePersistenceWarning: cueResult.persistence === 'session',
       presentation,
     }
     sourceChunkGroups[deckIndex] = group
@@ -6546,6 +7220,17 @@ async function uploadSourceToNexus(
 
     const uploadOneChunk = async (plan: SourceChunkPlan) => {
       const progress = chunkProgress[plan.index]
+      const manifest = createSourceChunkManifest({
+        groupId,
+        audioFootprint,
+        fileName: file.name,
+        partIndex: plan.index,
+        partCount: plans.length,
+        startFrame: plan.startFrame,
+        endFrame: plan.endFrame,
+        totalFrames: decoded.length,
+        sampleRate: decoded.sampleRate,
+      })
       let currentUploadName: string | null = null
       try {
         const sample = await retryWithBackoff(async (attempt) => {
@@ -6565,7 +7250,7 @@ async function uploadSourceToNexus(
             wav,
             `DECK ${deckNum} — ${file.name} · PART ${plan.index + 1}/${plans.length}`,
             undefined,
-            `Temporary cue-aware upload chunk ${plan.index + 1}/${plans.length}`,
+            formatSourceChunkManifest(manifest),
             abortController.signal,
           )
           currentUploadName = upload.name
@@ -6587,7 +7272,7 @@ async function uploadSourceToNexus(
           })
           currentUploadName = null
           settleMetadata(normalizeBpm(ready.bpm))
-          return { plan, uploadName: upload.name, sample: ready } as UploadedSourceChunk
+          return { plan, manifest, uploadName: upload.name, sample: ready } as UploadedSourceChunk
         }, {
           attempts: 3,
           signal: abortController.signal,
@@ -6627,7 +7312,7 @@ async function uploadSourceToNexus(
       } catch (error) {
         progress.state = 'failed'
         updateChunkProgress({ phase: 'uploading', chunks: chunkProgress })
-        return { ok: false as const, error }
+        return { ok: false as const, error: new Error(sourceUploadErrorMessage(error)) }
       }
     }
 
@@ -6669,110 +7354,8 @@ async function uploadSourceToNexus(
       bindPlayableSourceChunkGroup(deckIndex, group, decoded, expectedSession)
     }
 
-    updateChunkProgress({ phase: 'consolidating', chunks: chunkProgress })
-    setStatus('connected', `DECK ${deckNum}: ALL CHUNKS PLAYABLE · CONSOLIDATING FULL TRACK…`)
-    const consolidationStartedAt = performance.now()
-    let consolidationUploadName: string | null = null
-    let consolidatedSample: SampleMeta
-    try {
-      consolidatedSample = await retryWithBackoff(async (attempt) => {
-        const attemptStartedAt = performance.now()
-        const wav = sourceWavFile(
-          channels,
-          decoded.sampleRate,
-          `${file.name.replace(/\.[^.]+$/, '')}.consolidated.wav`,
-        )
-        const upload = await startSampleUpload(
-          wav,
-          `DECK ${deckNum} — ${file.name}`,
-          undefined,
-          'Client-consolidated cue-aware source upload',
-          abortController.signal,
-        )
-        consolidationUploadName = upload.name
-        const transferStartedAt = performance.now()
-        const uploaded = await upload.uploaded
-        if (uploaded instanceof Error) throw uploaded
-        const transferMs = performance.now() - transferStartedAt
-        const processingStartedAt = performance.now()
-        const ready = await upload.ready
-        if (ready instanceof Error) throw ready
-        structuredTiming.attempts.push({
-          kind: 'consolidation',
-          attempt,
-          totalMs: performance.now() - attemptStartedAt,
-          transferMs,
-          processingMs: performance.now() - processingStartedAt,
-          outcome: 'ready',
-        })
-        consolidationUploadName = null
-        settleMetadata(normalizeBpm(ready.bpm))
-        return ready
-      }, {
-        attempts: 3,
-        signal: abortController.signal,
-        wait: abortableUploadWait,
-        onFailure: async (error, attempt) => {
-          structuredTiming.attempts.push({
-            kind: 'consolidation',
-            attempt,
-            outcome: 'failed',
-            error: error instanceof Error ? error.message : String(error),
-          })
-          if (consolidationUploadName) {
-            await cleanupRemoteSample(consolidationUploadName)
-            consolidationUploadName = null
-          }
-        },
-      })
-    } catch (error) {
-      group.flattenFailed = true
-      structuredTiming.consolidationMs = performance.now() - consolidationStartedAt
-      settlePipelineReady(false)
-      updateChunkProgress({
-        phase: 'failed',
-        chunks: chunkProgress,
-        message: 'CONSOLIDATION FAILED · PLAYABLE CHUNKS RETAINED',
-      })
-      operation.bpmStatus = operation.bpmStatus || 'BPM ANALYSIS CONTINUES'
-      updateSourceDeckUi(deckIndex)
-      setStatus('error', `DECK ${deckNum}: CONSOLIDATION FAILED AFTER 3 ATTEMPTS — PLAYABLE CHUNKS RETAINED`)
-      logStructuredResult({
-        outcome: 'playable-chunks',
-        chunks: plans.length,
-        consolidationError: error instanceof Error ? error.message : String(error),
-      })
-      return true
-    }
-
-    try {
-      await flattenSourceChunkGroup(
-        deckIndex,
-        group,
-        consolidatedSample,
-        decoded,
-        expectedSession,
-        loadSessionId,
-      )
-    } catch (error) {
-      group.flattenFailed = true
-      await cleanupRemoteSample(consolidatedSample.name)
-      structuredTiming.consolidationMs = performance.now() - consolidationStartedAt
-      settlePipelineReady(false)
-      updateChunkProgress({
-        phase: 'failed',
-        chunks: chunkProgress,
-        message: 'FLATTEN SWAP FAILED · PLAYABLE CHUNKS RETAINED',
-      })
-      setStatus('error', `DECK ${deckNum}: FLATTEN SWAP FAILED — PLAYABLE CHUNKS RETAINED`)
-      logStructuredResult({
-        outcome: 'playable-chunks',
-        chunks: plans.length,
-        consolidationError: error instanceof Error ? error.message : String(error),
-      })
-      return true
-    }
-    structuredTiming.consolidationMs = performance.now() - consolidationStartedAt
+    group.ready = true
+    sourceChunkGroups[deckIndex] = group
     structuredTiming.finalReadyMs = performance.now() - startedAt
     settlePipelineReady(true)
     updateChunkProgress({ phase: 'ready', chunks: chunkProgress })
@@ -6782,7 +7365,7 @@ async function uploadSourceToNexus(
         updateSourceDeckUi(deckIndex)
       }
     }, 2500)
-    setStatus('connected', `DECK ${deckNum}: ${file.name} — CHUNKS JOINED AND FLATTENED ✓`)
+    setStatus('connected', `DECK ${deckNum}: ${file.name} — ${plans.length} LOGICAL ${plans.length === 1 ? 'CHUNK' : 'CHUNKS'} READY ✓`)
     logStructuredResult({ outcome: 'ready', chunks: plans.length })
     return true
   } catch (error) {
@@ -7134,6 +7717,38 @@ function removeDeckContentInTransaction(
   })
 }
 
+function removeSourceChunkGroupInTransaction(
+  t: SafeTransactionBuilder,
+  group: SourceChunkGroup,
+) {
+  const regionIds = new Set(group.chunks.flatMap((chunk) => chunk.region ? [chunk.region.id] : []))
+  const sampleIds = new Set(group.chunks.map((chunk) => chunk.sampleEntity?.id).filter(
+    (sampleId): sampleId is string => typeof sampleId === 'string',
+  ))
+  const automationCollectionIds = new Set(group.chunks.map(
+    (chunk) => chunk.automationCollection?.id,
+  ).filter((collectionId): collectionId is string => typeof collectionId === 'string'))
+  regionIds.forEach((regionId) => {
+    const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+    if (region) t.remove(region)
+  })
+  sampleIds.forEach((sampleId) => {
+    const stillUsed = t.entities.ofTypes('audioRegion').get().some((region) =>
+      !regionIds.has(region.id) && region.fields.sample.value.entityId === sampleId)
+    const sample = stillUsed ? undefined : t.entities.ofTypes('sample').getEntity(sampleId)
+    if (sample) t.removeWithDependencies(sample)
+  })
+  automationCollectionIds.forEach((collectionId) => {
+    const stillUsed = t.entities.ofTypes('audioRegion').get().some((region) =>
+      !regionIds.has(region.id)
+      && region.fields.playbackAutomationCollection.value.entityId === collectionId)
+    const collection = stillUsed
+      ? undefined
+      : t.entities.ofTypes('automationCollection').getEntity(collectionId)
+    if (collection) t.removeWithDependencies(collection)
+  })
+}
+
 async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: number) {
   const deck = decks[deckIndex]
   const operation = deckOperationStates[deckIndex]
@@ -7160,13 +7775,13 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
     operation.suppressProjectRemovalSync = true
     try {
       await projectDocument.modify((t) => {
-        if (chunkGroup && !chunkGroup.flattened) {
+        if (chunkGroup) {
           chunkGroup.chunks.forEach((chunk) => {
             if (chunk.region) {
               guardedRegionRemovalIds.add(chunk.region.id)
-              removeDeckContentInTransaction(t, chunk.region.id, undefined, undefined)
             }
           })
+          removeSourceChunkGroupInTransaction(t, chunkGroup)
         } else {
           removeDeckContentInTransaction(
             t,
@@ -7180,9 +7795,6 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
       clearDeckContentEntities(deck)
       if (chunkGroup) {
         sourceChunkGroups[deckIndex] = null
-        void Promise.allSettled(
-          chunkGroup.chunks.map((chunk) => cleanupRemoteSample(chunk.uploadName)),
-        )
       }
     } finally {
       chunkGroup?.chunks.forEach((chunk) => {
