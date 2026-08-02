@@ -105,6 +105,21 @@ import type {
   BpmRaceDecision,
   UploadProgressSnapshot,
 } from './upload-orchestration-utils.js'
+import {
+  aggregateChunkProgress,
+  audioChannelsSlice,
+  encodePcm16Wav,
+  loadSourceUploadSettings,
+  mapWithConcurrency,
+  planSourceChunks,
+  prioritizeSourceChunks,
+  retryWithBackoff,
+  saveSourceUploadSettings,
+} from './source-chunk-utils.js'
+import type {
+  SourceChunkPlan,
+  SourceUploadSettings,
+} from './source-chunk-utils.js'
 
 // ── OAuth config ──────────────────────────────────────────────────────────────
 const CLIENT_ID = 'fa370480-13d6-4cba-8015-f9297a81e9e8'
@@ -126,6 +141,7 @@ interface DeckState {
   lastAppliedTiming: TempoTimingSnapshot | null
   volume: number; gainTrim: number
   sampleBpm: number | null; sampleMeta: SampleMeta | null
+  detectedBpm: BpmResolution | null
   regionEntity: NexusEntity<'audioRegion'> | null
   trackEntity: NexusEntity<'audioTrack'> | null; audioDeviceEntity: NexusEntity<'audioDevice'> | null
   mixerChannelEntity: NexusEntity<'mixerChannel'> | null; sampleEntity: NexusEntity<'sample'> | null
@@ -209,7 +225,49 @@ interface DeckOperationState {
   pendingCount: number
   activeKind: 'loading' | 'replacing' | 'unloading' | 'launching' | 'cue-scheduling' | 'cancelling' | 'stopping' | 'generating' | null
   uploadProgress: UploadProgressSnapshot | null
+  chunkProgress: SourceChunkProgressSnapshot | null
+  bpmStatus: string
   suppressProjectRemovalSync: boolean
+}
+type SourceChunkState = 'queued' | 'uploading' | 'retrying' | 'ready' | 'failed'
+interface SourceChunkProgressItem {
+  index: number
+  state: SourceChunkState
+  attempts: number
+}
+interface SourceChunkProgressSnapshot {
+  phase: 'decoding' | 'uploading' | 'chunks-ready' | 'consolidating' | 'ready' | 'failed'
+  chunks: SourceChunkProgressItem[]
+  message?: string
+}
+interface UploadedSourceChunk {
+  plan: SourceChunkPlan
+  uploadName: string
+  sample: SampleMeta
+  region?: NexusEntity<'audioRegion'>
+  sampleEntity?: NexusEntity<'sample'>
+  automationCollection?: NexusEntity<'automationCollection'>
+}
+interface SourceChunkGroup {
+  sessionId: number
+  placement: DeckInsertionPlacement
+  fileName: string
+  durationSeconds: number
+  totalChunks: number
+  chunks: UploadedSourceChunk[]
+  flattened: boolean
+  flattenFailed: boolean
+  presentation: SourceRegionPresentation | null
+}
+interface SourceRegionPresentation {
+  isEnabled: boolean
+  colorIndex: number
+  gain: number
+  fadeInDurationTicks: number
+  fadeInSlope: number
+  fadeOutDurationTicks: number
+  fadeOutSlope: number
+  pitchShiftSemitones: number
 }
 interface ManualBpmReportState {
   editing: boolean
@@ -362,6 +420,9 @@ let liveAudioSessionId = 0
 let liveAudioRecordingId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
 const sourceLoadAbortControllers: [AbortController | null, AbortController | null] = [null, null]
+const sourceLoadSessionIds: [number, number] = [0, 0]
+const sourceChunkGroups: [SourceChunkGroup | null, SourceChunkGroup | null] = [null, null]
+let sourceUploadSettings: SourceUploadSettings = { ...loadSourceUploadSettings(localStorage) }
 const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
   { editing: false, pending: false, requestId: 0 },
   { editing: false, pending: false, requestId: 0 },
@@ -377,14 +438,14 @@ const musicLibraryPickerStates: [MusicLibraryPickerState, MusicLibraryPickerStat
   },
 ]
 const deckOperationStates: [DeckOperationState, DeckOperationState, DeckOperationState] = [
-  { pendingCount: 0, activeKind: null, uploadProgress: null, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, uploadProgress: null, suppressProjectRemovalSync: false },
-  { pendingCount: 0, activeKind: null, uploadProgress: null, suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploadProgress: null, chunkProgress: null, bpmStatus: '', suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploadProgress: null, chunkProgress: null, bpmStatus: '', suppressProjectRemovalSync: false },
+  { pendingCount: 0, activeKind: null, uploadProgress: null, chunkProgress: null, bpmStatus: '', suppressProjectRemovalSync: false },
 ]
 const decks: [DeckState, DeckState, DeckState] = [
-  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
-  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, detectedBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, detectedBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
+  { audioCtx: null, audioBuffer: null, cueLoadId: 0, audioFootprint: null, cuePoints: [null, null, null, null, null], cuePosition: 0, cueLoading: false, scheduledCuePosition: 0, cuePersistenceWarning: false, fileName: null, baseBpm: null, pitchPercent: 0, playbackRate: 1, tempoPercent: 0, tempoRange: 10, tempoSync: false, tempoUpdatePending: false, pendingTempoPercent: null, tempoWorker: null, tempoReconcileScheduled: false, lastAppliedTiming: null, volume: 0.8, gainTrim: 1, sampleBpm: null, detectedBpm: null, regionEntity: null, sampleMeta: null, trackEntity: null, audioDeviceEntity: null, mixerChannelEntity: null, sampleEntity: null, automationCollectionEntity: null, cableEntity: null, fxGraph: null, contentSubscriptions: [], routingSubscriptions: [] },
 ]
 
 const guardedRegionRemovalIds = new Set<string>()
@@ -1126,6 +1187,10 @@ function resetTempoMasterSession() {
     controller?.abort(new Error('Project session ended'))
     sourceLoadAbortControllers[deckIndex] = null
     deckOperationStates[deckIndex].uploadProgress = null
+    deckOperationStates[deckIndex].chunkProgress = null
+    deckOperationStates[deckIndex].bpmStatus = ''
+    sourceLoadSessionIds[deckIndex] += 1
+    sourceChunkGroups[deckIndex] = null
   })
   tempoSessionId += 1
   projectConnected = false
@@ -1955,6 +2020,7 @@ function clearDeckContentEntities(deck: DeckState) {
   deck.contentSubscriptions.forEach((subscription) => subscription.terminate())
   deck.contentSubscriptions = []
   deck.sampleBpm = null
+  deck.detectedBpm = null
   deck.sampleMeta = null
   deck.regionEntity = null
   deck.sampleEntity = null
@@ -2458,6 +2524,7 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
   const loaded = isCueDeckLoaded(deckIndex)
   const operationPending = deckOperationStates[deckIndex].pendingCount > 0
     || deck.tempoUpdatePending
+    || (deckIndex < 2 && sourceChunkGroups[deckIndex as 0 | 1] !== null)
   const ready = projectConnected
     && loaded
     && deck.audioFootprint !== null
@@ -2497,7 +2564,9 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
             : 'CHOOSE A SOURCE BAR · SET A PAD OR SELECT A SAVED CUE TO SCHEDULE IT'
           : 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
         : loaded
-          ? 'CUES UNAVAILABLE'
+          ? deckIndex < 2 && sourceChunkGroups[deckIndex as 0 | 1]?.flattenFailed
+            ? 'CUES UNAVAILABLE UNTIL PLAYABLE CHUNKS ARE CONSOLIDATED'
+            : 'CUES UNAVAILABLE'
           : 'LOAD A TRACK TO ADD CUES'
   controls.pads.forEach(({ trigger, clear }, slot) => {
     const point = deck.cuePoints[slot]
@@ -3027,14 +3096,50 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const assistant = el<HTMLDivElement>(`deck${deckIndex + 1}-bpm-dialogue`)
   const uploadProgress = el<HTMLDivElement>(`deck${deckIndex + 1}-upload-progress`)
   const uploadStatus = el<HTMLSpanElement>(`deck${deckIndex + 1}-upload-status`)
-  const progressText = uploadProgressText(operation.uploadProgress)
+  const uploadBpmStatus = el<HTMLSpanElement>(`deck${deckIndex + 1}-upload-bpm-status`)
+  const uploadSegments = el<HTMLSpanElement>(`deck${deckIndex + 1}-upload-segments`)
+  const chunkProgress = operation.chunkProgress
+  const aggregate = chunkProgress
+    ? aggregateChunkProgress(chunkProgress.chunks, chunkProgress.phase)
+    : null
+  const progressText = chunkProgress
+    ? chunkProgress.message ?? (
+        chunkProgress.phase === 'decoding'
+          ? 'DECODING SOURCE AUDIO'
+          : chunkProgress.phase === 'consolidating'
+            ? `CONSOLIDATING · ${aggregate?.ready ?? 0}/${aggregate?.total ?? 0} CHUNKS READY`
+            : chunkProgress.phase === 'ready'
+              ? 'CONSOLIDATED TRACK READY'
+              : chunkProgress.phase === 'failed'
+                ? 'CHUNK LOAD FAILED'
+                : `${aggregate?.ready ?? 0}/${aggregate?.total ?? 0} CHUNKS READY${aggregate?.retrying ? ` · ${aggregate.retrying} RETRYING` : ''}`
+      )
+    : uploadProgressText(operation.uploadProgress)
 
   zone.classList.toggle('loaded', loaded)
   zone.classList.toggle('pending', pending)
   zone.setAttribute('aria-disabled', String(pending))
   assistant.setAttribute('aria-busy', String(progressText !== ''))
-  uploadProgress.hidden = progressText === ''
+  uploadProgress.hidden = progressText === '' && operation.bpmStatus === ''
   uploadStatus.textContent = progressText
+  uploadBpmStatus.textContent = operation.bpmStatus
+  uploadBpmStatus.hidden = operation.bpmStatus === ''
+  uploadSegments.replaceChildren()
+  if (chunkProgress?.chunks.length) {
+    chunkProgress.chunks
+      .slice()
+      .sort((left, right) => left.index - right.index)
+      .forEach((chunk) => {
+        const segment = document.createElement('span')
+        segment.className = `deck-upload-segment is-${chunk.state}`
+        segment.title = `Chunk ${chunk.index + 1}: ${chunk.state}${chunk.attempts > 1 ? ` (attempt ${chunk.attempts})` : ''}`
+        uploadSegments.append(segment)
+      })
+  } else if (progressText) {
+    const bar = document.createElement('span')
+    bar.className = 'deck-upload-progress-bar'
+    uploadSegments.append(bar)
+  }
   filename.textContent = loaded ? deck.fileName ?? '' : ''
   const bpm = loaded ? normalizeBpm(deck.sampleBpm ?? deck.baseBpm) : null
   metadataBpm.textContent = bpm === null ? '—' : String(bpm)
@@ -3055,7 +3160,9 @@ function clearSourceDeckLocalMedia(deckIndex: 0 | 1) {
   deck.audioBuffer = null
   deck.fileName = null
   deck.baseBpm = null
+  deck.detectedBpm = null
   deck.playbackRate = 1
+  sourceChunkGroups[deckIndex] = null
 }
 
 function clearMagicDeckLocalMedia() {
@@ -3065,6 +3172,7 @@ function clearMagicDeckLocalMedia() {
   magicDeck.fileName = null
   magicDeck.baseBpm = null
   magicDeck.sampleBpm = null
+  magicDeck.detectedBpm = null
   magicDeck.sampleMeta = null
   magicDeck.playbackRate = 1
   magicWaveformPeaks = null
@@ -3983,6 +4091,7 @@ async function applyManualSourceBpm(deckIndex: 0 | 1, correctedBpm: number) {
       )
       deck.sampleBpm = correctedBpm
       deck.baseBpm = correctedBpm
+      deck.detectedBpm = null
       deck.tempoPercent = transactionResult.desiredPercent
       deck.playbackRate = tempoPercentToPlaybackRate(transactionResult.desiredPercent)
       if (deck.tempoSync) {
@@ -4015,7 +4124,11 @@ function setupManualBpmReport(deckIndex: 0 | 1) {
   const deckNum = deckIndex + 1
 
   controls.trigger.onclick = () => {
-    const bpm = normalizeBpm(decks[deckIndex].sampleBpm ?? decks[deckIndex].baseBpm)
+    const bpm = normalizeBpm(
+      decks[deckIndex].detectedBpm?.bpm
+      ?? decks[deckIndex].sampleBpm
+      ?? decks[deckIndex].baseBpm,
+    )
     if (!canReportManualBpm(deckIndex) || !isSupportedBpm(bpm)) {
       setStatus('error', `DECK ${deckNum}: SOURCE BPM CANNOT BE REPORTED WITHOUT AN ACTIVE PROJECT REGION`)
       updateManualBpmReportUi(deckIndex)
@@ -4185,7 +4298,7 @@ function knobValueToEqDb(value: number) {
 }
 
 async function startSampleUpload(
-  file: File,
+  file: File | Blob | ArrayBuffer,
   displayName: string,
   bpm?: number,
   description?: string,
@@ -4237,6 +4350,72 @@ async function decodeLocalAudioDuration(file: File, signal: AbortSignal) {
   } finally {
     await context.close().catch(() => undefined)
   }
+}
+
+async function decodeLocalAudio(file: File, signal: AbortSignal) {
+  if (signal.aborted) throw signal.reason
+  const context = new AudioContext()
+  try {
+    const decoded = await context.decodeAudioData(await file.arrayBuffer())
+    if (signal.aborted) throw signal.reason
+    if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.length < 1) {
+      throw new Error('Local audio could not be decoded')
+    }
+    return decoded
+  } finally {
+    await context.close().catch(() => undefined)
+  }
+}
+
+function abortableUploadWait(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('Upload cancelled'))
+      return
+    }
+    const timeoutId = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    const onAbort = () => {
+      window.clearTimeout(timeoutId)
+      reject(signal?.reason ?? new Error('Upload cancelled'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function cleanupRemoteSample(sampleName: string, signal?: AbortSignal) {
+  const client = at
+  if (!client) return
+  const removed = await client.samples.delete(sampleName, signal).catch(() => undefined)
+  if (removed instanceof Error) {
+    console.warn('[SOURCE_UPLOAD] Temporary sample cleanup:', removed)
+  }
+}
+
+function sourceUploadIsCurrent(
+  deckIndex: 0 | 1,
+  expectedSession: number,
+  loadSessionId: number,
+) {
+  return isCurrentSession(expectedSession, tempoSessionId)
+    && sourceLoadSessionIds[deckIndex] === loadSessionId
+    && nexus !== null
+    && projectConnected
+}
+
+function decodedAudioChannels(buffer: AudioBuffer) {
+  return Array.from({ length: buffer.numberOfChannels }, (_, channel) =>
+    new Float32Array(buffer.getChannelData(channel)))
+}
+
+function sourceWavFile(
+  channels: readonly Float32Array[],
+  sampleRate: number,
+  name: string,
+) {
+  return new File([encodePcm16Wav(channels, sampleRate)], name, { type: 'audio/wav' })
 }
 
 function resolveInsertedProjectEntities(region: NexusEntity<'audioRegion'>, t: SafeTransactionBuilder) {
@@ -4341,7 +4520,10 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
   const operation = deckOperationStates[deckIndex]
   const region = decks[deckIndex].regionEntity
   const available = projectConnected && nexus !== null && region !== null
-  const pending = operation.pendingCount > 0
+  const retainedChunkGroup = deckIndex < 2
+    ? sourceChunkGroups[deckIndex as 0 | 1]
+    : null
+  const pending = operation.pendingCount > 0 || retainedChunkGroup !== null
   const outgoingValue = controls.crossfadeFrom.value
   const outgoingDeckIndex = outgoingValue === ''
     ? null
@@ -4371,6 +4553,10 @@ function renderDeckTransport(deckIndex: WaveformDeckIndex) {
 
   if (!region) {
     controls.status.textContent = 'EMPTY'
+    return
+  }
+  if (retainedChunkGroup?.flattenFailed) {
+    controls.status.textContent = 'PLAYABLE CHUNKS · FLATTEN FAILED'
     return
   }
   if (!region.fields.region.fields.isEnabled.value) {
@@ -5833,6 +6019,307 @@ async function removePendingSourceInsertion(
   })
 }
 
+function captureSourceRegionPresentation(deckIndex: 0 | 1): SourceRegionPresentation | null {
+  const region = decks[deckIndex].regionEntity
+  if (!region) return null
+  return {
+    isEnabled: region.fields.region.fields.isEnabled.value,
+    colorIndex: region.fields.region.fields.colorIndex.value,
+    gain: region.fields.gain.value,
+    fadeInDurationTicks: region.fields.fadeInDurationTicks.value,
+    fadeInSlope: region.fields.fadeInSlope.value,
+    fadeOutDurationTicks: region.fields.fadeOutDurationTicks.value,
+    fadeOutSlope: region.fields.fadeOutSlope.value,
+    pitchShiftSemitones: region.fields.pitchShiftSemitones.value,
+  }
+}
+
+function applySourceRegionPresentation(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+  presentation: SourceRegionPresentation | null,
+  includeFadeIn: boolean,
+  includeFadeOut: boolean,
+) {
+  if (!presentation) return
+  const durationTicks = region.fields.region.fields.durationTicks.value
+  t.update(region.fields.region.fields.isEnabled, presentation.isEnabled)
+  t.update(region.fields.region.fields.colorIndex, presentation.colorIndex)
+  t.update(region.fields.gain, presentation.gain)
+  t.update(region.fields.fadeInDurationTicks, includeFadeIn
+    ? Math.min(durationTicks, presentation.fadeInDurationTicks)
+    : 0)
+  t.update(region.fields.fadeInSlope, presentation.fadeInSlope)
+  t.update(region.fields.fadeOutDurationTicks, includeFadeOut
+    ? Math.min(durationTicks, presentation.fadeOutDurationTicks)
+    : 0)
+  t.update(region.fields.fadeOutSlope, presentation.fadeOutSlope)
+  t.update(region.fields.timestretchMode, 2)
+  t.update(region.fields.pitchShiftSemitones, presentation.pitchShiftSemitones)
+}
+
+function applyForwardInsertionCollisionPlan(
+  t: SafeTransactionBuilder,
+  track: NexusEntity<'audioTrack'>,
+  positionTicks: number,
+  ignoredRegionIds: ReadonlySet<string>,
+  removedRegionIds: string[],
+) {
+  const destinationRegions = t.entities
+    .ofTypes('audioRegion')
+    .get()
+    .filter((region) =>
+      region.fields.track.value.entityId === track.id
+      && !ignoredRegionIds.has(region.id))
+  const collisionPlan = planForwardTimelineInsertion(
+    destinationRegions.map(regionSnapshot),
+    positionTicks,
+  )
+  if (collisionPlan.kind === 'reject') {
+    throw new Error(collisionPlan.reason === 'region-starts-at-boundary'
+      ? 'A deck region already starts at the selected bar; choose a later bar'
+      : 'The selected bar is before this deck’s latest insertion; choose a later bar')
+  }
+  collisionPlan.truncate.forEach((truncation) => {
+    const region = t.entities.ofTypes('audioRegion').getEntity(truncation.id)
+    if (!region || region.fields.track.value.entityId !== track.id) {
+      throw new Error('Destination deck content changed during collision planning')
+    }
+    t.update(region.fields.region.fields.durationTicks, truncation.durationTicks)
+    if (region.fields.fadeInDurationTicks.value !== truncation.fadeInDurationTicks) {
+      t.update(region.fields.fadeInDurationTicks, truncation.fadeInDurationTicks)
+    }
+    if (region.fields.fadeOutDurationTicks.value !== truncation.fadeOutDurationTicks) {
+      t.update(region.fields.fadeOutDurationTicks, truncation.fadeOutDurationTicks)
+    }
+  })
+  collisionPlan.removeRegionIds.forEach((regionId) => {
+    const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+    if (!region || region.fields.track.value.entityId !== track.id) {
+      throw new Error('Destination deck content changed during collision planning')
+    }
+    guardedRegionRemovalIds.add(regionId)
+    removedRegionIds.push(regionId)
+    t.remove(region)
+  })
+}
+
+async function insertSourceChunkSet(
+  deckIndex: 0 | 1,
+  chunks: UploadedSourceChunk[],
+  group: SourceChunkGroup,
+  replaceExisting: boolean,
+  expectedSession: number,
+  loadSessionId: number,
+) {
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  const operation = deckOperationStates[deckIndex]
+  if (!projectDocument || !sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+    throw new Error('Project connection changed before chunk insertion')
+  }
+  const expectedTrackId = deck.trackEntity?.id
+  if (!expectedTrackId) throw new Error('Deck routing is unavailable')
+  const removedRegionIds: string[] = []
+  operation.suppressProjectRemovalSync = true
+  try {
+    const inserted = await serializeSourceTiming(() => projectDocument.modify((t) => {
+      if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+        throw new Error('Project connection changed during chunk insertion')
+      }
+      const targetTrack = t.entities.ofTypes('audioTrack').getEntity(expectedTrackId)
+      if (!targetTrack) throw new Error('Deck track changed before chunk insertion')
+      const replacementRegion = replaceExisting && deck.regionEntity
+        ? t.entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
+        : undefined
+      const replacementIds = new Set<string>()
+      if (replacementRegion) {
+        sourceDeckInstanceRegions(t.entities, deckIndex, replacementRegion).forEach((region) => {
+          replacementIds.add(region.id)
+          guardedRegionRemovalIds.add(region.id)
+          removedRegionIds.push(region.id)
+        })
+        removeDeckContentInTransaction(
+          t,
+          replacementRegion.id,
+          deck.sampleEntity?.id,
+          deck.automationCollectionEntity?.id,
+          deckIndex,
+        )
+      }
+      if (replaceExisting) {
+        applyForwardInsertionCollisionPlan(
+          t,
+          targetTrack,
+          group.placement.positionTicks,
+          replacementIds,
+          removedRegionIds,
+        )
+      }
+      const projectBpm = normalizeBpm(currentProjectBpm)
+      if (!isSupportedBpm(projectBpm)) throw new Error('Project BPM is outside the supported range')
+      return chunks
+        .slice()
+        .sort((left, right) => left.plan.startFrame - right.plan.startFrame)
+        .map((chunk) => {
+          const startTicks = secondsToTicks(chunk.plan.startSeconds, projectBpm)
+          const endTicks = secondsToTicks(
+            chunk.plan.startSeconds + chunk.plan.durationSeconds,
+            projectBpm,
+          )
+          const durationTicks = Math.max(1, endTicks - startTicks)
+          const region = t.insertSample(chunk.sample, {
+            sample: { musicDurationTicks: durationTicks },
+            region: {
+              positionTicks: group.placement.positionTicks + startTicks,
+              durationTicks,
+            },
+            attachTo: targetTrack,
+            displayName: `DECK ${deckIndex + 1} — ${group.fileName} · PART ${chunk.plan.index + 1}/${group.totalChunks}`,
+          })
+          const isFirst = chunk.plan.startFrame === 0
+          const isLast = chunk.plan.index === group.totalChunks - 1
+          applySourceRegionPresentation(t, region, group.presentation, isFirst, isLast)
+          const entities = resolveInsertedProjectEntities(region, t)
+          return { chunk, region, ...entities }
+        })
+    }))
+    inserted.forEach(({ chunk, region, sample, automationCollection }) => {
+      chunk.region = region
+      chunk.sampleEntity = sample
+      chunk.automationCollection = automationCollection
+    })
+    return inserted
+  } finally {
+    removedRegionIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
+    operation.suppressProjectRemovalSync = false
+  }
+}
+
+function bindPlayableSourceChunkGroup(
+  deckIndex: 0 | 1,
+  group: SourceChunkGroup,
+  decoded: AudioBuffer,
+  expectedSession: number,
+) {
+  const projectDocument = nexus
+  const opening = group.chunks.find((chunk) => chunk.plan.startFrame === 0 && chunk.region)
+    ?? group.chunks.find((chunk) => chunk.region)
+  if (!projectDocument || !opening?.region || !opening.sampleEntity || !opening.automationCollection) {
+    throw new Error('Playable chunk group has no synchronized region')
+  }
+  const deck = decks[deckIndex]
+  deck.fileName = group.fileName
+  deck.audioBuffer = decoded
+  deck.sampleMeta = { ...opening.sample, durationSeconds: group.durationSeconds }
+  deck.sampleBpm = normalizeBpm(currentProjectBpm)
+  deck.baseBpm = normalizeBpm(currentProjectBpm)
+  bindDeckContentGraph(deckIndex, projectDocument, {
+    region: opening.region,
+    sample: opening.sampleEntity,
+    automationCollection: opening.automationCollection,
+  }, expectedSession)
+  updateSourceDeckUi(deckIndex)
+}
+
+async function removeIncompleteSourceChunkGroup(
+  deckIndex: 0 | 1,
+  group: SourceChunkGroup,
+  expectedSession: number,
+  loadSessionId: number,
+) {
+  const projectDocument = nexus
+  const inserted = group.chunks.filter((chunk) => chunk.region)
+  if (
+    projectDocument
+    && inserted.length
+    && sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)
+  ) {
+    const guardedIds = inserted.map((chunk) => chunk.region!.id)
+    guardedIds.forEach((regionId) => guardedRegionRemovalIds.add(regionId))
+    try {
+      await serializeSourceTiming(() => projectDocument.modify((t) => {
+        inserted.forEach((chunk) => {
+          if (chunk.region) removeDeckContentInTransaction(t, chunk.region.id, undefined, undefined)
+        })
+      }))
+    } finally {
+      guardedIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
+    }
+  }
+  await Promise.allSettled(group.chunks.map((chunk) => cleanupRemoteSample(chunk.uploadName)))
+  if (inserted.some((chunk) => chunk.region?.id === decks[deckIndex].regionEntity?.id)) {
+    clearDeckContentEntities(decks[deckIndex])
+    clearSourceDeckLocalMedia(deckIndex)
+    updateSourceDeckUi(deckIndex)
+  }
+  if (sourceChunkGroups[deckIndex] === group) sourceChunkGroups[deckIndex] = null
+}
+
+async function flattenSourceChunkGroup(
+  deckIndex: 0 | 1,
+  group: SourceChunkGroup,
+  consolidatedSample: SampleMeta,
+  decoded: AudioBuffer,
+  expectedSession: number,
+  loadSessionId: number,
+) {
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  if (!projectDocument || !sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+    throw new Error('Project connection changed before consolidation')
+  }
+  const trackId = deck.trackEntity?.id
+  if (!trackId) throw new Error('Deck track changed before consolidation')
+  const guardedIds = group.chunks.flatMap((chunk) => chunk.region ? [chunk.region.id] : [])
+  guardedIds.forEach((regionId) => guardedRegionRemovalIds.add(regionId))
+  deckOperationStates[deckIndex].suppressProjectRemovalSync = true
+  try {
+    const inserted = await serializeSourceTiming(() => projectDocument.modify((t) => {
+      const targetTrack = t.entities.ofTypes('audioTrack').getEntity(trackId)
+      if (!targetTrack) throw new Error('Deck track changed during consolidation')
+      group.chunks.forEach((chunk) => {
+        if (chunk.region) removeDeckContentInTransaction(t, chunk.region.id, undefined, undefined)
+      })
+      const projectBpm = normalizeBpm(currentProjectBpm)
+      if (!isSupportedBpm(projectBpm)) throw new Error('Project BPM is outside the supported range')
+      const durationTicks = secondsToTicks(group.durationSeconds, projectBpm)
+      const region = t.insertSample(consolidatedSample, {
+        sample: { musicDurationTicks: durationTicks },
+        region: {
+          positionTicks: group.placement.positionTicks,
+          durationTicks,
+        },
+        attachTo: targetTrack,
+        displayName: `DECK ${deckIndex + 1} — ${group.fileName}`,
+      })
+      applySourceRegionPresentation(t, region, group.presentation, true, true)
+      return { region, ...resolveInsertedProjectEntities(region, t) }
+    }))
+    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+      throw new Error('Project connection changed after consolidation')
+    }
+    group.flattened = true
+    deck.fileName = group.fileName
+    deck.audioBuffer = decoded
+    deck.sampleMeta = consolidatedSample
+    deck.sampleBpm = normalizeBpm(currentProjectBpm)
+    deck.baseBpm = normalizeBpm(currentProjectBpm)
+    bindDeckContentGraph(deckIndex, projectDocument, {
+      region: inserted.region,
+      sample: inserted.sample,
+      automationCollection: inserted.automationCollection,
+    }, expectedSession)
+    sourceChunkGroups[deckIndex] = null
+    updateSourceDeckUi(deckIndex)
+    await Promise.allSettled(group.chunks.map((chunk) => cleanupRemoteSample(chunk.uploadName)))
+    return inserted
+  } finally {
+    guardedIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
+    deckOperationStates[deckIndex].suppressProjectRemovalSync = false
+  }
+}
+
 function logSourceBpmDiscrepancy(
   deckNum: number,
   resolution: BpmResolution,
@@ -5888,6 +6375,454 @@ async function resolutionFromBpmDecision(
 }
 
 async function uploadSourceToNexus(
+  deckIndex: 0 | 1,
+  file: File,
+  replacing: boolean,
+  expectedSession: number,
+  placement: DeckInsertionPlacement,
+) {
+  if (!nexus || !at) throw new Error('Connect an Audiotool project before loading audio')
+  pendingBpmResolutions[deckIndex]?.(null)
+  sourceLoadAbortControllers[deckIndex]?.abort(new Error('Superseded by a newer deck load'))
+  const deckNum = deckIndex + 1
+  const deck = decks[deckIndex]
+  const operation = deckOperationStates[deckIndex]
+  const abortController = new AbortController()
+  const loadSessionId = sourceLoadSessionIds[deckIndex] + 1
+  sourceLoadSessionIds[deckIndex] = loadSessionId
+  sourceLoadAbortControllers[deckIndex] = abortController
+  operation.uploadProgress = null
+  operation.bpmStatus = 'DETECTING BPM · UPLOAD CONTINUES'
+  const startedAt = performance.now()
+  const structuredTiming: {
+    decodeMs?: number
+    attempts: Array<Record<string, unknown>>
+    firstPlayableMs?: number
+    allChunksReadyMs?: number
+    consolidationMs?: number
+    bpmMs?: number
+    finalReadyMs?: number
+    bpm?: BpmResolution | null
+  } = { attempts: [] }
+  let metadataSettled = false
+  let resolveMetadata!: (bpm: number | null) => void
+  let rejectMetadata!: (error: unknown) => void
+  const metadataBpm = new Promise<number | null>((resolve, reject) => {
+    resolveMetadata = resolve
+    rejectMetadata = reject
+  })
+  const settleMetadata = (bpm: number | null) => {
+    if (metadataSettled) return
+    metadataSettled = true
+    resolveMetadata(bpm)
+  }
+  const failMetadata = (error: unknown) => {
+    if (metadataSettled) return
+    metadataSettled = true
+    rejectMetadata(error)
+  }
+  let pipelineReadySettled = false
+  let resolvePipelineReady!: (ready: boolean) => void
+  const pipelineReady = new Promise<boolean>((resolve) => { resolvePipelineReady = resolve })
+  const settlePipelineReady = (ready: boolean) => {
+    if (pipelineReadySettled) return
+    pipelineReadySettled = true
+    resolvePipelineReady(ready)
+  }
+  const aubioPromise = requestAubioBpm(file, abortController.signal)
+  const bpmWorkflow = resolveBpmRace(
+    metadataBpm,
+    aubioPromise,
+    {
+      minimum: MIN_SUPPORTED_BPM,
+      maximum: MAX_SUPPORTED_BPM,
+      confidenceThreshold: AUBIO_AUTO_ACCEPT_CONFIDENCE,
+    },
+  ).then(async (decision) => {
+    const resolution = await resolutionFromBpmDecision(deckNum, decision, expectedSession)
+    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) return null
+    structuredTiming.bpmMs = performance.now() - startedAt
+    structuredTiming.bpm = resolution
+    if (!resolution) {
+      operation.bpmStatus = 'BPM CONFIRMATION CANCELLED · NATIVE RATE RETAINED'
+      updateSourceDeckUi(deckIndex)
+      return null
+    }
+    deck.detectedBpm = resolution
+    if (resolution.source === 'manual' || resolution.source === 'project') {
+      operation.bpmStatus = `BPM ${resolution.bpm} CONFIRMED · WAITING TO APPLY`
+      updateSourceDeckUi(deckIndex)
+      const readyToRetime = await pipelineReady
+      if (!readyToRetime || !sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+        operation.bpmStatus = `BPM ${resolution.bpm} CONFIRMED · CHUNK GROUP KEPT AT NATIVE RATE`
+        updateSourceDeckUi(deckIndex)
+        return resolution
+      }
+      await applyManualSourceBpm(deckIndex, resolution.bpm)
+      operation.bpmStatus = `BPM ${resolution.bpm} APPLIED · LOGICAL TRACK RETIMED`
+    } else {
+      operation.bpmStatus = `BPM ${resolution.bpm} ${resolution.source === 'aubio' ? 'DETECTED' : 'FROM AUDIOTOOL'} · USE REPORT BPM TO APPLY`
+    }
+    updateSourceDeckUi(deckIndex)
+    return resolution
+  }).catch((error: unknown) => {
+    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) return null
+    const message = error instanceof Error ? error.message : String(error)
+    operation.bpmStatus = `BPM ANALYSIS FAILED · ${message.toUpperCase()}`
+    updateSourceDeckUi(deckIndex)
+    return null
+  }).finally(() => {
+    if (sourceLoadAbortControllers[deckIndex] === abortController && pipelineReadySettled) {
+      sourceLoadAbortControllers[deckIndex] = null
+    }
+  })
+
+  const logStructuredResult = (details: Record<string, unknown>) => {
+    void bpmWorkflow.finally(() => {
+      console.info('[SOURCE_UPLOAD_RESULT]', {
+        deck: deckNum,
+        fileName: file.name,
+        replacement: replacing,
+        settings: { ...sourceUploadSettings },
+        timings: structuredTiming,
+        ...details,
+      })
+    })
+  }
+  const updateChunkProgress = (snapshot: SourceChunkProgressSnapshot) => {
+    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) return
+    operation.chunkProgress = snapshot
+    updateSourceDeckUi(deckIndex)
+  }
+
+  updateChunkProgress({ phase: 'decoding', chunks: [], message: 'DECODING SOURCE · DETECTING BPM' })
+  showBpmAnalyzing(deckNum)
+  setStatus('connected', `DECK ${deckNum}: DECODING ${file.name} · BPM RUNNING ASYNCHRONOUSLY…`)
+  let group: SourceChunkGroup | null = null
+  try {
+    const projectDocument = nexus
+    if (!projectDocument) throw new Error('Project connection changed before routing preparation')
+    const graph = await ensureDeckRoutingGraph(projectDocument, deckIndex, expectedSession)
+    if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+      throw new Error('Project connection changed during routing preparation')
+    }
+    bindDeckRoutingGraph(deckIndex, projectDocument, graph.routing, expectedSession)
+    if (graph.content && !deck.regionEntity) {
+      bindDeckContentGraph(deckIndex, projectDocument, graph.content, expectedSession)
+    }
+    const presentation = captureSourceRegionPresentation(deckIndex)
+    const cueTemplate = [...deck.cuePoints]
+    const decodeStartedAt = performance.now()
+    const decoded = await decodeLocalAudio(file, abortController.signal)
+    structuredTiming.decodeMs = performance.now() - decodeStartedAt
+    const channels = decodedAudioChannels(decoded)
+    const plans = planSourceChunks({
+      durationFrames: decoded.length,
+      sampleRate: decoded.sampleRate,
+      cueSlots: cueTemplate,
+      maximumSeconds: sourceUploadSettings.chunkDurationSeconds,
+      chunkingEnabled: sourceUploadSettings.chunkingEnabled,
+    })
+    const prioritizedPlans = prioritizeSourceChunks(plans)
+    const chunkProgress: SourceChunkProgressItem[] = plans.map((plan) => ({
+      index: plan.index,
+      state: 'queued',
+      attempts: 0,
+    }))
+    group = {
+      sessionId: loadSessionId,
+      placement,
+      fileName: file.name,
+      durationSeconds: decoded.duration,
+      totalChunks: plans.length,
+      chunks: [],
+      flattened: false,
+      flattenFailed: false,
+      presentation,
+    }
+    sourceChunkGroups[deckIndex] = group
+    updateChunkProgress({ phase: 'uploading', chunks: chunkProgress })
+    setStatus('connected', `DECK ${deckNum}: UPLOADING ${plans.length} CUE-AWARE WAV ${plans.length === 1 ? 'CHUNK' : 'CHUNKS'}…`)
+
+    const uploadOneChunk = async (plan: SourceChunkPlan) => {
+      const progress = chunkProgress[plan.index]
+      let currentUploadName: string | null = null
+      try {
+        const sample = await retryWithBackoff(async (attempt) => {
+          if (!sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+            throw new Error('Source upload session is stale')
+          }
+          progress.attempts = attempt
+          progress.state = attempt === 1 ? 'uploading' : 'retrying'
+          updateChunkProgress({ phase: 'uploading', chunks: chunkProgress })
+          const attemptStartedAt = performance.now()
+          const wav = sourceWavFile(
+            audioChannelsSlice(channels, plan.startFrame, plan.endFrame),
+            decoded.sampleRate,
+            `${file.name.replace(/\.[^.]+$/, '')}.part-${plan.index + 1}.wav`,
+          )
+          const upload = await startSampleUpload(
+            wav,
+            `DECK ${deckNum} — ${file.name} · PART ${plan.index + 1}/${plans.length}`,
+            undefined,
+            `Temporary cue-aware upload chunk ${plan.index + 1}/${plans.length}`,
+            abortController.signal,
+          )
+          currentUploadName = upload.name
+          const transferStartedAt = performance.now()
+          const uploaded = await upload.uploaded
+          if (uploaded instanceof Error) throw uploaded
+          const transferMs = performance.now() - transferStartedAt
+          const processingStartedAt = performance.now()
+          const ready = await upload.ready
+          if (ready instanceof Error) throw ready
+          structuredTiming.attempts.push({
+            kind: 'chunk',
+            chunk: plan.index,
+            attempt,
+            totalMs: performance.now() - attemptStartedAt,
+            transferMs,
+            processingMs: performance.now() - processingStartedAt,
+            outcome: 'ready',
+          })
+          currentUploadName = null
+          settleMetadata(normalizeBpm(ready.bpm))
+          return { plan, uploadName: upload.name, sample: ready } as UploadedSourceChunk
+        }, {
+          attempts: 3,
+          signal: abortController.signal,
+          wait: abortableUploadWait,
+          onFailure: async (error, attempt) => {
+            structuredTiming.attempts.push({
+              kind: 'chunk',
+              chunk: plan.index,
+              attempt,
+              outcome: 'failed',
+              error: error instanceof Error ? error.message : String(error),
+            })
+            if (currentUploadName) {
+              await cleanupRemoteSample(currentUploadName)
+              currentUploadName = null
+            }
+          },
+        })
+        group!.chunks.push(sample)
+        if (!replacing) {
+          await insertSourceChunkSet(
+            deckIndex,
+            [sample],
+            group!,
+            false,
+            expectedSession,
+            loadSessionId,
+          )
+          if (structuredTiming.firstPlayableMs === undefined) {
+            structuredTiming.firstPlayableMs = performance.now() - startedAt
+          }
+          bindPlayableSourceChunkGroup(deckIndex, group!, decoded, expectedSession)
+        }
+        progress.state = 'ready'
+        updateChunkProgress({ phase: 'uploading', chunks: chunkProgress })
+        return { ok: true as const, sample }
+      } catch (error) {
+        progress.state = 'failed'
+        updateChunkProgress({ phase: 'uploading', chunks: chunkProgress })
+        return { ok: false as const, error }
+      }
+    }
+
+    const results = await mapWithConcurrency(
+      prioritizedPlans,
+      sourceUploadSettings.uploadConcurrency,
+      uploadOneChunk,
+    )
+    const failed = results.filter((result) => !result.ok)
+    if (failed.length > 0) {
+      const failure = failed[0]
+      updateChunkProgress({
+        phase: 'failed',
+        chunks: chunkProgress,
+        message: `${failed.length} CHUNK ${failed.length === 1 ? 'FAILED' : 'FAILURES'} · INCOMPLETE GROUP REMOVED`,
+      })
+      await removeIncompleteSourceChunkGroup(
+        deckIndex,
+        group,
+        expectedSession,
+        loadSessionId,
+      )
+      failMetadata(failure.ok ? new Error('Chunk upload failed') : failure.error)
+      throw failure.ok ? new Error('Chunk upload failed') : failure.error
+    }
+    group.chunks.sort((left, right) => left.plan.startFrame - right.plan.startFrame)
+    structuredTiming.allChunksReadyMs = performance.now() - startedAt
+    updateChunkProgress({ phase: 'chunks-ready', chunks: chunkProgress })
+    if (replacing) {
+      await insertSourceChunkSet(
+        deckIndex,
+        group.chunks,
+        group,
+        true,
+        expectedSession,
+        loadSessionId,
+      )
+      structuredTiming.firstPlayableMs = performance.now() - startedAt
+      bindPlayableSourceChunkGroup(deckIndex, group, decoded, expectedSession)
+    }
+
+    updateChunkProgress({ phase: 'consolidating', chunks: chunkProgress })
+    setStatus('connected', `DECK ${deckNum}: ALL CHUNKS PLAYABLE · CONSOLIDATING FULL TRACK…`)
+    const consolidationStartedAt = performance.now()
+    let consolidationUploadName: string | null = null
+    let consolidatedSample: SampleMeta
+    try {
+      consolidatedSample = await retryWithBackoff(async (attempt) => {
+        const attemptStartedAt = performance.now()
+        const wav = sourceWavFile(
+          channels,
+          decoded.sampleRate,
+          `${file.name.replace(/\.[^.]+$/, '')}.consolidated.wav`,
+        )
+        const upload = await startSampleUpload(
+          wav,
+          `DECK ${deckNum} — ${file.name}`,
+          undefined,
+          'Client-consolidated cue-aware source upload',
+          abortController.signal,
+        )
+        consolidationUploadName = upload.name
+        const transferStartedAt = performance.now()
+        const uploaded = await upload.uploaded
+        if (uploaded instanceof Error) throw uploaded
+        const transferMs = performance.now() - transferStartedAt
+        const processingStartedAt = performance.now()
+        const ready = await upload.ready
+        if (ready instanceof Error) throw ready
+        structuredTiming.attempts.push({
+          kind: 'consolidation',
+          attempt,
+          totalMs: performance.now() - attemptStartedAt,
+          transferMs,
+          processingMs: performance.now() - processingStartedAt,
+          outcome: 'ready',
+        })
+        consolidationUploadName = null
+        settleMetadata(normalizeBpm(ready.bpm))
+        return ready
+      }, {
+        attempts: 3,
+        signal: abortController.signal,
+        wait: abortableUploadWait,
+        onFailure: async (error, attempt) => {
+          structuredTiming.attempts.push({
+            kind: 'consolidation',
+            attempt,
+            outcome: 'failed',
+            error: error instanceof Error ? error.message : String(error),
+          })
+          if (consolidationUploadName) {
+            await cleanupRemoteSample(consolidationUploadName)
+            consolidationUploadName = null
+          }
+        },
+      })
+    } catch (error) {
+      group.flattenFailed = true
+      structuredTiming.consolidationMs = performance.now() - consolidationStartedAt
+      settlePipelineReady(false)
+      updateChunkProgress({
+        phase: 'failed',
+        chunks: chunkProgress,
+        message: 'CONSOLIDATION FAILED · PLAYABLE CHUNKS RETAINED',
+      })
+      operation.bpmStatus = operation.bpmStatus || 'BPM ANALYSIS CONTINUES'
+      updateSourceDeckUi(deckIndex)
+      setStatus('error', `DECK ${deckNum}: CONSOLIDATION FAILED AFTER 3 ATTEMPTS — PLAYABLE CHUNKS RETAINED`)
+      logStructuredResult({
+        outcome: 'playable-chunks',
+        chunks: plans.length,
+        consolidationError: error instanceof Error ? error.message : String(error),
+      })
+      return true
+    }
+
+    try {
+      await flattenSourceChunkGroup(
+        deckIndex,
+        group,
+        consolidatedSample,
+        decoded,
+        expectedSession,
+        loadSessionId,
+      )
+    } catch (error) {
+      group.flattenFailed = true
+      await cleanupRemoteSample(consolidatedSample.name)
+      structuredTiming.consolidationMs = performance.now() - consolidationStartedAt
+      settlePipelineReady(false)
+      updateChunkProgress({
+        phase: 'failed',
+        chunks: chunkProgress,
+        message: 'FLATTEN SWAP FAILED · PLAYABLE CHUNKS RETAINED',
+      })
+      setStatus('error', `DECK ${deckNum}: FLATTEN SWAP FAILED — PLAYABLE CHUNKS RETAINED`)
+      logStructuredResult({
+        outcome: 'playable-chunks',
+        chunks: plans.length,
+        consolidationError: error instanceof Error ? error.message : String(error),
+      })
+      return true
+    }
+    structuredTiming.consolidationMs = performance.now() - consolidationStartedAt
+    structuredTiming.finalReadyMs = performance.now() - startedAt
+    settlePipelineReady(true)
+    updateChunkProgress({ phase: 'ready', chunks: chunkProgress })
+    window.setTimeout(() => {
+      if (sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+        operation.chunkProgress = null
+        updateSourceDeckUi(deckIndex)
+      }
+    }, 2500)
+    setStatus('connected', `DECK ${deckNum}: ${file.name} — CHUNKS JOINED AND FLATTENED ✓`)
+    logStructuredResult({ outcome: 'ready', chunks: plans.length })
+    return true
+  } catch (error) {
+    if (!abortController.signal.aborted) abortController.abort(error)
+    if (
+      group
+      && sourceChunkGroups[deckIndex] === group
+      && !group.chunks.some((chunk) => chunk.region)
+    ) {
+      await Promise.allSettled(group.chunks.map((chunk) => cleanupRemoteSample(chunk.uploadName)))
+      sourceChunkGroups[deckIndex] = null
+    }
+    failMetadata(error)
+    settlePipelineReady(false)
+    if (sourceUploadIsCurrent(deckIndex, expectedSession, loadSessionId)) {
+      operation.chunkProgress = {
+        phase: 'failed',
+        chunks: operation.chunkProgress?.chunks ?? [],
+        message: 'TRACK LOAD FAILED',
+      }
+      updateSourceDeckUi(deckIndex)
+    }
+    logStructuredResult({
+      outcome: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    })
+    throw error
+  } finally {
+    settlePipelineReady(false)
+    if (sourceLoadAbortControllers[deckIndex] === abortController) {
+      void bpmWorkflow.finally(() => {
+        if (sourceLoadAbortControllers[deckIndex] === abortController) {
+          sourceLoadAbortControllers[deckIndex] = null
+        }
+      })
+    }
+  }
+}
+
+async function uploadSourceToNexusLegacy(
   deckIndex: 0 | 1,
   file: File,
   replacing: boolean,
@@ -6219,21 +7154,40 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
     const regionId = deck.regionEntity?.id
     const storedSampleId = deck.sampleEntity?.id
     const storedAutomationCollectionId = deck.automationCollectionEntity?.id
+    const chunkGroup = sourceChunkGroups[deckIndex]
     if (!regionId) throw new Error('The synchronized project content is no longer available')
 
     operation.suppressProjectRemovalSync = true
     try {
       await projectDocument.modify((t) => {
-        removeDeckContentInTransaction(
-          t,
-          regionId,
-          storedSampleId,
-          storedAutomationCollectionId,
-          deckIndex,
-        )
+        if (chunkGroup && !chunkGroup.flattened) {
+          chunkGroup.chunks.forEach((chunk) => {
+            if (chunk.region) {
+              guardedRegionRemovalIds.add(chunk.region.id)
+              removeDeckContentInTransaction(t, chunk.region.id, undefined, undefined)
+            }
+          })
+        } else {
+          removeDeckContentInTransaction(
+            t,
+            regionId,
+            storedSampleId,
+            storedAutomationCollectionId,
+            deckIndex,
+          )
+        }
       })
       clearDeckContentEntities(deck)
+      if (chunkGroup) {
+        sourceChunkGroups[deckIndex] = null
+        void Promise.allSettled(
+          chunkGroup.chunks.map((chunk) => cleanupRemoteSample(chunk.uploadName)),
+        )
+      }
     } finally {
+      chunkGroup?.chunks.forEach((chunk) => {
+        if (chunk.region) guardedRegionRemovalIds.delete(chunk.region.id)
+      })
       operation.suppressProjectRemovalSync = false
     }
   })
@@ -7097,6 +8051,10 @@ function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPla
 
 async function unloadSourceDeck(deckIndex: 0 | 1) {
   if (!isSourceDeckSynchronized(deckIndex)) return
+  pendingBpmResolutions[deckIndex]?.(null)
+  sourceLoadAbortControllers[deckIndex]?.abort(new Error('Deck unloaded'))
+  sourceLoadAbortControllers[deckIndex] = null
+  sourceLoadSessionIds[deckIndex] += 1
   const expectedSession = tempoSessionId
   setStatus('connecting', `DECK ${deckIndex + 1}: UNLOADING — CLEARING PROJECT CONTENT…`)
   await removeDeckProjectContent(deckIndex, expectedSession)
@@ -7948,6 +8906,30 @@ function wireTransport(prefix: DeckPrefix, deckIndex: 0 | 1 | 2) {
   renderDeckTransport(deckIndex)
 }
 
+function setupSourceUploadSettings() {
+  const enabled = el<HTMLInputElement>('source-chunking-enabled')
+  const duration = el<HTMLInputElement>('source-chunk-duration')
+  const concurrency = el<HTMLInputElement>('source-upload-concurrency')
+  const render = () => {
+    enabled.checked = sourceUploadSettings.chunkingEnabled
+    duration.value = String(sourceUploadSettings.chunkDurationSeconds)
+    duration.disabled = !sourceUploadSettings.chunkingEnabled
+    concurrency.value = String(sourceUploadSettings.uploadConcurrency)
+  }
+  const persist = () => {
+    sourceUploadSettings = saveSourceUploadSettings(localStorage, {
+      chunkingEnabled: enabled.checked,
+      chunkDurationSeconds: Number(duration.value),
+      uploadConcurrency: Number(concurrency.value),
+    })
+    render()
+  }
+  enabled.addEventListener('change', persist)
+  duration.addEventListener('change', persist)
+  concurrency.addEventListener('change', persist)
+  render()
+}
+
 // ── INIT ──────────────────────────────────────────────────────────────────────
 function initApp() {
   document.addEventListener('dragover', (e) => e.preventDefault())
@@ -7998,6 +8980,7 @@ function initApp() {
   setupDeckLibraryPicker(1)
   renderMusicLibrarySetup()
   void restoreMusicLibrary()
+  setupSourceUploadSettings()
 
   setupDropZone('drop-1', 0)
   setupDropZone('drop-2', 1)

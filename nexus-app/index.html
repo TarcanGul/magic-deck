@@ -49,6 +49,17 @@
         <button id="btn-music-library-change" class="btn-danger is-hidden" type="button">CHANGE FOLDER</button>
         <input id="music-library-fallback" class="is-hidden" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav" webkitdirectory multiple />
       </div>
+      <div class="conn-row source-upload-settings" id="source-upload-settings">
+        <span class="conn-label">TRACK UPLOAD</span>
+        <label class="upload-setting-toggle"><input id="source-chunking-enabled" type="checkbox" checked> CHUNKS</label>
+        <label class="upload-setting-field">MAX
+          <input id="source-chunk-duration" type="number" min="10" max="120" step="1" value="30" inputmode="numeric" aria-label="Maximum source upload chunk duration in seconds">
+          SEC
+        </label>
+        <label class="upload-setting-field">PARALLEL
+          <input id="source-upload-concurrency" type="number" min="1" max="6" step="1" value="3" inputmode="numeric" aria-label="Parallel source upload count">
+        </label>
+      </div>
       <!-- Hidden inputs still in DOM for JS refs -->
       <input type="hidden" id="input-client-id" value="fa370480-13d6-4cba-8015-f9297a81e9e8">
       <div class="conn-actions">
@@ -194,8 +205,9 @@
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck1-bpm-title"></div>
               </div>
               <div class="deck-upload-progress deck-assistant-normal" id="deck1-upload-progress" role="status" aria-live="polite" hidden>
-                <span class="deck-upload-progress-track" aria-hidden="true"><span class="deck-upload-progress-bar"></span></span>
+                <span class="deck-upload-progress-track" id="deck1-upload-segments" aria-hidden="true"><span class="deck-upload-progress-bar"></span></span>
                 <span class="deck-upload-progress-status" id="deck1-upload-status"></span>
+                <span class="deck-upload-bpm-status" id="deck1-upload-bpm-status"></span>
               </div>
               <div class="bpm-dialogue-form deck-assistant-normal is-hidden" id="deck1-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck1-bpm-hint"></div>
@@ -397,8 +409,9 @@
                 <div class="bpm-dialogue-title bpm-dialogue-title-idle deck-assistant-normal" id="deck2-bpm-title"></div>
               </div>
               <div class="deck-upload-progress deck-assistant-normal" id="deck2-upload-progress" role="status" aria-live="polite" hidden>
-                <span class="deck-upload-progress-track" aria-hidden="true"><span class="deck-upload-progress-bar"></span></span>
+                <span class="deck-upload-progress-track" id="deck2-upload-segments" aria-hidden="true"><span class="deck-upload-progress-bar"></span></span>
                 <span class="deck-upload-progress-status" id="deck2-upload-status"></span>
+                <span class="deck-upload-bpm-status" id="deck2-upload-bpm-status"></span>
               </div>
               <div class="bpm-dialogue-form deck-assistant-normal is-hidden" id="deck2-bpm-form">
                 <div class="bpm-dialogue-hint" id="deck2-bpm-hint"></div>

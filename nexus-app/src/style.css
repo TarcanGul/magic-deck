@@ -80,6 +80,27 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   letter-spacing: 1px;
 }
 .music-library-summary .dot { display: inline-block; }
+.source-upload-settings { flex-basis: 100%; }
+.upload-setting-toggle,
+.upload-setting-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 9px;
+  letter-spacing: 1px;
+}
+.upload-setting-toggle input { accent-color: var(--red); }
+.upload-setting-field input {
+  width: 54px;
+  border: 1px solid var(--grey-light);
+  background: var(--black);
+  color: var(--white);
+  padding: 3px 5px;
+  font-family: var(--font-data);
+  font-size: 10px;
+}
 
 .btn-primary, .btn-danger { font-family: var(--font-header); font-size: 13px; letter-spacing: 2px; padding: 5px 14px; border: none; cursor: pointer; transition: all 0.15s; }
 .btn-primary { background: var(--red); color: var(--white); }
@@ -589,6 +610,8 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 .deck-upload-progress[hidden] { display: none; }
 .deck-upload-progress-track {
+  display: flex;
+  gap: 1px;
   height: 4px;
   overflow: hidden;
   border: 1px solid var(--red-dim);
@@ -604,6 +627,16 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   box-shadow: 0 0 8px var(--red-glow);
   animation: deck-upload-progress-slide 1.15s ease-in-out infinite alternate;
 }
+.deck-upload-segment {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 100%;
+  background: var(--grey-light);
+}
+.deck-upload-segment.is-uploading,
+.deck-upload-segment.is-retrying { background: #ff8800; }
+.deck-upload-segment.is-ready { background: var(--red); box-shadow: 0 0 5px var(--red-glow); }
+.deck-upload-segment.is-failed { background: var(--white); }
 .deck-upload-progress-status {
   min-width: 0;
   overflow: hidden;
@@ -613,6 +646,13 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   letter-spacing: 0.7px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.deck-upload-bpm-status {
+  grid-column: 1 / -1;
+  color: var(--grey-text);
+  font-family: var(--font-data);
+  font-size: 8px;
+  letter-spacing: 0.7px;
 }
 @keyframes deck-upload-progress-slide {
   from { transform: translateX(-10%); }
