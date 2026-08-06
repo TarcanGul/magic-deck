@@ -796,7 +796,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   min-height: 0;
   flex-basis: auto;
 }
-.bpm-report-trigger, .deck-unload, .assistant-fx-trigger, .assistant-library-trigger {
+.bpm-report-trigger, .deck-clear, .assistant-fx-trigger, .assistant-library-trigger {
   flex: 0 0 auto;
   padding: 5px 7px;
   border: 1px solid var(--grey-light);
@@ -807,21 +807,21 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   letter-spacing: 0.7px;
   cursor: pointer;
 }
-.deck-unload, .assistant-fx-trigger, .assistant-library-trigger { border-color: var(--red); color: var(--red); }
+.deck-clear, .assistant-fx-trigger, .assistant-library-trigger { border-color: var(--red); color: var(--red); }
 .bpm-report-trigger:hover, .bpm-report-trigger:focus-visible,
-.deck-unload:hover:not(:disabled), .deck-unload:focus-visible,
+.deck-clear:hover:not(:disabled), .deck-clear:focus-visible,
 .assistant-fx-trigger:hover:not(:disabled), .assistant-fx-trigger:focus-visible,
 .assistant-library-trigger:hover:not(:disabled), .assistant-library-trigger:focus-visible {
   border-color: var(--red);
   color: var(--white);
   outline: none;
 }
-.deck-unload:hover:not(:disabled), .assistant-fx-trigger:hover:not(:disabled),
+.deck-clear:hover:not(:disabled), .assistant-fx-trigger:hover:not(:disabled),
 .assistant-library-trigger:hover:not(:disabled) {
   background: var(--red);
   box-shadow: 0 0 12px var(--red-glow);
 }
-.bpm-report-trigger:disabled, .deck-unload:disabled, .assistant-fx-trigger:disabled,
+.bpm-report-trigger:disabled, .deck-clear:disabled, .assistant-fx-trigger:disabled,
 .assistant-library-trigger:disabled {
   cursor: wait;
   opacity: 0.5;

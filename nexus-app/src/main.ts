@@ -38,6 +38,7 @@ import {
 } from './tempo-utils.js'
 import type { TempoRange } from './tempo-utils.js'
 import {
+  planDeckTrackClear,
   planForwardTimelineInsertion,
   planNonOverlappingCueTakeover,
   selectCanonicalRouting,
@@ -242,7 +243,7 @@ interface AubioBpmResult {
 }
 interface DeckOperationState {
   pendingCount: number
-  activeKind: 'loading' | 'replacing' | 'unloading' | 'launching' | 'cue-scheduling' | 'cancelling' | 'stopping' | 'generating' | null
+  activeKind: 'loading' | 'replacing' | 'clearing' | 'launching' | 'cue-scheduling' | 'cancelling' | 'stopping' | 'generating' | null
   uploadProgress: UploadProgressSnapshot | null
   chunkProgress: SourceChunkProgressSnapshot | null
   bpmStatus: string
@@ -4051,7 +4052,7 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const filename = el<HTMLDivElement>(`drop${deckIndex + 1}-filename`)
   const metadataBpm = el<HTMLElement>(`drop${deckIndex + 1}-bpm`)
   const metadataDuration = el<HTMLElement>(`drop${deckIndex + 1}-duration`)
-  const unload = el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`)
+  const clear = el<HTMLButtonElement>(`deck${deckIndex + 1}-clear`)
   const assistant = el<HTMLDivElement>(`deck${deckIndex + 1}-bpm-dialogue`)
   const uploadProgress = el<HTMLDivElement>(`deck${deckIndex + 1}-upload-progress`)
   const uploadStatus = el<HTMLSpanElement>(`deck${deckIndex + 1}-upload-status`)
@@ -4101,8 +4102,9 @@ function updateSourceDeckUi(deckIndex: 0 | 1) {
   const bpm = loaded ? normalizeBpm(deck.sampleBpm ?? deck.baseBpm) : null
   metadataBpm.textContent = bpm === null ? '—' : String(bpm)
   metadataDuration.textContent = loaded ? formatDuration(deck.sampleMeta?.durationSeconds) : '—'
-  unload.classList.toggle('is-hidden', !loaded)
-  unload.disabled = pending || !projectConnected || activeFxDeckIndex === deckIndex
+  clear.classList.toggle('is-hidden', !loaded)
+  clear.disabled = pending || !projectConnected || activeFxDeckIndex === deckIndex
+  clear.textContent = operation.activeKind === 'clearing' ? 'CLEARING…' : 'CLEAR DECK'
   renderTempoControls(deckIndex)
   renderDeckTransport(deckIndex)
   renderCueControls(deckIndex)
@@ -8188,7 +8190,7 @@ function removeSourceChunkGroupInTransaction(
   })
 }
 
-async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: number) {
+async function clearDeckProjectContent(deckIndex: 0 | 1, expectedSession: number) {
   const deck = decks[deckIndex]
   const operation = deckOperationStates[deckIndex]
   const projectDocument = nexus
@@ -8202,43 +8204,63 @@ async function removeDeckProjectContent(deckIndex: 0 | 1, expectedSession: numbe
       || !projectConnected
       || expectedSession !== tempoSessionId
     ) {
-      throw new Error('Project connection changed before deck removal')
+      throw new Error('Project connection changed before clearing the deck')
     }
 
-    const regionId = deck.regionEntity?.id
-    const storedSampleId = deck.sampleEntity?.id
-    const storedAutomationCollectionId = deck.automationCollectionEntity?.id
+    const trackId = deck.trackEntity?.id
     const chunkGroup = sourceChunkGroups[deckIndex]
-    if (!regionId) throw new Error('The synchronized project content is no longer available')
+    if (!trackId) throw new Error('The synchronized deck track is no longer available')
+    const catalogDependencies = [
+      {
+        sampleId: deck.sampleEntity?.id,
+        automationCollectionId: deck.automationCollectionEntity?.id,
+      },
+      ...(chunkGroup?.chunks.map((chunk) => ({
+        sampleId: chunk.sampleEntity?.id,
+        automationCollectionId: chunk.automationCollection?.id,
+      })) ?? []),
+    ]
+    const clearedRegionIds = new Set<string>()
 
     operation.suppressProjectRemovalSync = true
     try {
       await projectDocument.modify((t) => {
-        if (chunkGroup) {
-          chunkGroup.chunks.forEach((chunk) => {
-            if (chunk.region) {
-              guardedRegionRemovalIds.add(chunk.region.id)
-            }
-          })
-          removeSourceChunkGroupInTransaction(t, chunkGroup)
-        } else {
-          removeDeckContentInTransaction(
-            t,
-            regionId,
-            storedSampleId,
-            storedAutomationCollectionId,
-            deckIndex,
-          )
-        }
+        const targetTrack = t.entities.ofTypes('audioTrack').getEntity(trackId)
+        if (!targetTrack) throw new Error('The synchronized deck track is no longer available')
+        const allRegions = t.entities.ofTypes('audioRegion').get()
+        const plan = planDeckTrackClear(
+          allRegions.map((region) => ({
+            id: region.id,
+            trackId: region.fields.track.value.entityId,
+            sampleId: region.fields.sample.value.entityId,
+            automationCollectionId:
+              region.fields.playbackAutomationCollection.value.entityId,
+          })),
+          targetTrack.id,
+          catalogDependencies,
+        )
+
+        plan.regionIds.forEach((regionId) => {
+          guardedRegionRemovalIds.add(regionId)
+          clearedRegionIds.add(regionId)
+        })
+        plan.regionIds.forEach((regionId) => {
+          const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+          if (region) t.remove(region)
+        })
+        plan.sampleIds.forEach((sampleId) => {
+          const sample = t.entities.ofTypes('sample').getEntity(sampleId)
+          if (sample) t.removeWithDependencies(sample)
+        })
+        plan.automationCollectionIds.forEach((collectionId) => {
+          const collection = t.entities.ofTypes('automationCollection').getEntity(collectionId)
+          if (collection) t.removeWithDependencies(collection)
+        })
       })
       clearDeckContentEntities(deck)
-      if (chunkGroup) {
-        sourceChunkGroups[deckIndex] = null
-      }
+      clearSourceDeckLocalMedia(deckIndex)
     } finally {
-      chunkGroup?.chunks.forEach((chunk) => {
-        if (chunk.region) guardedRegionRemovalIds.delete(chunk.region.id)
-      })
+      clearedRegionIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
       operation.suppressProjectRemovalSync = false
     }
   })
@@ -9100,35 +9122,34 @@ function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPla
     })
 }
 
-async function unloadSourceDeck(deckIndex: 0 | 1) {
+async function clearSourceDeck(deckIndex: 0 | 1) {
   if (!isSourceDeckSynchronized(deckIndex)) return
   pendingBpmResolutions[deckIndex]?.(null)
-  sourceLoadAbortControllers[deckIndex]?.abort(new Error('Deck unloaded'))
+  sourceLoadAbortControllers[deckIndex]?.abort(new Error('Deck cleared'))
   sourceLoadAbortControllers[deckIndex] = null
   sourceLoadSessionIds[deckIndex] += 1
   const expectedSession = tempoSessionId
-  setStatus('connecting', `DECK ${deckIndex + 1}: UNLOADING — CLEARING PROJECT CONTENT…`)
-  await removeDeckProjectContent(deckIndex, expectedSession)
-  clearSourceDeckLocalMedia(deckIndex)
+  setStatus('connecting', `DECK ${deckIndex + 1}: CLEARING — REMOVING TRACK CONTENT…`)
+  await clearDeckProjectContent(deckIndex, expectedSession)
   updateSourceDeckUi(deckIndex)
-  setStatus('connected', `DECK ${deckIndex + 1}: UNLOADED — PROJECT TRACK PRESERVED ✓`)
+  setStatus('connected', `DECK ${deckIndex + 1}: CLEARED — PROJECT TRACK AND ROUTING PRESERVED ✓`)
 }
 
-function queueDeckUnload(deckIndex: 0 | 1) {
+function queueDeckClear(deckIndex: 0 | 1) {
   const operation = deckOperationStates[deckIndex]
   if (operation.pendingCount > 0 || !isSourceDeckSynchronized(deckIndex)) return
   const expectedSession = tempoSessionId
   operation.pendingCount += 1
-  operation.activeKind = 'unloading'
+  operation.activeKind = 'clearing'
   updateSourceDeckUi(deckIndex)
   void deckLoadQueues.enqueue(deckIndex, () => {
     if (expectedSession !== tempoSessionId) return
-    return unloadSourceDeck(deckIndex)
+    return clearSourceDeck(deckIndex)
   })
     .catch((error: unknown) => {
       if (expectedSession !== tempoSessionId) return
       const message = error instanceof Error ? error.message : String(error)
-      setStatus('error', `DECK ${deckIndex + 1}: UNLOAD FAILED — ${message}`)
+      setStatus('error', `DECK ${deckIndex + 1}: CLEAR FAILED — ${message}`)
     })
     .finally(() => {
       operation.pendingCount = Math.max(0, operation.pendingCount - 1)
@@ -9868,9 +9889,9 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
   })
 }
 
-function setupUnloadButton(deckIndex: 0 | 1) {
-  el<HTMLButtonElement>(`deck${deckIndex + 1}-unload`).onclick = () => {
-    queueDeckUnload(deckIndex)
+function setupClearDeckButton(deckIndex: 0 | 1) {
+  el<HTMLButtonElement>(`deck${deckIndex + 1}-clear`).onclick = () => {
+    queueDeckClear(deckIndex)
   }
 }
 
@@ -10035,8 +10056,8 @@ function initApp() {
 
   setupDropZone('drop-1', 0)
   setupDropZone('drop-2', 1)
-  setupUnloadButton(0)
-  setupUnloadButton(1)
+  setupClearDeckButton(0)
+  setupClearDeckButton(1)
   setupCueControls(0)
   setupCueControls(1)
   setupCueControls(2)

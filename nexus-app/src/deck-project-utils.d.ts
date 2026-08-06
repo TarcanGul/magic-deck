@@ -23,12 +23,35 @@ export interface RoutingCandidate {
   routingId?: string
 }
 
+export interface TrackAudioRegionDependency {
+  id: string
+  trackId: string
+  sampleId: string
+  automationCollectionId: string
+}
+
+export interface CatalogAudioDependency {
+  sampleId?: string
+  automationCollectionId?: string
+}
+
+export interface DeckTrackClearPlan {
+  regionIds: string[]
+  sampleIds: string[]
+  automationCollectionIds: string[]
+}
+
 export function buildLogicalRegionChains<T extends TimelineRegionSnapshot>(regions: T[]): T[][]
 export function selectLatestLogicalRegion<T extends TimelineRegionSnapshot>(regions: T[]): T | null
 export function logicalRegionChainIds(
   regions: TimelineRegionSnapshot[],
   controlledRegionId: string,
 ): string[]
+export function planDeckTrackClear(
+  regions: TrackAudioRegionDependency[],
+  trackId: string,
+  catalogDependencies?: CatalogAudioDependency[],
+): DeckTrackClearPlan
 export function clampRegionFades(
   durationTicks: number,
   fadeInDurationTicks: number,

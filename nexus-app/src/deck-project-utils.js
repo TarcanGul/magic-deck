@@ -53,6 +53,34 @@ export function logicalRegionChainIds(regions, controlledRegionId) {
   return chain?.map((region) => region.id) ?? []
 }
 
+export function planDeckTrackClear(regions, trackId, catalogDependencies = []) {
+  const regionsToRemove = regions.filter((region) => region.trackId === trackId)
+  const regionIds = new Set(regionsToRemove.map((region) => region.id))
+  const sampleIds = new Set(regionsToRemove.map((region) => region.sampleId))
+  const automationCollectionIds = new Set(
+    regionsToRemove.map((region) => region.automationCollectionId),
+  )
+
+  catalogDependencies.forEach((dependency) => {
+    if (dependency.sampleId) sampleIds.add(dependency.sampleId)
+    if (dependency.automationCollectionId) {
+      automationCollectionIds.add(dependency.automationCollectionId)
+    }
+  })
+
+  regions.forEach((region) => {
+    if (regionIds.has(region.id)) return
+    sampleIds.delete(region.sampleId)
+    automationCollectionIds.delete(region.automationCollectionId)
+  })
+
+  return {
+    regionIds: [...regionIds].sort(),
+    sampleIds: [...sampleIds].sort(),
+    automationCollectionIds: [...automationCollectionIds].sort(),
+  }
+}
+
 export function clampRegionFades(durationTicks, fadeInDurationTicks, fadeOutDurationTicks) {
   const fadeIn = Math.min(Math.max(0, fadeInDurationTicks), durationTicks)
   const fadeOut = Math.min(

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   buildLogicalRegionChains,
   logicalRegionChainIds,
+  planDeckTrackClear,
   planForwardTimelineInsertion,
   planNonOverlappingCueTakeover,
   selectCanonicalRouting,
@@ -194,7 +195,7 @@ test('restores the newest logical insertion with an entity-id tie-breaker', () =
   assert.equal(selectLatestLogicalRegion(regions)?.id, 'newer-z')
 })
 
-test('scopes unload to the controlled logical chain', () => {
+test('scopes a logical region lookup to the controlled chain', () => {
   const regions = [
     region('part-a', 100, 50),
     region('part-b', 150, 50),
@@ -205,6 +206,63 @@ test('scopes unload to the controlled logical chain', () => {
   ]
   assert.deepEqual(logicalRegionChainIds(regions, 'part-b'), ['part-a', 'part-b'])
   assert.deepEqual(logicalRegionChainIds(regions, 'missing'), [])
+})
+
+test('plans clearing every audio region on one deck track', () => {
+  const regions = [
+    { id: 'chunk-a1', trackId: 'deck-a', sampleId: 'sample-a1', automationCollectionId: 'automation-a1' },
+    { id: 'chunk-a2', trackId: 'deck-a', sampleId: 'sample-a2', automationCollectionId: 'automation-a2' },
+    { id: 'cue-derived', trackId: 'deck-a', sampleId: 'sample-a1', automationCollectionId: 'automation-cue' },
+    { id: 'older-group', trackId: 'deck-a', sampleId: 'sample-old', automationCollectionId: 'automation-old' },
+    { id: 'manual-region', trackId: 'deck-a', sampleId: 'sample-manual', automationCollectionId: 'automation-manual' },
+    { id: 'deck-b-region', trackId: 'deck-b', sampleId: 'sample-b', automationCollectionId: 'automation-b' },
+  ]
+
+  assert.deepEqual(planDeckTrackClear(regions, 'deck-a'), {
+    regionIds: ['chunk-a1', 'chunk-a2', 'cue-derived', 'manual-region', 'older-group'],
+    sampleIds: ['sample-a1', 'sample-a2', 'sample-manual', 'sample-old'],
+    automationCollectionIds: [
+      'automation-a1',
+      'automation-a2',
+      'automation-cue',
+      'automation-manual',
+      'automation-old',
+    ],
+  })
+})
+
+test('preserves dependencies referenced by regions outside the cleared track', () => {
+  const regions = [
+    { id: 'deck-a-shared', trackId: 'deck-a', sampleId: 'sample-shared', automationCollectionId: 'automation-shared' },
+    { id: 'deck-a-only', trackId: 'deck-a', sampleId: 'sample-only', automationCollectionId: 'automation-only' },
+    { id: 'deck-b-shared', trackId: 'deck-b', sampleId: 'sample-shared', automationCollectionId: 'automation-shared' },
+    { id: 'deck-b-catalog', trackId: 'deck-b', sampleId: 'catalog-shared', automationCollectionId: 'catalog-shared-automation' },
+  ]
+
+  assert.deepEqual(planDeckTrackClear(regions, 'deck-a', [
+    { sampleId: 'catalog-only', automationCollectionId: 'catalog-automation' },
+    { sampleId: 'catalog-shared', automationCollectionId: 'catalog-shared-automation' },
+    { sampleId: 'sample-shared', automationCollectionId: 'automation-shared' },
+  ]), {
+    regionIds: ['deck-a-only', 'deck-a-shared'],
+    sampleIds: ['catalog-only', 'sample-only'],
+    automationCollectionIds: ['automation-only', 'catalog-automation'],
+  })
+})
+
+test('clear plans contain content only and never routing entities', () => {
+  const plan = planDeckTrackClear([
+    { id: 'region-a', trackId: 'track-a', sampleId: 'sample-a', automationCollectionId: 'automation-a' },
+  ], 'track-a')
+
+  assert.deepEqual(Object.keys(plan).sort(), [
+    'automationCollectionIds',
+    'regionIds',
+    'sampleIds',
+  ])
+  assert.equal(JSON.stringify(plan).includes('track-a'), false)
+  assert.equal(JSON.stringify(plan).includes('device-a'), false)
+  assert.equal(JSON.stringify(plan).includes('cable-a'), false)
 })
 
 test('lets a scheduled cue take over its bar without overlapping existing deck regions', () => {
