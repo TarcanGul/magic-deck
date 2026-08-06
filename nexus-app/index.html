@@ -98,7 +98,14 @@
             </div>
           </div>
           <div class="cue-module is-disabled" id="d1-cue-module">
-            <canvas class="cue-waveform" id="d1-cue-waveform" width="1200" height="96" role="img" aria-label="Deck A cue waveform"></canvas>
+            <div class="cue-waveform-row">
+              <canvas class="cue-waveform" id="d1-cue-waveform" width="1200" height="96" role="img" tabindex="0" aria-label="Deck A cue waveform"></canvas>
+              <div class="cue-zoom-controls" role="group" aria-label="Deck A cue waveform zoom">
+                <button id="d1-cue-zoom-out" type="button" aria-label="Zoom out Deck A cue waveform">−</button>
+                <button class="cue-zoom-level" id="d1-cue-zoom-reset" type="button" aria-label="Reset Deck A cue waveform zoom">1×</button>
+                <button id="d1-cue-zoom-in" type="button" aria-label="Zoom in Deck A cue waveform">+</button>
+              </div>
+            </div>
             <div class="cue-position-row">
               <span class="cue-title">CUE POINTS</span>
               <input class="cue-position" id="d1-cue-position" type="range" min="0" max="999" step="1" value="0" aria-label="Deck A cue position">
@@ -303,7 +310,14 @@
             </div>
           </div>
           <div class="cue-module is-disabled" id="d2-cue-module">
-            <canvas class="cue-waveform" id="d2-cue-waveform" width="1200" height="96" role="img" aria-label="Deck B cue waveform"></canvas>
+            <div class="cue-waveform-row">
+              <canvas class="cue-waveform" id="d2-cue-waveform" width="1200" height="96" role="img" tabindex="0" aria-label="Deck B cue waveform"></canvas>
+              <div class="cue-zoom-controls" role="group" aria-label="Deck B cue waveform zoom">
+                <button id="d2-cue-zoom-out" type="button" aria-label="Zoom out Deck B cue waveform">−</button>
+                <button class="cue-zoom-level" id="d2-cue-zoom-reset" type="button" aria-label="Reset Deck B cue waveform zoom">1×</button>
+                <button id="d2-cue-zoom-in" type="button" aria-label="Zoom in Deck B cue waveform">+</button>
+              </div>
+            </div>
             <div class="cue-position-row">
               <span class="cue-title">CUE POINTS</span>
               <input class="cue-position" id="d2-cue-position" type="range" min="0" max="999" step="1" value="0" aria-label="Deck B cue position">

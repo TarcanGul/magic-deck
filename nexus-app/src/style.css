@@ -258,6 +258,12 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   background: rgba(0, 0, 0, 0.46);
 }
 .cue-module.is-disabled { opacity: 0.55; }
+.cue-waveform-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 6px;
+}
 .cue-waveform {
   width: 100%;
   height: 54px;
@@ -267,9 +273,46 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   background: #080000;
   box-shadow: inset 0 2px 6px rgba(0,0,0,0.9);
 }
+.cue-waveform.is-interactive { cursor: crosshair; touch-action: none; }
+.cue-waveform.is-pannable { cursor: grab; }
+.cue-waveform.is-panning { cursor: grabbing; }
+.cue-waveform:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+}
+.cue-zoom-controls {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  align-items: stretch;
+  gap: 3px;
+}
+.cue-zoom-controls button {
+  min-width: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--grey-light);
+  border-radius: 3px;
+  background: linear-gradient(180deg, #242424, #101010);
+  color: var(--white);
+  font-family: var(--font-data);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cue-zoom-controls .cue-zoom-level {
+  min-width: 42px;
+  color: #62efa9;
+  font-family: var(--font-live);
+  font-size: 10px;
+}
+.cue-zoom-controls button:hover:not(:disabled),
+.cue-zoom-controls button:focus-visible {
+  border-color: var(--red);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--red);
+}
+.cue-zoom-controls button:disabled { cursor: not-allowed; opacity: 0.38; }
 .cue-position-row {
   display: grid;
-  grid-template-columns: auto minmax(80px, 1fr) minmax(70px, auto);
+  grid-template-columns: auto minmax(80px, 1fr) minmax(180px, auto);
   align-items: center;
   gap: 9px;
 }
@@ -288,6 +331,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
   font-family: var(--font-live);
   font-size: 12px;
   text-align: right;
+  white-space: nowrap;
 }
 .cue-pads {
   display: grid;
@@ -1045,6 +1089,8 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 }
 
 @media (max-width: 560px) {
+  .cue-position-row { grid-template-columns: auto minmax(80px, 1fr); }
+  .cue-position-value { grid-column: 1 / -1; text-align: left; }
   .drop-zone.loaded .drop-loaded-summary { align-items: flex-start; flex-direction: column; gap: 7px; }
   .controls-row { gap: 10px; }
   .bpm-dialogue { flex-basis: 100%; width: 100%; }

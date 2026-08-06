@@ -88,13 +88,14 @@ test('falls back to session storage when a later persistent save fails', async (
   const fixture = adapters({
     writePersistent: async () => { throw new Error('quota') },
   })
+  const precisePosition = 19_323 / 96_001
   const result = await saveCuePointMetadata({
     audioFootprint: footprint,
-    points: [0, null, 0.5, null, null],
+    points: [0, null, precisePosition, null, null],
     writePersistent: fixture.options.writePersistent,
     writeSession: fixture.options.writeSession,
     now: () => 456,
   })
   assert.equal(result.persistence, 'session')
-  assert.deepEqual(fixture.written.session?.points, [0, null, 0.5, null, null])
+  assert.deepEqual(fixture.written.session?.points, [0, null, precisePosition, null, null])
 })

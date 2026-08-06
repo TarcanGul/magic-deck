@@ -318,6 +318,34 @@ test('preserves exact normalized cue positions across duration changes', () => {
   assert.equal(position, 2_000 / 7_001)
 })
 
+test('schedules a non-bar-aligned source cue without requantizing it', () => {
+  const fullDurationTicks = 96_001
+  const cueOffsetTicks = 19_323
+  const plan = planCueRegionDuplicate({
+    source: {
+      region: {
+        positionTicks: 0, durationTicks: fullDurationTicks,
+        collectionOffsetTicks: 0, loopOffsetTicks: 0,
+        loopDurationTicks: fullDurationTicks, isEnabled: true,
+        colorIndex: 2, displayName: 'Precise source cue',
+      },
+      track: 'track', playbackAutomationCollection: 'source-automation', sample: 'sample',
+      gain: 1, fadeInDurationTicks: 0, fadeInSlope: 0,
+      fadeOutDurationTicks: 0, fadeOutSlope: 0,
+      timestretchMode: 2, pitchShiftSemitones: 0,
+    },
+    playbackAutomationCollection: 'cue-automation',
+    targetPositionTicks: 153_600,
+    fullDurationTicks,
+    cuePosition: cueOffsetTicks / fullDurationTicks,
+  })
+
+  assert.equal(plan.cueOffsetTicks, cueOffsetTicks)
+  assert.equal(plan.region.region.collectionOffsetTicks, cueOffsetTicks)
+  assert.equal(plan.region.region.positionTicks, 153_600)
+  assert.equal(plan.region.region.durationTicks, fullDurationTicks - cueOffsetTicks)
+})
+
 test('plans legacy cue chain collapse from the earliest aligned region', () => {
   const result = planLegacyCueChainCollapse([
     {

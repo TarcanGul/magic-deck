@@ -48,7 +48,6 @@ import { staleOAuthCallbackUrl } from './auth-utils.js'
 import {
   buildIndependentAudioRegionCopy,
   cueBarForPosition,
-  cuePositionForBar,
   cuePositionsFromSegments,
   planCueRegionDuplicate,
   planLegacyCueChainCollapse,
@@ -68,6 +67,17 @@ import type {
   StoredCuePointsV1,
   StoredCuePointsV2,
 } from './cue-storage-utils.js'
+import {
+  CUE_ZOOM_LEVELS,
+  createCueViewport,
+  cuePositionFromPointer,
+  cueTicksToNormalizedPosition,
+  formatCueTickPosition,
+  normalizedCuePositionToTicks,
+  panCueViewport,
+  zoomCueViewport,
+} from './cue-waveform-utils.js'
+import type { CueViewport } from './cue-waveform-utils.js'
 import {
   buildMusicLibraryTree,
   findMusicLibraryNode,
@@ -159,6 +169,9 @@ interface DeckState {
 }
 type DeckPrefix = 'd1' | 'd2' | 'd3'
 type WaveformDeckIndex = 0 | 1 | 2
+function isSourceDeckIndex(deckIndex: WaveformDeckIndex): deckIndex is 0 | 1 {
+  return deckIndex === 0 || deckIndex === 1
+}
 type EqBand = 'hi' | 'mid' | 'low'
 type DeckFxKind = 'delay' | 'reverb' | 'distortion' | 'flanger'
 const DECK_FX_KINDS: readonly DeckFxKind[] = ['delay', 'reverb', 'distortion', 'flanger']
@@ -396,6 +409,9 @@ const CUE_DATABASE_STORE_NAME = 'cue-points'
 const MUSIC_LIBRARY_DB_VERSION = 2
 const MUSIC_LIBRARY_ROOT_KEY = 'music-root'
 const MUSIC_LIBRARY_PAGE_SIZE = 3
+const MAX_CUE_WAVEFORM_PEAKS = 1200 * 64
+const RESTORED_WAVEFORM_FALLBACK_RESOLUTION = 1920
+const CUE_WAVEFORM_DRAG_THRESHOLD = 4
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let at: AuthenticatedClient | null = null
@@ -422,6 +438,17 @@ let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 const cueWaveformPeaks: [number[] | null, number[] | null, number[] | null] = [null, null, null]
 const cueAudioBufferPeakCache = new WeakMap<AudioBuffer, number[]>()
+const sourceCueViewports: [CueViewport, CueViewport] = [
+  createCueViewport(),
+  createCueViewport(),
+]
+interface CuePointerDrag {
+  pointerId: number
+  startClientX: number
+  initialViewport: CueViewport
+  panning: boolean
+}
+const cuePointerDrags: [CuePointerDrag | null, CuePointerDrag | null] = [null, null]
 let suppressMagicProjectRemovalSync = false
 let liveAudioStream: MediaStream | null = null
 let liveAudioContext: AudioContext | null = null
@@ -2099,21 +2126,40 @@ function restoredMagicPrompt(graphDisplayName: string, sampleMeta: SampleMeta) {
   ) ?? ''
 }
 
-async function fetchWaveformPeaks(sampleMeta: SampleMeta) {
+async function requestWaveformPeaks(sampleMeta: SampleMeta, resolution: number) {
+  const response = await fetch(sampleMeta.getWaveformUrl({
+    resolution: resolution as 1920,
+    channel: 'both',
+  }))
+  if (!response.ok) throw new Error(`Waveform request failed (${response.status})`)
+  const payload: unknown = await response.json()
+  if (!Array.isArray(payload)) throw new Error('Waveform response was not an array')
+  const peaks = payload.filter(
+    (value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0,
+  )
+  if (peaks.length === 0) throw new Error('Waveform response was empty')
+  return peaks
+}
+
+async function fetchWaveformPeaks(
+  sampleMeta: SampleMeta,
+  resolution = RESTORED_WAVEFORM_FALLBACK_RESOLUTION,
+  compatibilityFallback = false,
+) {
   try {
-    const response = await fetch(sampleMeta.getWaveformUrl({
-      resolution: 1920,
-      channel: 'both',
-    }))
-    if (!response.ok) throw new Error(`Waveform request failed (${response.status})`)
-    const payload: unknown = await response.json()
-    if (!Array.isArray(payload)) throw new Error('Waveform response was not an array')
-    const peaks = payload.filter(
-      (value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0,
-    )
-    if (peaks.length === 0) throw new Error('Waveform response was empty')
-    return peaks
+    return await requestWaveformPeaks(sampleMeta, resolution)
   } catch (error) {
+    if (compatibilityFallback && resolution !== RESTORED_WAVEFORM_FALLBACK_RESOLUTION) {
+      try {
+        return await requestWaveformPeaks(
+          sampleMeta,
+          RESTORED_WAVEFORM_FALLBACK_RESOLUTION,
+        )
+      } catch (fallbackError) {
+        console.warn('[NEXUS] Waveform restore:', fallbackError)
+        return null
+      }
+    }
     console.warn('[NEXUS] Waveform restore:', error)
     return null
   }
@@ -2139,7 +2185,12 @@ async function loadRestoredCueWaveform(
 ) {
   const expectedRegionId = decks[deckIndex].regionEntity?.id
   const totalDuration = samples.reduce((total, sample) => total + sample.durationSeconds, 0)
-  const peakGroups = await Promise.all(samples.map(fetchWaveformPeaks))
+  const targetResolutions = samples.map((sample) => Math.max(
+    1,
+    Math.round(MAX_CUE_WAVEFORM_PEAKS * sample.durationSeconds / Math.max(totalDuration, 0.001)),
+  ))
+  const peakGroups = await Promise.all(samples.map((sample, index) =>
+    fetchWaveformPeaks(sample, targetResolutions[index], true)))
   if (
     nexus !== projectDocument
     || !projectConnected
@@ -2150,7 +2201,7 @@ async function loadRestoredCueWaveform(
   cueWaveformPeaks[deckIndex] = peakGroups.every((peaks) => peaks !== null)
     ? peakGroups.flatMap((peaks, index) => resampleWaveformPeaks(
         peaks ?? [],
-        Math.max(1, Math.round(1920 * samples[index].durationSeconds / Math.max(totalDuration, 0.001))),
+        targetResolutions[index],
       ))
     : null
   renderCueControls(deckIndex)
@@ -2895,12 +2946,17 @@ function resetDeckCueState(deckIndex: WaveformDeckIndex) {
   deck.cueLoading = false
   deck.scheduledCuePosition = 0
   deck.cuePersistenceWarning = false
+  if (isSourceDeckIndex(deckIndex)) {
+    sourceCueViewports[deckIndex] = createCueViewport()
+    cuePointerDrags[deckIndex] = null
+  }
   renderCueControls(deckIndex)
 }
 
 function resetDeckCuePosition(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   deck.cuePosition = 0
+  if (isSourceDeckIndex(deckIndex)) sourceCueViewports[deckIndex] = createCueViewport()
   renderCueControls(deckIndex)
 }
 
@@ -2908,6 +2964,20 @@ function formatCueTime(deckIndex: WaveformDeckIndex, position: number) {
   const durationSeconds = decks[deckIndex].sampleMeta?.durationSeconds
   if (!durationSeconds || !Number.isFinite(durationSeconds)) return '—'
   return formatDuration(Math.min(durationSeconds, Math.max(0, position * durationSeconds)))
+}
+
+function formatSourceCuePosition(
+  deckIndex: 0 | 1,
+  position: number,
+  fullDurationTicks: number,
+) {
+  return formatCueTickPosition(
+    normalizedCuePositionToTicks(position, fullDurationTicks),
+    fullDurationTicks,
+    Ticks.Bars(1),
+    Ticks.Beat,
+    decks[deckIndex].sampleMeta?.durationSeconds ?? 0,
+  )
 }
 
 function getCueElements(deckIndex: WaveformDeckIndex) {
@@ -2918,6 +2988,9 @@ function getCueElements(deckIndex: WaveformDeckIndex) {
     slider: el<HTMLInputElement>(`${prefix}-position`),
     position: el<HTMLOutputElement>(`${prefix}-position-value`),
     status: el<HTMLSpanElement>(`${prefix}-status`),
+    zoomOut: deckIndex < 2 ? el<HTMLButtonElement>(`${prefix}-zoom-out`) : null,
+    zoomReset: deckIndex < 2 ? el<HTMLButtonElement>(`${prefix}-zoom-reset`) : null,
+    zoomIn: deckIndex < 2 ? el<HTMLButtonElement>(`${prefix}-zoom-in`) : null,
     pads: Array.from({ length: 5 }, (_, slot) => ({
       trigger: el<HTMLButtonElement>(`${prefix}-${slot + 1}`),
       clear: el<HTMLButtonElement>(`${prefix}-${slot + 1}-clear`),
@@ -2929,7 +3002,7 @@ function audioBufferCuePeaks(buffer: AudioBuffer) {
   const cached = cueAudioBufferPeakCache.get(buffer)
   if (cached) return cached
 
-  const peakCount = 1200
+  const peakCount = Math.min(MAX_CUE_WAVEFORM_PEAKS, Math.max(1, buffer.length))
   const peaks = new Array<number>(peakCount).fill(0)
   const framesPerPeak = Math.max(1, Math.ceil(buffer.length / peakCount))
   for (let channelIndex = 0; channelIndex < buffer.numberOfChannels; channelIndex++) {
@@ -2958,6 +3031,9 @@ function drawCueWaveform(deckIndex: WaveformDeckIndex) {
   const peaks = deck.audioBuffer
     ? audioBufferCuePeaks(deck.audioBuffer)
     : cueWaveformPeaks[deckIndex]
+  const viewport = isSourceDeckIndex(deckIndex)
+    ? sourceCueViewports[deckIndex]
+    : createCueViewport()
   context.fillStyle = '#080000'
   context.fillRect(0, 0, width, height)
 
@@ -2971,8 +3047,12 @@ function drawCueWaveform(deckIndex: WaveformDeckIndex) {
   if (peaks?.length) {
     const peakMaximum = Math.max(...peaks, 0.0001)
     for (let x = 0; x < width; x++) {
-      const start = Math.floor(x * peaks.length / width)
-      const end = Math.max(start + 1, Math.floor((x + 1) * peaks.length / width))
+      const start = Math.floor(
+        (viewport.start + x / width * (viewport.end - viewport.start)) * peaks.length,
+      )
+      const end = Math.max(start + 1, Math.ceil(
+        (viewport.start + (x + 1) / width * (viewport.end - viewport.start)) * peaks.length,
+      ))
       let peak = 0
       for (let index = start; index < end && index < peaks.length; index++) {
         peak = Math.max(peak, peaks[index])
@@ -2986,19 +3066,27 @@ function drawCueWaveform(deckIndex: WaveformDeckIndex) {
     }
   }
 
-  const currentX = Math.min(width - 0.5, Math.max(0.5, deck.cuePosition * width))
-  context.strokeStyle = '#d40000'
-  context.lineWidth = 2
-  context.beginPath()
-  context.moveTo(currentX, 0)
-  context.lineTo(currentX, height)
-  context.stroke()
+  if (deck.cuePosition >= viewport.start && deck.cuePosition <= viewport.end) {
+    const currentX = Math.min(width - 0.5, Math.max(
+      0.5,
+      (deck.cuePosition - viewport.start) / (viewport.end - viewport.start) * width,
+    ))
+    context.strokeStyle = '#d40000'
+    context.lineWidth = 2
+    context.beginPath()
+    context.moveTo(currentX, 0)
+    context.lineTo(currentX, height)
+    context.stroke()
+  }
 
   context.strokeStyle = '#fff'
   context.lineWidth = 2
   deck.cuePoints.forEach((point) => {
-    if (point === null) return
-    const x = Math.min(width - 0.5, Math.max(0.5, point * width))
+    if (point === null || point < viewport.start || point > viewport.end) return
+    const x = Math.min(width - 0.5, Math.max(
+      0.5,
+      (point - viewport.start) / (viewport.end - viewport.start) * width,
+    ))
     context.beginPath()
     context.moveTo(x, 0)
     context.lineTo(x, height)
@@ -3017,37 +3105,68 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
   const loaded = isCueDeckLoaded(deckIndex)
   const operationPending = deckOperationStates[deckIndex].pendingCount > 0
     || deck.tempoUpdatePending
+  const fullDurationTicks = isSourceDeckIndex(deckIndex)
+    ? getSynchronizedDeckFullDurationTicks(deckIndex)
+    : null
   const ready = projectConnected
     && loaded
     && deck.audioFootprint !== null
     && !deck.cueLoading
     && !operationPending
-  const fullDurationTicks = deckIndex < 2
-    ? getSynchronizedDeckFullDurationTicks(deckIndex)
-    : null
+    && (!isSourceDeckIndex(deckIndex) || fullDurationTicks !== null)
   controls.module.classList.toggle('is-disabled', !loaded)
   controls.waveform.setAttribute(
     'aria-label',
-    `${placementDeckLabel(deckIndex)} top-half waveform with ${deck.cuePoints.filter((point) => point !== null).length} saved cue markers`,
+    `${placementDeckLabel(deckIndex)} cue waveform with ${deck.cuePoints.filter((point) => point !== null).length} saved cue markers${isSourceDeckIndex(deckIndex) ? '; click to set the cue, drag to pan, and use the wheel to zoom' : ''}`,
+  )
+  controls.waveform.setAttribute('aria-disabled', String(!ready))
+  controls.waveform.classList.toggle('is-interactive', ready && isSourceDeckIndex(deckIndex))
+  controls.waveform.classList.toggle(
+    'is-pannable',
+    ready && isSourceDeckIndex(deckIndex) && sourceCueViewports[deckIndex].zoomLevel > 1,
   )
   controls.slider.disabled = !ready
-  if (deckIndex < 2 && fullDurationTicks !== null) {
-    const maximumBar = Math.floor((fullDurationTicks - 1) / Ticks.Bars(1)) + 1
-    controls.slider.min = '1'
-    controls.slider.max = String(maximumBar)
+  if (isSourceDeckIndex(deckIndex)) {
+    const cueTicks = fullDurationTicks === null
+      ? 0
+      : normalizedCuePositionToTicks(deck.cuePosition, fullDurationTicks)
+    controls.slider.min = '0'
+    controls.slider.max = String(fullDurationTicks === null ? 0 : fullDurationTicks - 1)
     controls.slider.step = '1'
-    controls.slider.value = String(cueBarForPosition(
-      deck.cuePosition,
-      Ticks.Bars(1),
-      fullDurationTicks,
-    ))
-    controls.position.value = `B${controls.slider.value} · ${formatCueTime(deckIndex, deck.cuePosition)}`
+    controls.slider.value = String(cueTicks)
+    controls.position.value = fullDurationTicks === null
+      ? '—'
+      : formatSourceCuePosition(deckIndex, deck.cuePosition, fullDurationTicks)
+    controls.waveform.setAttribute('role', 'slider')
+    controls.waveform.setAttribute('aria-valuemin', '0')
+    controls.waveform.setAttribute(
+      'aria-valuemax',
+      String(fullDurationTicks === null ? 0 : fullDurationTicks - 1),
+    )
+    controls.waveform.setAttribute('aria-valuenow', String(cueTicks))
+    controls.waveform.setAttribute('aria-valuetext', controls.position.value)
   } else {
     controls.slider.min = '0'
     controls.slider.max = '999'
     controls.slider.step = '1'
     controls.slider.value = String(Math.round(deck.cuePosition * 1000))
     controls.position.value = formatCueTime(deckIndex, deck.cuePosition)
+  }
+  controls.slider.setAttribute('aria-valuetext', controls.position.value)
+  if (isSourceDeckIndex(deckIndex)) {
+    const viewport = sourceCueViewports[deckIndex]
+    const zoomIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
+    if (controls.zoomOut) controls.zoomOut.disabled = !ready || zoomIndex <= 0
+    if (controls.zoomIn) {
+      controls.zoomIn.disabled = !ready || zoomIndex >= CUE_ZOOM_LEVELS.length - 1
+    }
+    if (controls.zoomReset) {
+      controls.zoomReset.disabled = !ready || viewport.zoomLevel === 1
+      controls.zoomReset.textContent = `${viewport.zoomLevel}×`
+      controls.zoomReset.title = viewport.zoomLevel === 1
+        ? 'Cue waveform is showing the full track'
+        : `Reset ${placementDeckLabel(deckIndex)} cue waveform from ${viewport.zoomLevel}× zoom`
+    }
   }
   controls.status.textContent = deckOperationStates[deckIndex].activeKind === 'cue-scheduling'
     ? 'SCHEDULING SAVED CUE…'
@@ -3057,7 +3176,7 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
         ? deckIndex < 2
           ? deck.cuePersistenceWarning
             ? 'CUES ARE SESSION-ONLY · INDEXEDDB PERSISTENCE UNAVAILABLE'
-            : 'CHOOSE A SOURCE BAR · SET A PAD OR SELECT A SAVED CUE TO SCHEDULE IT'
+            : 'CLICK A TRANSIENT OR ADJUST ONE TICK AT A TIME · SET A PAD OR SELECT A SAVED CUE'
           : 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
         : loaded
           ? 'CUES UNAVAILABLE'
@@ -3066,9 +3185,11 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     const point = deck.cuePoints[slot]
     trigger.disabled = !ready
     trigger.classList.toggle('is-set', point !== null)
-    const scheduled = deckIndex < 2
+    const scheduled = isSourceDeckIndex(deckIndex)
       && point !== null
-      && Math.abs(point - deck.scheduledCuePosition) < 0.000_5
+      && fullDurationTicks !== null
+      && normalizedCuePositionToTicks(point, fullDurationTicks)
+        === normalizedCuePositionToTicks(deck.scheduledCuePosition, fullDurationTicks)
     trigger.classList.toggle('is-scheduled', scheduled)
     trigger.textContent = point === null
       ? `CUE ${slot + 1}\nSET`
@@ -3076,11 +3197,11 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     trigger.setAttribute(
       'aria-label',
       point === null
-        ? deckIndex < 2
-          ? `Save cue ${slot + 1} at source track bar ${controls.slider.value}`
+        ? isSourceDeckIndex(deckIndex)
+          ? `Save cue ${slot + 1} at ${fullDurationTicks === null ? 'the selected source position' : formatSourceCuePosition(deckIndex, deck.cuePosition, fullDurationTicks)}`
           : `Create Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, deck.cuePosition)}`
-        : deckIndex < 2
-          ? `Schedule cue ${slot + 1} from source track bar ${fullDurationTicks === null ? '—' : cueBarForPosition(point, Ticks.Bars(1), fullDurationTicks)}`
+        : isSourceDeckIndex(deckIndex)
+          ? `Schedule cue ${slot + 1} from ${fullDurationTicks === null ? 'the saved source position' : formatSourceCuePosition(deckIndex, point, fullDurationTicks)}`
           : `Select Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, point)}`,
     )
     clear.disabled = !ready || point === null
@@ -3160,19 +3281,18 @@ async function loadSourceCuePointsForFootprint(audioFootprint: string) {
 
 async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
   const deck = decks[deckIndex]
-  if (deckIndex < 2) {
+  if (isSourceDeckIndex(deckIndex)) {
     const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
     if (fullDurationTicks === null) throw new Error('The synchronized track duration is unavailable')
-    const position = cuePositionForBar(
-      cueBarForPosition(deck.cuePosition, Ticks.Bars(1), fullDurationTicks),
-      Ticks.Bars(1),
+    const position = cueTicksToNormalizedPosition(
+      normalizedCuePositionToTicks(deck.cuePosition, fullDurationTicks),
       fullDurationTicks,
     )
     deck.cuePoints[slot] = position
     deck.cuePosition = position
     renderCueControls(deckIndex)
     await persistCuePoints(deckIndex)
-    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SAVED AT SOURCE TRACK BAR ${cueBarForPosition(position, Ticks.Bars(1), fullDurationTicks)} · SELECT IT AGAIN TO SCHEDULE`)
+    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SAVED AT ${formatSourceCuePosition(deckIndex, position, fullDurationTicks)} · SELECT IT AGAIN TO SCHEDULE`)
     return
   }
   const projectDocument = nexus
@@ -3707,22 +3827,184 @@ async function mutateSourceCueSchedule(
   }
 }
 
+function sourceCueControlsReady(deckIndex: 0 | 1) {
+  const deck = decks[deckIndex]
+  return projectConnected
+    && isCueDeckLoaded(deckIndex)
+    && deck.audioFootprint !== null
+    && !deck.cueLoading
+    && deckOperationStates[deckIndex].pendingCount === 0
+    && !deck.tempoUpdatePending
+    && getSynchronizedDeckFullDurationTicks(deckIndex) !== null
+}
+
+function centerSourceCueViewport(deckIndex: 0 | 1) {
+  const viewport = sourceCueViewports[deckIndex]
+  sourceCueViewports[deckIndex] = zoomCueViewport(
+    viewport,
+    viewport.zoomLevel,
+    decks[deckIndex].cuePosition,
+    0.5,
+  )
+}
+
+function adjustSourceCueTicks(deckIndex: 0 | 1, delta: number) {
+  const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+  if (fullDurationTicks === null) return
+  const currentTicks = normalizedCuePositionToTicks(
+    decks[deckIndex].cuePosition,
+    fullDurationTicks,
+  )
+  decks[deckIndex].cuePosition = cueTicksToNormalizedPosition(
+    currentTicks + delta,
+    fullDurationTicks,
+  )
+  centerSourceCueViewport(deckIndex)
+  renderCueControls(deckIndex)
+}
+
+function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
+  const deck = decks[deckIndex]
+  const controls = getCueElements(deckIndex)
+  const changeZoom = (direction: -1 | 1) => {
+    if (!sourceCueControlsReady(deckIndex)) return
+    const viewport = sourceCueViewports[deckIndex]
+    const currentIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
+    const nextIndex = Math.min(
+      CUE_ZOOM_LEVELS.length - 1,
+      Math.max(0, currentIndex + direction),
+    )
+    sourceCueViewports[deckIndex] = zoomCueViewport(
+      viewport,
+      CUE_ZOOM_LEVELS[nextIndex],
+      deck.cuePosition,
+      0.5,
+    )
+    renderCueControls(deckIndex)
+  }
+
+  controls.zoomOut?.addEventListener('click', () => changeZoom(-1))
+  controls.zoomIn?.addEventListener('click', () => changeZoom(1))
+  controls.zoomReset?.addEventListener('click', () => {
+    if (!sourceCueControlsReady(deckIndex)) return
+    sourceCueViewports[deckIndex] = createCueViewport()
+    renderCueControls(deckIndex)
+  })
+
+  controls.waveform.addEventListener('wheel', (event) => {
+    if (!sourceCueControlsReady(deckIndex) || event.deltaY === 0) return
+    event.preventDefault()
+    const viewport = sourceCueViewports[deckIndex]
+    const currentIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
+    const nextIndex = Math.min(
+      CUE_ZOOM_LEVELS.length - 1,
+      Math.max(0, currentIndex + (event.deltaY < 0 ? 1 : -1)),
+    )
+    if (nextIndex === currentIndex) return
+    const bounds = controls.waveform.getBoundingClientRect()
+    const pointerX = event.clientX - bounds.left
+    const anchorRatio = Math.min(1, Math.max(0, pointerX / bounds.width))
+    const anchorPosition = cuePositionFromPointer(pointerX, bounds.width, viewport)
+    sourceCueViewports[deckIndex] = zoomCueViewport(
+      viewport,
+      CUE_ZOOM_LEVELS[nextIndex],
+      anchorPosition,
+      anchorRatio,
+    )
+    renderCueControls(deckIndex)
+  }, { passive: false })
+
+  controls.waveform.addEventListener('pointerdown', (event) => {
+    if (!sourceCueControlsReady(deckIndex) || event.button !== 0) return
+    cuePointerDrags[deckIndex] = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      initialViewport: { ...sourceCueViewports[deckIndex] },
+      panning: false,
+    }
+    controls.waveform.setPointerCapture(event.pointerId)
+  })
+  controls.waveform.addEventListener('pointermove', (event) => {
+    const drag = cuePointerDrags[deckIndex]
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const movement = event.clientX - drag.startClientX
+    if (!drag.panning && Math.abs(movement) >= CUE_WAVEFORM_DRAG_THRESHOLD) {
+      drag.panning = true
+      controls.waveform.classList.add('is-panning')
+    }
+    if (!drag.panning || drag.initialViewport.zoomLevel === 1) return
+    const bounds = controls.waveform.getBoundingClientRect()
+    const span = drag.initialViewport.end - drag.initialViewport.start
+    sourceCueViewports[deckIndex] = panCueViewport(
+      drag.initialViewport,
+      -movement / bounds.width * span,
+    )
+    renderCueControls(deckIndex)
+    controls.waveform.classList.add('is-panning')
+  })
+  const finishPointer = (event: PointerEvent, cancelled: boolean) => {
+    const drag = cuePointerDrags[deckIndex]
+    if (!drag || drag.pointerId !== event.pointerId) return
+    cuePointerDrags[deckIndex] = null
+    controls.waveform.classList.remove('is-panning')
+    if (controls.waveform.hasPointerCapture(event.pointerId)) {
+      controls.waveform.releasePointerCapture(event.pointerId)
+    }
+    if (cancelled || drag.panning || !sourceCueControlsReady(deckIndex)) return
+    const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+    if (fullDurationTicks === null) return
+    const bounds = controls.waveform.getBoundingClientRect()
+    const position = cuePositionFromPointer(
+      event.clientX - bounds.left,
+      bounds.width,
+      sourceCueViewports[deckIndex],
+    )
+    deck.cuePosition = cueTicksToNormalizedPosition(
+      normalizedCuePositionToTicks(position, fullDurationTicks),
+      fullDurationTicks,
+    )
+    renderCueControls(deckIndex)
+  }
+  controls.waveform.addEventListener('pointerup', (event) => finishPointer(event, false))
+  controls.waveform.addEventListener('pointercancel', (event) => finishPointer(event, true))
+  controls.waveform.addEventListener('keydown', (event) => {
+    if (!sourceCueControlsReady(deckIndex)) return
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp'].includes(event.key)) return
+    event.preventDefault()
+    adjustSourceCueTicks(
+      deckIndex,
+      (event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? -1 : 1)
+        * (event.shiftKey ? 10 : 1),
+    )
+  })
+}
+
 function setupCueControls(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   const controls = getCueElements(deckIndex)
   controls.slider.addEventListener('input', () => {
-    if (deckIndex < 2) {
+    if (isSourceDeckIndex(deckIndex)) {
       const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
       if (fullDurationTicks === null) return
-      deck.cuePosition = cuePositionForBar(
+      deck.cuePosition = cueTicksToNormalizedPosition(
         Number(controls.slider.value),
-        Ticks.Bars(1),
         fullDurationTicks,
       )
+      centerSourceCueViewport(deckIndex)
     } else {
       deck.cuePosition = Number(controls.slider.value) / 1000
     }
     renderCueControls(deckIndex)
+  })
+  controls.slider.addEventListener('keydown', (event) => {
+    if (!isSourceDeckIndex(deckIndex) || !sourceCueControlsReady(deckIndex)) return
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp'].includes(event.key)) return
+    event.preventDefault()
+    adjustSourceCueTicks(
+      deckIndex,
+      (event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? -1 : 1)
+        * (event.shiftKey ? 10 : 1),
+    )
   })
   controls.pads.forEach(({ trigger, clear }, slot) => {
     trigger.addEventListener('click', () => {
@@ -3736,8 +4018,9 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
         return
       }
       deck.cuePosition = point
+      if (isSourceDeckIndex(deckIndex)) centerSourceCueViewport(deckIndex)
       renderCueControls(deckIndex)
-      if (deckIndex < 2) {
+      if (isSourceDeckIndex(deckIndex)) {
         const sourceDeckIndex = deckIndex as 0 | 1
         queueDeckTransportOperation(
           sourceDeckIndex,
@@ -3755,6 +4038,7 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
       })
     })
   })
+  if (isSourceDeckIndex(deckIndex)) setupSourceCueWaveformControls(deckIndex)
   renderCueControls(deckIndex)
 }
 
