@@ -52,15 +52,13 @@ import {
   cuePositionsFromSegments,
   planCueRegionDuplicate,
   planLegacyCueChainCollapse,
-  planAudioRegionSplit,
+  planMagicCueLoopLaunch,
   planResizedCueOffsets,
   planSourceInstanceTimingResize,
 } from './cue-utils.js'
 import {
   emptyCuePointSlots,
   loadCuePointMetadata,
-  parseCueRecordV1,
-  reconcileLegacyCuePoints,
   saveCuePointMetadata,
 } from './cue-storage-utils.js'
 import type {
@@ -449,7 +447,8 @@ let tempoSessionId = 0
 let magicWaveformPeaks: number[] | null = null
 const cueWaveformPeaks: [number[] | null, number[] | null, number[] | null] = [null, null, null]
 const cueAudioBufferPeakCache = new WeakMap<AudioBuffer, number[]>()
-const sourceCueViewports: [CueViewport, CueViewport] = [
+const cueViewports: [CueViewport, CueViewport, CueViewport] = [
+  createCueViewport(),
   createCueViewport(),
   createCueViewport(),
 ]
@@ -459,7 +458,11 @@ interface CuePointerDrag {
   initialViewport: CueViewport
   panning: boolean
 }
-const cuePointerDrags: [CuePointerDrag | null, CuePointerDrag | null] = [null, null]
+const cuePointerDrags: [CuePointerDrag | null, CuePointerDrag | null, CuePointerDrag | null] = [
+  null,
+  null,
+  null,
+]
 let suppressMagicProjectRemovalSync = false
 let liveAudioStream: MediaStream | null = null
 let liveAudioContext: AudioContext | null = null
@@ -577,6 +580,7 @@ const musicLibraryFallbackInput = el<HTMLInputElement>('music-library-fallback')
 const inputProjectUrl = el<HTMLInputElement>('input-project-url')
 const magentaUrl = el<HTMLInputElement>('magenta-url')
 const btnGenerate = el<HTMLButtonElement>('btn-generate')
+const btnClearMagic = el<HTMLButtonElement>('deck3-clear')
 const magicDot = el<HTMLSpanElement>('magic-dot')
 const magicStatusLabel = el<HTMLSpanElement>('magic-status-label')
 const magicPrompt = el<HTMLInputElement>('magic-prompt')
@@ -2472,14 +2476,6 @@ async function persistCuePoints(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   if (!deck.audioFootprint) return
   try {
-    if (deckIndex === 2) {
-      await writeSessionCueRecord(deck.audioFootprint, {
-        version: 1,
-        audioFootprint: deck.audioFootprint,
-        points: [...deck.cuePoints] as CuePointSlots,
-      })
-      return
-    }
     const result = await saveCuePointMetadata({
       audioFootprint: deck.audioFootprint,
       points: deck.cuePoints,
@@ -2760,6 +2756,31 @@ function applySourceDeckLaunchPlan(
   return scheduledRegion
 }
 
+function applyMagicDeckLaunchPlan(
+  t: SafeTransactionBuilder,
+  region: NexusEntity<'audioRegion'>,
+  positionTicks: number,
+  durationTicks: number,
+) {
+  const scheduledRegion = collapseLegacyCueChain(t, region)
+  const fields = scheduledRegion.fields.region.fields
+  t.update(fields.positionTicks, positionTicks)
+  t.update(fields.durationTicks, durationTicks)
+  t.update(fields.collectionOffsetTicks, fields.loopOffsetTicks.value)
+  if (!fields.isEnabled.value) t.update(fields.isEnabled, true)
+  if (scheduledRegion.fields.fadeInDurationTicks.value > durationTicks) {
+    t.update(scheduledRegion.fields.fadeInDurationTicks, durationTicks)
+  }
+  const maximumFadeOutTicks = Math.max(
+    0,
+    durationTicks - Math.min(scheduledRegion.fields.fadeInDurationTicks.value, durationTicks),
+  )
+  if (scheduledRegion.fields.fadeOutDurationTicks.value > maximumFadeOutTicks) {
+    t.update(scheduledRegion.fields.fadeOutDurationTicks, maximumFadeOutTicks)
+  }
+  return scheduledRegion
+}
+
 function deckCueRegions(entities: EntityQuery, deckIndex: WaveformDeckIndex) {
   const regionId = decks[deckIndex].regionEntity?.id
   if (!regionId) return []
@@ -3004,17 +3025,15 @@ function resetDeckCueState(deckIndex: WaveformDeckIndex) {
   deck.cueLoading = false
   deck.scheduledCuePosition = 0
   deck.cuePersistenceWarning = false
-  if (isSourceDeckIndex(deckIndex)) {
-    sourceCueViewports[deckIndex] = createCueViewport()
-    cuePointerDrags[deckIndex] = null
-  }
+  cueViewports[deckIndex] = createCueViewport()
+  cuePointerDrags[deckIndex] = null
   renderCueControls(deckIndex)
 }
 
 function resetDeckCuePosition(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   deck.cuePosition = 0
-  if (isSourceDeckIndex(deckIndex)) sourceCueViewports[deckIndex] = createCueViewport()
+  cueViewports[deckIndex] = createCueViewport()
   renderCueControls(deckIndex)
 }
 
@@ -3024,8 +3043,8 @@ function formatCueTime(deckIndex: WaveformDeckIndex, position: number) {
   return formatDuration(Math.min(durationSeconds, Math.max(0, position * durationSeconds)))
 }
 
-function formatSourceCuePosition(
-  deckIndex: 0 | 1,
+function formatTickCuePosition(
+  deckIndex: WaveformDeckIndex,
   position: number,
   fullDurationTicks: number,
 ) {
@@ -3046,9 +3065,9 @@ function getCueElements(deckIndex: WaveformDeckIndex) {
     slider: el<HTMLInputElement>(`${prefix}-position`),
     position: el<HTMLOutputElement>(`${prefix}-position-value`),
     status: el<HTMLSpanElement>(`${prefix}-status`),
-    zoomOut: deckIndex < 2 ? el<HTMLButtonElement>(`${prefix}-zoom-out`) : null,
-    zoomReset: deckIndex < 2 ? el<HTMLButtonElement>(`${prefix}-zoom-reset`) : null,
-    zoomIn: deckIndex < 2 ? el<HTMLButtonElement>(`${prefix}-zoom-in`) : null,
+    zoomOut: el<HTMLButtonElement>(`${prefix}-zoom-out`),
+    zoomReset: el<HTMLButtonElement>(`${prefix}-zoom-reset`),
+    zoomIn: el<HTMLButtonElement>(`${prefix}-zoom-in`),
     pads: Array.from({ length: 5 }, (_, slot) => ({
       trigger: el<HTMLButtonElement>(`${prefix}-${slot + 1}`),
       clear: el<HTMLButtonElement>(`${prefix}-${slot + 1}-clear`),
@@ -3089,9 +3108,7 @@ function drawCueWaveform(deckIndex: WaveformDeckIndex) {
   const peaks = deck.audioBuffer
     ? audioBufferCuePeaks(deck.audioBuffer)
     : cueWaveformPeaks[deckIndex]
-  const viewport = isSourceDeckIndex(deckIndex)
-    ? sourceCueViewports[deckIndex]
-    : createCueViewport()
+  const viewport = cueViewports[deckIndex]
   context.fillStyle = '#080000'
   context.fillRect(0, 0, width, height)
 
@@ -3158,84 +3175,67 @@ function isCueDeckLoaded(deckIndex: WaveformDeckIndex) {
 }
 
 function renderCueControls(deckIndex: WaveformDeckIndex) {
+  if (deckIndex === 2) renderMagicClearButton()
   const deck = decks[deckIndex]
   const controls = getCueElements(deckIndex)
   const loaded = isCueDeckLoaded(deckIndex)
   const operationPending = deckOperationStates[deckIndex].pendingCount > 0
     || deck.tempoUpdatePending
-  const fullDurationTicks = isSourceDeckIndex(deckIndex)
-    ? getSynchronizedDeckFullDurationTicks(deckIndex)
-    : null
+  const fullDurationTicks = getCueDurationTicks(deckIndex)
   const ready = projectConnected
     && loaded
     && deck.audioFootprint !== null
     && !deck.cueLoading
     && !operationPending
-    && (!isSourceDeckIndex(deckIndex) || fullDurationTicks !== null)
+    && fullDurationTicks !== null
   controls.module.classList.toggle('is-disabled', !loaded)
   controls.waveform.setAttribute(
     'aria-label',
-    `${placementDeckLabel(deckIndex)} cue waveform with ${deck.cuePoints.filter((point) => point !== null).length} saved cue markers${isSourceDeckIndex(deckIndex) ? '; click to set the cue, drag to pan, and use the wheel to zoom' : ''}`,
+    `${placementDeckLabel(deckIndex)} cue waveform with ${deck.cuePoints.filter((point) => point !== null).length} saved cue markers; click to set the cue, drag to pan, and use the wheel to zoom`,
   )
   controls.waveform.setAttribute('aria-disabled', String(!ready))
-  controls.waveform.classList.toggle('is-interactive', ready && isSourceDeckIndex(deckIndex))
+  controls.waveform.classList.toggle('is-interactive', ready)
   controls.waveform.classList.toggle(
     'is-pannable',
-    ready && isSourceDeckIndex(deckIndex) && sourceCueViewports[deckIndex].zoomLevel > 1,
+    ready && cueViewports[deckIndex].zoomLevel > 1,
   )
   controls.slider.disabled = !ready
-  if (isSourceDeckIndex(deckIndex)) {
-    const cueTicks = fullDurationTicks === null
-      ? 0
-      : normalizedCuePositionToTicks(deck.cuePosition, fullDurationTicks)
-    controls.slider.min = '0'
-    controls.slider.max = String(fullDurationTicks === null ? 0 : fullDurationTicks - 1)
-    controls.slider.step = '1'
-    controls.slider.value = String(cueTicks)
-    controls.position.value = fullDurationTicks === null
-      ? '—'
-      : formatSourceCuePosition(deckIndex, deck.cuePosition, fullDurationTicks)
-    controls.waveform.setAttribute('role', 'slider')
-    controls.waveform.setAttribute('aria-valuemin', '0')
-    controls.waveform.setAttribute(
-      'aria-valuemax',
-      String(fullDurationTicks === null ? 0 : fullDurationTicks - 1),
-    )
-    controls.waveform.setAttribute('aria-valuenow', String(cueTicks))
-    controls.waveform.setAttribute('aria-valuetext', controls.position.value)
-  } else {
-    controls.slider.min = '0'
-    controls.slider.max = '999'
-    controls.slider.step = '1'
-    controls.slider.value = String(Math.round(deck.cuePosition * 1000))
-    controls.position.value = formatCueTime(deckIndex, deck.cuePosition)
-  }
+  const cueTicks = fullDurationTicks === null
+    ? 0
+    : normalizedCuePositionToTicks(deck.cuePosition, fullDurationTicks)
+  controls.slider.min = '0'
+  controls.slider.max = String(fullDurationTicks === null ? 0 : fullDurationTicks - 1)
+  controls.slider.step = '1'
+  controls.slider.value = String(cueTicks)
+  controls.position.value = fullDurationTicks === null
+    ? '—'
+    : formatTickCuePosition(deckIndex, deck.cuePosition, fullDurationTicks)
+  controls.waveform.setAttribute('role', 'slider')
+  controls.waveform.setAttribute('aria-valuemin', '0')
+  controls.waveform.setAttribute(
+    'aria-valuemax',
+    String(fullDurationTicks === null ? 0 : fullDurationTicks - 1),
+  )
+  controls.waveform.setAttribute('aria-valuenow', String(cueTicks))
+  controls.waveform.setAttribute('aria-valuetext', controls.position.value)
   controls.slider.setAttribute('aria-valuetext', controls.position.value)
-  if (isSourceDeckIndex(deckIndex)) {
-    const viewport = sourceCueViewports[deckIndex]
-    const zoomIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
-    if (controls.zoomOut) controls.zoomOut.disabled = !ready || zoomIndex <= 0
-    if (controls.zoomIn) {
-      controls.zoomIn.disabled = !ready || zoomIndex >= CUE_ZOOM_LEVELS.length - 1
-    }
-    if (controls.zoomReset) {
-      controls.zoomReset.disabled = !ready || viewport.zoomLevel === 1
-      controls.zoomReset.textContent = `${viewport.zoomLevel}×`
-      controls.zoomReset.title = viewport.zoomLevel === 1
-        ? 'Cue waveform is showing the full track'
-        : `Reset ${placementDeckLabel(deckIndex)} cue waveform from ${viewport.zoomLevel}× zoom`
-    }
-  }
+  const viewport = cueViewports[deckIndex]
+  const zoomIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
+  controls.zoomOut.disabled = !ready || zoomIndex <= 0
+  controls.zoomIn.disabled = !ready || zoomIndex >= CUE_ZOOM_LEVELS.length - 1
+  controls.zoomReset.disabled = !ready || viewport.zoomLevel === 1
+  controls.zoomReset.textContent = `${viewport.zoomLevel}×`
+  controls.zoomReset.title = viewport.zoomLevel === 1
+    ? 'Cue waveform is showing the full track'
+    : `Reset ${placementDeckLabel(deckIndex)} cue waveform from ${viewport.zoomLevel}× zoom`
   controls.status.textContent = deckOperationStates[deckIndex].activeKind === 'cue-scheduling'
     ? 'SCHEDULING SAVED CUE…'
     : deck.cueLoading
-      ? deckIndex < 2 ? 'LOADING CUE METADATA…' : 'SYNCING PROJECT CUTS…'
+      ? 'LOADING CUE METADATA…'
       : ready
-        ? deckIndex < 2
-          ? deck.cuePersistenceWarning
-            ? 'CUES ARE SESSION-ONLY · INDEXEDDB PERSISTENCE UNAVAILABLE'
-            : 'CLICK A TRANSIENT OR ADJUST ONE TICK AT A TIME · SET A PAD OR SELECT A SAVED CUE'
-          : 'SET EMPTY PAD TO CUT THE AUDIOTOOL REGION · × JOINS THE CUT'
+        ? deck.cuePersistenceWarning
+          ? 'CUES ARE SESSION-ONLY · INDEXEDDB PERSISTENCE UNAVAILABLE'
+          : 'CLICK A TRANSIENT OR ADJUST ONE TICK AT A TIME · SET A PAD OR SELECT A SAVED CUE'
         : loaded
           ? 'CUES UNAVAILABLE'
           : 'LOAD A TRACK TO ADD CUES'
@@ -3243,8 +3243,7 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     const point = deck.cuePoints[slot]
     trigger.disabled = !ready
     trigger.classList.toggle('is-set', point !== null)
-    const scheduled = isSourceDeckIndex(deckIndex)
-      && point !== null
+    const scheduled = point !== null
       && fullDurationTicks !== null
       && normalizedCuePositionToTicks(point, fullDurationTicks)
         === normalizedCuePositionToTicks(deck.scheduledCuePosition, fullDurationTicks)
@@ -3255,12 +3254,8 @@ function renderCueControls(deckIndex: WaveformDeckIndex) {
     trigger.setAttribute(
       'aria-label',
       point === null
-        ? isSourceDeckIndex(deckIndex)
-          ? `Save cue ${slot + 1} at ${fullDurationTicks === null ? 'the selected source position' : formatSourceCuePosition(deckIndex, deck.cuePosition, fullDurationTicks)}`
-          : `Create Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, deck.cuePosition)}`
-        : isSourceDeckIndex(deckIndex)
-          ? `Schedule cue ${slot + 1} from ${fullDurationTicks === null ? 'the saved source position' : formatSourceCuePosition(deckIndex, point, fullDurationTicks)}`
-          : `Select Audiotool cut ${slot + 1} at ${formatCueTime(deckIndex, point)}`,
+        ? `Save cue ${slot + 1} at ${fullDurationTicks === null ? 'the selected source position' : formatTickCuePosition(deckIndex, deck.cuePosition, fullDurationTicks)}`
+        : `Schedule cue ${slot + 1} from ${fullDurationTicks === null ? 'the saved source position' : formatTickCuePosition(deckIndex, point, fullDurationTicks)}`,
     )
     clear.disabled = !ready || point === null
     clear.classList.toggle('is-hidden', point === null)
@@ -3288,32 +3283,52 @@ async function initializeDeckCues(
     const authoritativePoints = nexus
       ? projectCuePositions(nexus.queryEntities, deckIndex)
       : []
-    const result = deckIndex < 2
-      ? await loadCuePointMetadata({
-          audioFootprint,
-          authoritativePoints,
-          readPersistent: () => readPersistentCueRecord(audioFootprint),
-          readSession: () => readSessionCueRecord(audioFootprint),
-          writePersistent: writePersistentCueRecord,
-          writeSession: (record) => writeSessionCueRecord(audioFootprint, record),
-          removeSession: () => removeSessionCueRecord(audioFootprint),
-        })
-      : {
-          points: reconcileLegacyCuePoints(
-            parseCueRecordV1(await readSessionCueRecord(audioFootprint), audioFootprint)
-              ?? emptyCuePoints(),
-            authoritativePoints,
-          ),
-          persistence: 'session' as const,
-          migrated: false,
-        }
+    const result = await loadCuePointMetadata({
+      audioFootprint,
+      authoritativePoints,
+      readPersistent: () => readPersistentCueRecord(audioFootprint),
+      readSession: () => readSessionCueRecord(audioFootprint),
+      writePersistent: writePersistentCueRecord,
+      writeSession: (record) => writeSessionCueRecord(audioFootprint, record),
+      removeSession: () => removeSessionCueRecord(audioFootprint),
+    })
     if (loadId !== deck.cueLoadId || deck.sampleMeta !== sampleMeta) return
     deck.cuePoints = result.points
-    deck.cuePersistenceWarning = deckIndex < 2 && result.persistence === 'session'
+    deck.cuePersistenceWarning = result.persistence === 'session'
     if ('error' in result && result.error) {
       console.warn('[CUES] IndexedDB unavailable; using session fallback:', result.error)
     }
-    if (deckIndex === 2) await persistCuePoints(deckIndex)
+    if (deckIndex === 2 && authoritativePoints.length > 0 && nexus) {
+      const projectDocument = nexus
+      const expectedSession = tempoSessionId
+      const regionId = deck.regionEntity?.id
+      if (regionId) {
+        const collapsed = await projectDocument.modify((t) => {
+          if (
+            nexus !== projectDocument
+            || expectedSession !== tempoSessionId
+            || deck.regionEntity?.id !== regionId
+          ) throw new Error('Project changed before legacy Magic cues were migrated')
+          const anchor = t.entities.ofTypes('audioRegion').getEntity(regionId)
+          return anchor ? collapseLegacyCueChain(t, anchor) : null
+        })
+        if (collapsed && deck.regionEntity?.id === regionId) {
+          const sample = projectDocument.queryEntities
+            .ofTypes('sample')
+            .getEntity(collapsed.fields.sample.value.entityId)
+          const automationCollection = projectDocument.queryEntities
+            .ofTypes('automationCollection')
+            .getEntity(collapsed.fields.playbackAutomationCollection.value.entityId)
+          if (sample && automationCollection) {
+            bindDeckContentGraph(2, projectDocument, {
+              region: collapsed,
+              sample,
+              automationCollection,
+            }, expectedSession)
+          }
+        }
+      }
+    }
   } catch (error) {
     if (loadId !== deck.cueLoadId) return
     console.warn(`[CUES] ${placementDeckLabel(deckIndex)} initialization:`, error)
@@ -3337,220 +3352,47 @@ async function loadSourceCuePointsForFootprint(audioFootprint: string) {
   })
 }
 
-async function createProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
+async function saveDeckCuePoint(deckIndex: WaveformDeckIndex, slot: number) {
   const deck = decks[deckIndex]
-  if (isSourceDeckIndex(deckIndex)) {
-    const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
-    if (fullDurationTicks === null) throw new Error('The synchronized track duration is unavailable')
-    const position = cueTicksToNormalizedPosition(
-      normalizedCuePositionToTicks(deck.cuePosition, fullDurationTicks),
-      fullDurationTicks,
-    )
-    deck.cuePoints[slot] = position
-    deck.cuePosition = position
-    renderCueControls(deckIndex)
-    await persistCuePoints(deckIndex)
-    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SAVED AT ${formatSourceCuePosition(deckIndex, position, fullDurationTicks)} · SELECT IT AGAIN TO SCHEDULE`)
-    return
+  const fullDurationTicks = getCueDurationTicks(deckIndex)
+  if (fullDurationTicks === null) {
+    throw new Error('The synchronized cue duration is unavailable')
   }
-  const projectDocument = nexus
-  const expectedSession = tempoSessionId
-  const regionId = deck.regionEntity?.id
-  if (!projectDocument || !projectConnected || !regionId) {
-    throw new Error('The synchronized Audiotool region is required')
-  }
-  const operationId = ++deck.cueLoadId
-  const requestedPosition = deck.cuePosition
+  const position = cueTicksToNormalizedPosition(
+    normalizedCuePositionToTicks(deck.cuePosition, fullDurationTicks),
+    fullDurationTicks,
+  )
+  deck.cuePoints[slot] = position
+  deck.cuePosition = position
   deck.cueLoading = true
   renderCueControls(deckIndex)
   try {
-    const result = await serializeSourceTiming(() => projectDocument.modify((t) => {
-      if (
-        nexus !== projectDocument
-        || !projectConnected
-        || expectedSession !== tempoSessionId
-        || deck.regionEntity?.id !== regionId
-        || deck.cueLoadId !== operationId
-      ) throw new Error('Project connection changed before the cue cut')
-      const regions = deckCueRegions(t.entities, deckIndex)
-      if (regions.length === 0) throw new Error('The Audiotool region is no longer available')
-      const firstPositionTicks = regions[0].fields.region.fields.positionTicks.value
-      const last = regions.at(-1)!
-      const endPositionTicks =
-        last.fields.region.fields.positionTicks.value
-        + last.fields.region.fields.durationTicks.value
-      const fullDurationTicks = endPositionTicks - firstPositionTicks
-      const cutTicks = firstPositionTicks + Math.round(requestedPosition * fullDurationTicks)
-      if (cutTicks <= firstPositionTicks || cutTicks >= endPositionTicks) {
-        throw new Error('Move the cue away from the start or end of the region')
-      }
-      const existingCut = regions.find((region) =>
-        region.fields.region.fields.positionTicks.value === cutTicks)
-      if (existingCut) {
-        throw new Error('There is already an Audiotool cut at this position')
-      }
-      const containingRegion = regions.find((region) => {
-        const positionTicks = region.fields.region.fields.positionTicks.value
-        return cutTicks > positionTicks
-          && cutTicks < positionTicks + region.fields.region.fields.durationTicks.value
-      })
-      if (!containingRegion) throw new Error('Move the cue away from a region edge')
-      const regionFields = containingRegion.fields.region.fields
-      const split = planAudioRegionSplit({
-        positionTicks: regionFields.positionTicks.value,
-        durationTicks: regionFields.durationTicks.value,
-        collectionOffsetTicks: regionFields.collectionOffsetTicks.value,
-        loopOffsetTicks: regionFields.loopOffsetTicks.value,
-        loopDurationTicks: regionFields.loopDurationTicks.value,
-      }, cutTicks)
-      const originalFadeOutTicks = containingRegion.fields.fadeOutDurationTicks.value
-      const leftFadeInTicks = Math.min(
-        containingRegion.fields.fadeInDurationTicks.value,
-        split.leftDurationTicks,
-      )
-      const rightFadeOutTicks = Math.min(
-        originalFadeOutTicks,
-        split.right.durationTicks,
-      )
-      t.update(containingRegion.fields.fadeInDurationTicks, leftFadeInTicks)
-      t.update(containingRegion.fields.fadeOutDurationTicks, 0)
-      t.update(regionFields.durationTicks, split.leftDurationTicks)
-      t.create('audioRegion', buildIndependentAudioRegionCopy({
-        region: {
-          positionTicks: regionFields.positionTicks.value,
-          durationTicks: regionFields.durationTicks.value,
-          collectionOffsetTicks: regionFields.collectionOffsetTicks.value,
-          loopOffsetTicks: regionFields.loopOffsetTicks.value,
-          loopDurationTicks: regionFields.loopDurationTicks.value,
-          isEnabled: regionFields.isEnabled.value,
-          colorIndex: regionFields.colorIndex.value,
-          displayName: regionFields.displayName.value,
-        },
-        track: containingRegion.fields.track.value,
-        playbackAutomationCollection:
-          containingRegion.fields.playbackAutomationCollection.value,
-        sample: containingRegion.fields.sample.value,
-        gain: containingRegion.fields.gain.value,
-        fadeInDurationTicks: containingRegion.fields.fadeInDurationTicks.value,
-        fadeInSlope: containingRegion.fields.fadeInSlope.value,
-        fadeOutDurationTicks: originalFadeOutTicks,
-        fadeOutSlope: containingRegion.fields.fadeOutSlope.value,
-        timestretchMode: containingRegion.fields.timestretchMode.value,
-        pitchShiftSemitones: containingRegion.fields.pitchShiftSemitones.value,
-      }, {
-        region: split.right,
-        fadeInDurationTicks: 0,
-        fadeOutDurationTicks: rightFadeOutTicks,
-      }))
-      return { cuePosition: (cutTicks - firstPositionTicks) / fullDurationTicks }
-    }))
-    if (
-      nexus !== projectDocument
-      || expectedSession !== tempoSessionId
-      || deck.regionEntity?.id !== regionId
-      || deck.cueLoadId !== operationId
-    ) return
-    deck.cuePoints[slot] = result.cuePosition
-    deck.cuePosition = result.cuePosition
-    void persistCuePoints(deckIndex)
-    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT IN AUDIOTOOL AT ${formatCueTime(deckIndex, result.cuePosition)}`)
+    await persistCuePoints(deckIndex)
+    setStatus(
+      'connected',
+      `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SAVED AT ${formatTickCuePosition(deckIndex, position, fullDurationTicks)} · SELECT IT AGAIN TO SCHEDULE`,
+    )
   } finally {
-    if (deck.cueLoadId === operationId) {
-      deck.cueLoading = false
-      renderCueControls(deckIndex)
-    }
+    deck.cueLoading = false
+    renderCueControls(deckIndex)
   }
 }
 
-async function removeProjectCueCut(deckIndex: WaveformDeckIndex, slot: number) {
+async function removeDeckCuePoint(deckIndex: WaveformDeckIndex, slot: number) {
   const deck = decks[deckIndex]
-  if (deckIndex < 2) {
-    if (deck.cuePoints[slot] === null) return
-    deck.cuePoints[slot] = null
-    renderCueControls(deckIndex)
-    await persistCuePoints(deckIndex)
-    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} METADATA CLEARED · SCHEDULED AUDIO UNCHANGED`)
-    return
-  }
-  const projectDocument = nexus
-  const expectedSession = tempoSessionId
-  const regionId = deck.regionEntity?.id
-  const cuePosition = deck.cuePoints[slot]
-  if (!projectDocument || !projectConnected || !regionId || cuePosition === null) {
-    throw new Error('The synchronized Audiotool cut is no longer available')
-  }
-  const operationId = ++deck.cueLoadId
+  if (deck.cuePoints[slot] === null) return
+  deck.cuePoints[slot] = null
   deck.cueLoading = true
   renderCueControls(deckIndex)
   try {
-    const authoritativePoints = await serializeSourceTiming(() => projectDocument.modify((t) => {
-      if (
-        nexus !== projectDocument
-        || !projectConnected
-        || expectedSession !== tempoSessionId
-        || deck.regionEntity?.id !== regionId
-        || deck.cueLoadId !== operationId
-      ) throw new Error('Project connection changed before joining the cue cut')
-      const regions = deckCueRegions(t.entities, deckIndex)
-      const firstPositionTicks = regions[0]?.fields.region.fields.positionTicks.value
-      const last = regions.at(-1)
-      if (firstPositionTicks === undefined || !last) {
-        throw new Error('The Audiotool regions are no longer available')
-      }
-      const endPositionTicks =
-        last.fields.region.fields.positionTicks.value
-        + last.fields.region.fields.durationTicks.value
-      const fullDurationTicks = endPositionTicks - firstPositionTicks
-      const closestCut = regions
-        .slice(1)
-        .map((region, index) => ({
-          difference: Math.abs(
-            (region.fields.region.fields.positionTicks.value - firstPositionTicks)
-              / fullDurationTicks
-              - cuePosition,
-          ),
-          rightIndex: index + 1,
-        }))
-        .sort((a, b) => a.difference - b.difference)[0]
-      const rightIndex = closestCut && closestCut.difference < 0.000_5
-        ? closestCut.rightIndex
-        : -1
-      if (rightIndex <= 0) throw new Error('The Audiotool cut was changed or removed')
-      const left = regions[rightIndex - 1]
-      const right = regions[rightIndex]
-      const mergedDurationTicks =
-        left.fields.region.fields.durationTicks.value
-        + right.fields.region.fields.durationTicks.value
-      t.update(
-        left.fields.region.fields.durationTicks,
-        mergedDurationTicks,
-      )
-      t.update(left.fields.fadeOutDurationTicks, right.fields.fadeOutDurationTicks.value)
-      t.remove(right)
-      const remaining = regions.filter((region) => region.id !== right.id)
-      return cuePositionsFromSegments(remaining.map((region) => ({
-        id: region.id,
-        positionTicks: region.fields.region.fields.positionTicks.value,
-        durationTicks: region.id === left.id
-          ? mergedDurationTicks
-          : region.fields.region.fields.durationTicks.value,
-      }))).slice(0, 5)
-    }))
-    if (
-      nexus !== projectDocument
-      || expectedSession !== tempoSessionId
-      || deck.regionEntity?.id !== regionId
-      || deck.cueLoadId !== operationId
-    ) return
-    deck.cuePoints[slot] = null
-    deck.cuePoints = reconcileLegacyCuePoints(deck.cuePoints, authoritativePoints)
-    void persistCuePoints(deckIndex)
-    setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} CUT JOINED IN AUDIOTOOL`)
+    await persistCuePoints(deckIndex)
+    setStatus(
+      'connected',
+      `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} METADATA CLEARED · SCHEDULED AUDIO UNCHANGED`,
+    )
   } finally {
-    if (deck.cueLoadId === operationId) {
-      deck.cueLoading = false
-      renderCueControls(deckIndex)
-    }
+    deck.cueLoading = false
+    renderCueControls(deckIndex)
   }
 }
 
@@ -3885,7 +3727,167 @@ async function mutateSourceCueSchedule(
   }
 }
 
-function sourceCueControlsReady(deckIndex: 0 | 1) {
+async function mutateMagicCueSchedule(
+  slot: number,
+  expectedSession: number,
+) {
+  const deckIndex = 2
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  const regionId = deck.regionEntity?.id
+  const cuePosition = deck.cuePoints[slot]
+  const loopDurationTicks = getCueDurationTicks(deckIndex)
+  if (!projectDocument || !projectConnected || !regionId || cuePosition === null) {
+    throw new Error('The synchronized Magic Deck cue is no longer available')
+  }
+  if (loopDurationTicks === null) throw new Error('The Magic Deck loop duration is unavailable')
+
+  const targetBar = await showBarAssistant(deckIndex, 'cue-launch', {
+    cueNumber: slot + 1,
+    cuePosition,
+    cueSourceBar: cueBarForPosition(cuePosition, Ticks.Bars(1), loopDurationTicks),
+  })
+  if (targetBar === null) {
+    setMagicRestingStatus(
+      deck.audioBuffer ? 'generated' : 'restored',
+      `${deck.fileName ?? 'MAGIC AUDIO'} · CUE ${slot + 1} CANCELLED`,
+    )
+    return false
+  }
+  if (
+    nexus !== projectDocument
+    || !projectConnected
+    || expectedSession !== tempoSessionId
+    || deck.regionEntity?.id !== regionId
+    || deck.cuePoints[slot] !== cuePosition
+  ) throw new Error('Project or Magic cue state changed during scheduling')
+
+  const targetTicks = barToPositionTicks(targetBar, Ticks.Bars(1))
+  const guardedIds: string[] = []
+  try {
+    const duplicate = await projectDocument.modify((t) => {
+      if (
+        nexus !== projectDocument
+        || !projectConnected
+        || expectedSession !== tempoSessionId
+        || deck.regionEntity?.id !== regionId
+        || deck.cuePoints[slot] !== cuePosition
+      ) throw new Error('Project or Magic cue state changed before scheduling')
+      const boundRegion = t.entities.ofTypes('audioRegion').getEntity(regionId)
+      if (!boundRegion) throw new Error('The synchronized Magic region is unavailable')
+      const region = collapseLegacyCueChain(t, boundRegion)
+      const sample = t.entities.ofTypes('sample').getEntity(region.fields.sample.value.entityId)
+      const automationCollection = t.entities
+        .ofTypes('automationCollection')
+        .getEntity(region.fields.playbackAutomationCollection.value.entityId)
+      if (!sample || !automationCollection) {
+        throw new Error('The synchronized Magic sample or playback automation is unavailable')
+      }
+      const currentLoopDurationTicks = region.fields.region.fields.loopDurationTicks.value
+      const scheduledDurationTicks = getMagicLoopDurationTicks(t)
+      const plan = planMagicCueLoopLaunch({
+        source: {
+          region: {
+            positionTicks: region.fields.region.fields.positionTicks.value,
+            durationTicks: region.fields.region.fields.durationTicks.value,
+            collectionOffsetTicks: region.fields.region.fields.collectionOffsetTicks.value,
+            loopOffsetTicks: region.fields.region.fields.loopOffsetTicks.value,
+            loopDurationTicks: currentLoopDurationTicks,
+            isEnabled: region.fields.region.fields.isEnabled.value,
+            colorIndex: region.fields.region.fields.colorIndex.value,
+            displayName: region.fields.region.fields.displayName.value,
+          },
+          track: region.fields.track.value,
+          playbackAutomationCollection: region.fields.playbackAutomationCollection.value,
+          sample: region.fields.sample.value,
+          gain: region.fields.gain.value,
+          fadeInDurationTicks: region.fields.fadeInDurationTicks.value,
+          fadeInSlope: region.fields.fadeInSlope.value,
+          fadeOutDurationTicks: region.fields.fadeOutDurationTicks.value,
+          fadeOutSlope: region.fields.fadeOutSlope.value,
+          timestretchMode: region.fields.timestretchMode.value,
+          pitchShiftSemitones: region.fields.pitchShiftSemitones.value,
+        },
+        targetPositionTicks: targetTicks,
+        loopDurationTicks: currentLoopDurationTicks,
+        scheduledDurationTicks,
+        cuePosition,
+      })
+      const trackId = region.fields.track.value.entityId
+      const destinationRegions = t.entities.ofTypes('audioRegion').get().filter((candidate) =>
+        candidate.fields.track.value.entityId === trackId)
+      const takeover = planNonOverlappingCueTakeover(
+        destinationRegions.map(regionSnapshot),
+        targetTicks,
+        scheduledDurationTicks,
+      )
+      const duplicateRegion = t.create('audioRegion', plan.region)
+      takeover.truncate.forEach((truncation) => {
+        const existing = t.entities.ofTypes('audioRegion').getEntity(truncation.id)
+        if (!existing || existing.fields.track.value.entityId !== trackId) {
+          throw new Error('Magic track content changed during cue takeover planning')
+        }
+        t.update(existing.fields.region.fields.durationTicks, truncation.durationTicks)
+        t.update(existing.fields.fadeInDurationTicks, truncation.fadeInDurationTicks)
+        t.update(existing.fields.fadeOutDurationTicks, truncation.fadeOutDurationTicks)
+      })
+      const removedIds = new Set(takeover.removeRegionIds)
+      const removedSampleIds = new Set<string>()
+      const removedAutomationIds = new Set<string>()
+      takeover.removeRegionIds.forEach((existingRegionId) => {
+        const existing = t.entities.ofTypes('audioRegion').getEntity(existingRegionId)
+        if (!existing || existing.fields.track.value.entityId !== trackId) {
+          throw new Error('Magic track content changed during cue takeover planning')
+        }
+        guardedRegionRemovalIds.add(existingRegionId)
+        guardedIds.push(existingRegionId)
+        removedSampleIds.add(existing.fields.sample.value.entityId)
+        removedAutomationIds.add(
+          existing.fields.playbackAutomationCollection.value.entityId,
+        )
+        t.remove(existing)
+      })
+      removedSampleIds.forEach((sampleId) => {
+        const stillUsed = t.entities.ofTypes('audioRegion').get().some((candidate) =>
+          !removedIds.has(candidate.id) && candidate.fields.sample.value.entityId === sampleId)
+        const removedSample = stillUsed
+          ? undefined
+          : t.entities.ofTypes('sample').getEntity(sampleId)
+        if (removedSample) t.removeWithDependencies(removedSample)
+      })
+      removedAutomationIds.forEach((collectionId) => {
+        const stillUsed = t.entities.ofTypes('audioRegion').get().some((candidate) =>
+          !removedIds.has(candidate.id)
+          && candidate.fields.playbackAutomationCollection.value.entityId === collectionId)
+        const removedCollection = stillUsed
+          ? undefined
+          : t.entities.ofTypes('automationCollection').getEntity(collectionId)
+        if (removedCollection) t.removeWithDependencies(removedCollection)
+      })
+      return {
+        region: duplicateRegion,
+        sample,
+        automationCollection,
+      }
+    })
+    if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
+      throw new Error('Project connection changed after Magic cue scheduling')
+    }
+    bindDeckContentGraph(deckIndex, projectDocument, duplicate, expectedSession)
+    deck.scheduledCuePosition = cuePosition
+    deck.cuePosition = cuePosition
+    renderCueControls(deckIndex)
+    setMagicRestingStatus(
+      deck.audioBuffer ? 'generated' : 'restored',
+      `CUE ${slot + 1} · BAR ${targetBar}`,
+    )
+    return true
+  } finally {
+    guardedIds.forEach((guardedId) => guardedRegionRemovalIds.delete(guardedId))
+  }
+}
+
+function cueControlsReady(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   return projectConnected
     && isCueDeckLoaded(deckIndex)
@@ -3893,12 +3895,12 @@ function sourceCueControlsReady(deckIndex: 0 | 1) {
     && !deck.cueLoading
     && deckOperationStates[deckIndex].pendingCount === 0
     && !deck.tempoUpdatePending
-    && getSynchronizedDeckFullDurationTicks(deckIndex) !== null
+    && getCueDurationTicks(deckIndex) !== null
 }
 
-function centerSourceCueViewport(deckIndex: 0 | 1) {
-  const viewport = sourceCueViewports[deckIndex]
-  sourceCueViewports[deckIndex] = zoomCueViewport(
+function centerCueViewport(deckIndex: WaveformDeckIndex) {
+  const viewport = cueViewports[deckIndex]
+  cueViewports[deckIndex] = zoomCueViewport(
     viewport,
     viewport.zoomLevel,
     decks[deckIndex].cuePosition,
@@ -3906,8 +3908,8 @@ function centerSourceCueViewport(deckIndex: 0 | 1) {
   )
 }
 
-function adjustSourceCueTicks(deckIndex: 0 | 1, delta: number) {
-  const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+function adjustCueTicks(deckIndex: WaveformDeckIndex, delta: number) {
+  const fullDurationTicks = getCueDurationTicks(deckIndex)
   if (fullDurationTicks === null) return
   const currentTicks = normalizedCuePositionToTicks(
     decks[deckIndex].cuePosition,
@@ -3917,22 +3919,22 @@ function adjustSourceCueTicks(deckIndex: 0 | 1, delta: number) {
     currentTicks + delta,
     fullDurationTicks,
   )
-  centerSourceCueViewport(deckIndex)
+  centerCueViewport(deckIndex)
   renderCueControls(deckIndex)
 }
 
-function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
+function setupCueWaveformControls(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   const controls = getCueElements(deckIndex)
   const changeZoom = (direction: -1 | 1) => {
-    if (!sourceCueControlsReady(deckIndex)) return
-    const viewport = sourceCueViewports[deckIndex]
+    if (!cueControlsReady(deckIndex)) return
+    const viewport = cueViewports[deckIndex]
     const currentIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
     const nextIndex = Math.min(
       CUE_ZOOM_LEVELS.length - 1,
       Math.max(0, currentIndex + direction),
     )
-    sourceCueViewports[deckIndex] = zoomCueViewport(
+    cueViewports[deckIndex] = zoomCueViewport(
       viewport,
       CUE_ZOOM_LEVELS[nextIndex],
       deck.cuePosition,
@@ -3944,15 +3946,15 @@ function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
   controls.zoomOut?.addEventListener('click', () => changeZoom(-1))
   controls.zoomIn?.addEventListener('click', () => changeZoom(1))
   controls.zoomReset?.addEventListener('click', () => {
-    if (!sourceCueControlsReady(deckIndex)) return
-    sourceCueViewports[deckIndex] = createCueViewport()
+    if (!cueControlsReady(deckIndex)) return
+    cueViewports[deckIndex] = createCueViewport()
     renderCueControls(deckIndex)
   })
 
   controls.waveform.addEventListener('wheel', (event) => {
-    if (!sourceCueControlsReady(deckIndex) || event.deltaY === 0) return
+    if (!cueControlsReady(deckIndex) || event.deltaY === 0) return
     event.preventDefault()
-    const viewport = sourceCueViewports[deckIndex]
+    const viewport = cueViewports[deckIndex]
     const currentIndex = CUE_ZOOM_LEVELS.indexOf(viewport.zoomLevel)
     const nextIndex = Math.min(
       CUE_ZOOM_LEVELS.length - 1,
@@ -3963,7 +3965,7 @@ function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
     const pointerX = event.clientX - bounds.left
     const anchorRatio = Math.min(1, Math.max(0, pointerX / bounds.width))
     const anchorPosition = cuePositionFromPointer(pointerX, bounds.width, viewport)
-    sourceCueViewports[deckIndex] = zoomCueViewport(
+    cueViewports[deckIndex] = zoomCueViewport(
       viewport,
       CUE_ZOOM_LEVELS[nextIndex],
       anchorPosition,
@@ -3973,11 +3975,11 @@ function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
   }, { passive: false })
 
   controls.waveform.addEventListener('pointerdown', (event) => {
-    if (!sourceCueControlsReady(deckIndex) || event.button !== 0) return
+    if (!cueControlsReady(deckIndex) || event.button !== 0) return
     cuePointerDrags[deckIndex] = {
       pointerId: event.pointerId,
       startClientX: event.clientX,
-      initialViewport: { ...sourceCueViewports[deckIndex] },
+      initialViewport: { ...cueViewports[deckIndex] },
       panning: false,
     }
     controls.waveform.setPointerCapture(event.pointerId)
@@ -3993,7 +3995,7 @@ function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
     if (!drag.panning || drag.initialViewport.zoomLevel === 1) return
     const bounds = controls.waveform.getBoundingClientRect()
     const span = drag.initialViewport.end - drag.initialViewport.start
-    sourceCueViewports[deckIndex] = panCueViewport(
+    cueViewports[deckIndex] = panCueViewport(
       drag.initialViewport,
       -movement / bounds.width * span,
     )
@@ -4008,14 +4010,14 @@ function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
     if (controls.waveform.hasPointerCapture(event.pointerId)) {
       controls.waveform.releasePointerCapture(event.pointerId)
     }
-    if (cancelled || drag.panning || !sourceCueControlsReady(deckIndex)) return
-    const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
+    if (cancelled || drag.panning || !cueControlsReady(deckIndex)) return
+    const fullDurationTicks = getCueDurationTicks(deckIndex)
     if (fullDurationTicks === null) return
     const bounds = controls.waveform.getBoundingClientRect()
     const position = cuePositionFromPointer(
       event.clientX - bounds.left,
       bounds.width,
-      sourceCueViewports[deckIndex],
+      cueViewports[deckIndex],
     )
     deck.cuePosition = cueTicksToNormalizedPosition(
       normalizedCuePositionToTicks(position, fullDurationTicks),
@@ -4026,10 +4028,10 @@ function setupSourceCueWaveformControls(deckIndex: 0 | 1) {
   controls.waveform.addEventListener('pointerup', (event) => finishPointer(event, false))
   controls.waveform.addEventListener('pointercancel', (event) => finishPointer(event, true))
   controls.waveform.addEventListener('keydown', (event) => {
-    if (!sourceCueControlsReady(deckIndex)) return
+    if (!cueControlsReady(deckIndex)) return
     if (!['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp'].includes(event.key)) return
     event.preventDefault()
-    adjustSourceCueTicks(
+    adjustCueTicks(
       deckIndex,
       (event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? -1 : 1)
         * (event.shiftKey ? 10 : 1),
@@ -4041,24 +4043,20 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
   const deck = decks[deckIndex]
   const controls = getCueElements(deckIndex)
   controls.slider.addEventListener('input', () => {
-    if (isSourceDeckIndex(deckIndex)) {
-      const fullDurationTicks = getSynchronizedDeckFullDurationTicks(deckIndex)
-      if (fullDurationTicks === null) return
-      deck.cuePosition = cueTicksToNormalizedPosition(
-        Number(controls.slider.value),
-        fullDurationTicks,
-      )
-      centerSourceCueViewport(deckIndex)
-    } else {
-      deck.cuePosition = Number(controls.slider.value) / 1000
-    }
+    const fullDurationTicks = getCueDurationTicks(deckIndex)
+    if (fullDurationTicks === null) return
+    deck.cuePosition = cueTicksToNormalizedPosition(
+      Number(controls.slider.value),
+      fullDurationTicks,
+    )
+    centerCueViewport(deckIndex)
     renderCueControls(deckIndex)
   })
   controls.slider.addEventListener('keydown', (event) => {
-    if (!isSourceDeckIndex(deckIndex) || !sourceCueControlsReady(deckIndex)) return
+    if (!cueControlsReady(deckIndex)) return
     if (!['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp'].includes(event.key)) return
     event.preventDefault()
-    adjustSourceCueTicks(
+    adjustCueTicks(
       deckIndex,
       (event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? -1 : 1)
         * (event.shiftKey ? 10 : 1),
@@ -4068,15 +4066,15 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
     trigger.addEventListener('click', () => {
       const point = deck.cuePoints[slot]
       if (point === null) {
-        void createProjectCueCut(deckIndex, slot).catch((error: unknown) => {
+        void saveDeckCuePoint(deckIndex, slot).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error)
-          const action = deckIndex < 2 ? 'CUE SAVE' : 'CUE CUT'
+          const action = 'CUE SAVE'
           setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: ${action} FAILED — ${message}`)
         })
         return
       }
       deck.cuePosition = point
-      if (isSourceDeckIndex(deckIndex)) centerSourceCueViewport(deckIndex)
+      centerCueViewport(deckIndex)
       renderCueControls(deckIndex)
       if (isSourceDeckIndex(deckIndex)) {
         const sourceDeckIndex = deckIndex as 0 | 1
@@ -4086,17 +4084,21 @@ function setupCueControls(deckIndex: WaveformDeckIndex) {
           (expectedSession) => mutateSourceCueSchedule(sourceDeckIndex, slot, expectedSession),
         )
       } else {
-        setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE ${slot + 1} SELECTED — PLAYBACK REMAINS IN AUDIOTOOL`)
+        queueDeckTransportOperation(
+          2,
+          'cue-scheduling',
+          (expectedSession) => mutateMagicCueSchedule(slot, expectedSession),
+        )
       }
     })
     clear.addEventListener('click', () => {
-      void removeProjectCueCut(deckIndex, slot).catch((error: unknown) => {
+      void removeDeckCuePoint(deckIndex, slot).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error)
-        setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE JOIN FAILED — ${message}`)
+        setStatus('error', `${placementDeckLabel(deckIndex).toUpperCase()}: CUE CLEAR FAILED — ${message}`)
       })
     })
   })
-  if (isSourceDeckIndex(deckIndex)) setupSourceCueWaveformControls(deckIndex)
+  setupCueWaveformControls(deckIndex)
   renderCueControls(deckIndex)
 }
 
@@ -5631,6 +5633,14 @@ function getSynchronizedDeckFullDurationTicks(deckIndex: WaveformDeckIndex) {
   )?.fields.positionTicks.value ?? null
 }
 
+function getCueDurationTicks(deckIndex: WaveformDeckIndex) {
+  if (deckIndex < 2) return getSynchronizedDeckFullDurationTicks(deckIndex)
+  const loopDurationTicks = decks[2].regionEntity?.fields.region.fields.loopDurationTicks.value
+  return Number.isSafeInteger(loopDurationTicks) && loopDurationTicks! > 0
+    ? loopDurationTicks!
+    : null
+}
+
 function getDeckTransportElements(deckIndex: WaveformDeckIndex) {
   const prefix = `d${deckIndex + 1}`
   return {
@@ -5649,6 +5659,7 @@ function getDeckTransportElements(deckIndex: WaveformDeckIndex) {
 
 function renderDeckTransport(deckIndex: WaveformDeckIndex) {
   const controls = getDeckTransportElements(deckIndex)
+  if (deckIndex === 2) renderMagicClearButton()
   const operation = deckOperationStates[deckIndex]
   const region = decks[deckIndex].regionEntity
   const available = projectConnected && nexus !== null && region !== null
@@ -6055,13 +6066,12 @@ async function mutateDeckCrossfade(
         incomingFullDurationTicks,
       )
     } else {
-      const incomingRegions = updateDeckRegionChainTiming(
+      applyMagicDeckLaunchPlan(
         t,
         incomingRegion,
         incomingPlan.positionTicks,
         incomingPlan.durationTicks,
       )
-      updateAudioRegionChainEnabled(t, incomingRegions, incomingPlan.isEnabled)
     }
 
     const fadeEndTicks = targetTicks + fadeDurationTicks
@@ -6136,7 +6146,8 @@ async function mutateDeckCrossfade(
       expectedSession,
     )
   }
-  if (incomingDeckIndex < 2) incomingDeck.scheduledCuePosition = 0
+  incomingDeck.scheduledCuePosition = 0
+  if (incomingDeckIndex === 2) renderCueControls(2)
   return true
 }
 
@@ -6194,13 +6205,12 @@ async function mutateDeckLaunch(
     } else if (deckIndex < 2) {
       applySourceDeckLaunchPlan(t, region, plan, fullDurationTicks)
     } else {
-      const regions = updateDeckRegionChainTiming(
+      applyMagicDeckLaunchPlan(
         t,
         region,
         plan.positionTicks,
         plan.durationTicks,
       )
-      updateAudioRegionChainEnabled(t, regions, plan.isEnabled)
     }
     return null
   }))
@@ -6211,7 +6221,8 @@ async function mutateDeckLaunch(
     commitSourceChunkGroupLaunch(launchedContent)
     bindDeckContentGraph(deckIndex, projectDocument, launchedContent.content, expectedSession)
   }
-  if (deckIndex < 2) deck.scheduledCuePosition = 0
+  deck.scheduledCuePosition = 0
+  if (deckIndex === 2) renderCueControls(2)
   return true
 }
 
@@ -6713,7 +6724,23 @@ function watchMagicDeckContent(
       if (magicDeck.regionEntity?.id === region.id) renderDeckTransport(2)
     }),
     projectDocument.events.onUpdate(region.fields.region.fields.loopDurationTicks, () => {
-      if (magicDeck.regionEntity?.id === region.id) scheduleDeckTimingReconstruction(2)
+      if (magicDeck.regionEntity?.id === region.id) {
+        scheduleDeckTimingReconstruction(2)
+        renderCueControls(2)
+      }
+    }),
+    projectDocument.events.onUpdate(region.fields.region.fields.collectionOffsetTicks, () => {
+      if (
+        magicDeck.regionEntity?.id !== region.id
+        || deckOperationStates[2].pendingCount > 0
+      ) return
+      const fields = region.fields.region.fields
+      const loopDurationTicks = fields.loopDurationTicks.value
+      const cueOffsetTicks = fields.collectionOffsetTicks.value - fields.loopOffsetTicks.value
+      magicDeck.scheduledCuePosition = loopDurationTicks > 0 && cueOffsetTicks > 0
+        ? Math.min((loopDurationTicks - 1) / loopDurationTicks, cueOffsetTicks / loopDurationTicks)
+        : 0
+      renderCueControls(2)
     }),
     projectDocument.events.onRemove(region, () => {
       if (
@@ -6807,6 +6834,17 @@ function bindDeckContentGraph(
       expectedSession,
     )
   } else {
+    if (!replacingBoundContent) {
+      const fields = content.region.fields.region.fields
+      const loopDurationTicks = fields.loopDurationTicks.value
+      const loopCueOffsetTicks = fields.collectionOffsetTicks.value - fields.loopOffsetTicks.value
+      deck.scheduledCuePosition = loopDurationTicks > 0 && loopCueOffsetTicks > 0
+        ? Math.min(
+            (loopDurationTicks - 1) / loopDurationTicks,
+            loopCueOffsetTicks / loopDurationTicks,
+          )
+        : 0
+    }
     watchMagicDeckContent(projectDocument, content.region, expectedSession)
   }
   scheduleDeckTimingReconstruction(deckIndex)
@@ -8175,30 +8213,73 @@ async function clearDeckProjectContent(deckIndex: 0 | 1, expectedSession: number
   })
 }
 
-async function removeMagicDeckProjectContent(expectedSession: number) {
-  const magicDeck = decks[2]
+function renderMagicClearButton() {
+  const operation = deckOperationStates[2]
+  const hasContent = decks[2].regionEntity !== null
+  const pending = operation.pendingCount > 0
+    || decks[2].tempoUpdatePending
+    || decks[2].cueLoading
+    || activeFxDeckIndex === 2
+  btnClearMagic.classList.toggle('is-hidden', !hasContent)
+  btnClearMagic.disabled = !projectConnected || !hasContent || pending
+  btnClearMagic.textContent = operation.activeKind === 'clearing' ? 'CLEARING…' : 'CLEAR DECK'
+}
+
+async function clearMagicDeckProjectContent(expectedSession: number) {
+  const deck = decks[2]
   const projectDocument = nexus
-  if (!projectDocument || !projectConnected || expectedSession !== tempoSessionId) {
-    throw new Error('Project is not connected')
-  }
+  const trackId = deck.trackEntity?.id
+  if (
+    !projectDocument
+    || !projectConnected
+    || expectedSession !== tempoSessionId
+    || !trackId
+  ) throw new Error('The synchronized Magic track is no longer available')
 
-  const regionId = magicDeck.regionEntity?.id
-  const storedSampleId = magicDeck.sampleEntity?.id
-  const storedAutomationCollectionId = magicDeck.automationCollectionEntity?.id
-  if (!regionId) return
-
+  const catalogDependencies = [{
+    sampleId: deck.sampleEntity?.id,
+    automationCollectionId: deck.automationCollectionEntity?.id,
+  }]
+  const clearedRegionIds = new Set<string>()
   suppressMagicProjectRemovalSync = true
   try {
     await projectDocument.modify((t) => {
-      removeDeckContentInTransaction(
-        t,
-        regionId,
-        storedSampleId,
-        storedAutomationCollectionId,
+      if (nexus !== projectDocument || expectedSession !== tempoSessionId) {
+        throw new Error('Project connection changed before clearing Magic Deck')
+      }
+      const track = t.entities.ofTypes('audioTrack').getEntity(trackId)
+      if (!track) throw new Error('The synchronized Magic track is no longer available')
+      const regions = t.entities.ofTypes('audioRegion').get()
+      const plan = planDeckTrackClear(
+        regions.map((region) => ({
+          id: region.id,
+          trackId: region.fields.track.value.entityId,
+          sampleId: region.fields.sample.value.entityId,
+          automationCollectionId:
+            region.fields.playbackAutomationCollection.value.entityId,
+        })),
+        trackId,
+        catalogDependencies,
       )
+      plan.regionIds.forEach((regionId) => {
+        guardedRegionRemovalIds.add(regionId)
+        clearedRegionIds.add(regionId)
+        const region = t.entities.ofTypes('audioRegion').getEntity(regionId)
+        if (region) t.remove(region)
+      })
+      plan.sampleIds.forEach((sampleId) => {
+        const sample = t.entities.ofTypes('sample').getEntity(sampleId)
+        if (sample) t.removeWithDependencies(sample)
+      })
+      plan.automationCollectionIds.forEach((collectionId) => {
+        const collection = t.entities.ofTypes('automationCollection').getEntity(collectionId)
+        if (collection) t.removeWithDependencies(collection)
+      })
     })
-    clearDeckContentEntities(magicDeck)
+    clearDeckContentEntities(deck)
+    clearMagicDeckLocalMedia()
   } finally {
+    clearedRegionIds.forEach((regionId) => guardedRegionRemovalIds.delete(regionId))
     suppressMagicProjectRemovalSync = false
   }
 }
@@ -8896,6 +8977,7 @@ function closeDeckFxAssistant(restoreFocus = true) {
   }
   document.removeEventListener('keydown', handleDeckFxAssistantKey)
   renderDeckFxAvailability()
+  renderMagicClearButton()
   if (restoreFocus && trigger && !trigger.disabled && trigger.isConnected) trigger.focus()
 }
 
@@ -8924,6 +9006,7 @@ async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
   activeFxTrigger = trigger ?? null
   controls.error.textContent = ''
   setDeckFxAssistantView(deckIndex, true, true)
+  renderMagicClearButton()
   document.removeEventListener('keydown', handleDeckFxAssistantKey)
   document.addEventListener('keydown', handleDeckFxAssistantKey)
   controls.assistant.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
@@ -9183,6 +9266,46 @@ function queueDeckClear(deckIndex: 0 | 1) {
       operation.pendingCount = Math.max(0, operation.pendingCount - 1)
       if (operation.pendingCount === 0) operation.activeKind = null
       updateSourceDeckUi(deckIndex)
+    })
+}
+
+function queueMagicDeckClear() {
+  const operation = deckOperationStates[2]
+  if (
+    operation.pendingCount > 0
+    || !projectConnected
+    || !decks[2].regionEntity
+    || decks[2].cueLoading
+    || decks[2].tempoUpdatePending
+    || activeFxDeckIndex === 2
+  ) return
+  cancelDeckBarAssistant(2)
+  const expectedSession = tempoSessionId
+  operation.pendingCount += 1
+  operation.activeKind = 'clearing'
+  setMagicStatus('generating', 'CLEARING MAGIC TRACK CONTENT…')
+  renderDeckTransport(2)
+  renderCueControls(2)
+  void clearMagicDeckProjectContent(expectedSession)
+    .then(() => {
+      if (expectedSession !== tempoSessionId) return
+      setTemporaryMagicStatus(
+        'done',
+        'CLEARED · ROUTING, MIXER, FX, PROMPT, AND ROLE PRESERVED',
+        5000,
+      )
+    })
+    .catch((error: unknown) => {
+      if (expectedSession !== tempoSessionId) return
+      const message = error instanceof Error ? error.message : String(error)
+      setTemporaryMagicStatus('error', `CLEAR FAILED · ${message.toUpperCase()}`, 6000)
+    })
+    .finally(() => {
+      operation.pendingCount = Math.max(0, operation.pendingCount - 1)
+      if (operation.pendingCount === 0) operation.activeKind = null
+      renderDeckTransport(2)
+      renderCueControls(2)
+      renderDeckFxAvailability()
     })
 }
 
@@ -10093,6 +10216,7 @@ function initApp() {
   setupDropZone('drop-2', 1)
   setupClearDeckButton(0)
   setupClearDeckButton(1)
+  btnClearMagic.addEventListener('click', queueMagicDeckClear)
   setupCueControls(0)
   setupCueControls(1)
   setupCueControls(2)

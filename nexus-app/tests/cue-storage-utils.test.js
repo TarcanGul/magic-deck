@@ -99,3 +99,30 @@ test('falls back to session storage when a later persistent save fails', async (
   assert.equal(result.persistence, 'session')
   assert.deepEqual(fixture.written.session?.points, [0, null, precisePosition, null, null])
 })
+
+test('migrates legacy Magic cuts and durably saves later cue removal', async () => {
+  const legacyMagicSlots = [0.625, null, 0.125, null, null]
+  const fixture = adapters({
+    authoritativePoints: [0.125, 0.625],
+    readSession: async () => ({
+      version: 1,
+      audioFootprint: footprint,
+      points: legacyMagicSlots,
+    }),
+  })
+  const migrated = await loadCuePointMetadata(fixture.options)
+  assert.deepEqual(migrated.points, legacyMagicSlots)
+  assert.equal(migrated.persistence, 'indexeddb')
+
+  const removed = [...migrated.points]
+  removed[0] = null
+  const saved = await saveCuePointMetadata({
+    audioFootprint: footprint,
+    points: removed,
+    writePersistent: fixture.options.writePersistent,
+    writeSession: fixture.options.writeSession,
+    now: () => 456,
+  })
+  assert.equal(saved.persistence, 'indexeddb')
+  assert.deepEqual(fixture.written.persistent?.points, [null, null, 0.125, null, null])
+})

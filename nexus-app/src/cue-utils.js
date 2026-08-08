@@ -110,6 +110,60 @@ export function planCueRegionDuplicate({
   }
 }
 
+export function planMagicCueLoopLaunch({
+  source,
+  targetPositionTicks,
+  loopDurationTicks,
+  scheduledDurationTicks,
+  cuePosition,
+}) {
+  if (!Number.isSafeInteger(targetPositionTicks) || targetPositionTicks < 0) {
+    throw new RangeError('Magic cue target must be a non-negative safe tick position')
+  }
+  if (!Number.isSafeInteger(loopDurationTicks) || loopDurationTicks <= 0) {
+    throw new RangeError('Magic cue loop duration must be a positive safe integer')
+  }
+  if (!Number.isSafeInteger(scheduledDurationTicks) || scheduledDurationTicks <= 0) {
+    throw new RangeError('Magic cue scheduled duration must be a positive safe integer')
+  }
+  if (
+    typeof cuePosition !== 'number'
+    || !Number.isFinite(cuePosition)
+    || cuePosition < 0
+    || cuePosition >= 1
+  ) throw new RangeError('Magic cue position must be a finite number in [0, 1)')
+
+  const cueOffsetTicks = Math.round(loopDurationTicks * cuePosition)
+  const firstLoopDurationTicks = loopDurationTicks - cueOffsetTicks
+  if (firstLoopDurationTicks <= 0) {
+    throw new RangeError('Magic cue must leave playable audio in the first loop')
+  }
+  const fadeInDurationTicks = Math.min(
+    Math.max(0, source.fadeInDurationTicks),
+    scheduledDurationTicks,
+  )
+  const fadeOutDurationTicks = Math.min(
+    Math.max(0, source.fadeOutDurationTicks),
+    Math.max(0, scheduledDurationTicks - fadeInDurationTicks),
+  )
+  return {
+    region: buildIndependentAudioRegionCopy(source, {
+      region: {
+        positionTicks: targetPositionTicks,
+        durationTicks: scheduledDurationTicks,
+        collectionOffsetTicks: source.region.loopOffsetTicks + cueOffsetTicks,
+        loopDurationTicks,
+        isEnabled: true,
+      },
+      fadeInDurationTicks,
+      fadeOutDurationTicks,
+    }),
+    cueOffsetTicks,
+    firstLoopDurationTicks,
+    scheduledDurationTicks,
+  }
+}
+
 export function planSourceInstanceTimingResize({
   positionTicks,
   durationTicks,

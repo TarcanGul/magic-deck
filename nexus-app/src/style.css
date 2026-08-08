@@ -1131,6 +1131,7 @@ html, body { height: 100%; overflow: hidden; background: var(--black); color: va
 .magic-num { color: #ff2222; text-shadow: 0 0 20px var(--red); }
 .magic-title { color: var(--white); text-shadow: 0 0 10px var(--red-glow); letter-spacing: 6px; }
 .magic-status { display: flex; min-width: 0; align-items: center; gap: 8px; margin-left: auto; }
+.magic-status .deck-clear { flex: 0 0 auto; }
 .status-dot-magic { width: 10px; height: 10px; border-radius: 50%; background: var(--grey-text); }
 .status-dot-magic.idle { background: var(--grey-text); }
 .status-dot-magic.generating { background: #ff8800; box-shadow: 0 0 8px #ff8800; animation: blink 0.6s infinite; }

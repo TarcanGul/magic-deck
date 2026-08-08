@@ -63,3 +63,19 @@ test('formats bar, beat, tick, and millisecond source position', () => {
     'B4.4.3839 · 0:31.999',
   )
 })
+
+test('keeps Magic loop navigation tick-precise through zoom, pan, and reset', () => {
+  const loopDurationTicks = 61_440
+  const cueTicks = 19_323
+  const cuePosition = cueTicksToNormalizedPosition(cueTicks, loopDurationTicks)
+  const zoomed = zoomCueViewport(createCueViewport(), 8, cuePosition, 0.5)
+  const panned = panCueViewport(zoomed, 0.01)
+  const pointerPosition = cuePositionFromPointer(600, 1200, panned)
+
+  assert.equal(normalizedCuePositionToTicks(cuePosition, loopDurationTicks), cueTicks)
+  assert.equal(
+    normalizedCuePositionToTicks(pointerPosition, loopDurationTicks),
+    normalizedCuePositionToTicks((panned.start + panned.end) / 2, loopDurationTicks),
+  )
+  assert.deepEqual(createCueViewport(), { zoomLevel: 1, start: 0, end: 1 })
+})
