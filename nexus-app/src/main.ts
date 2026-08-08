@@ -104,6 +104,14 @@ import {
 } from './deck-filter-utils.js'
 import type { DeckFilterKind } from './deck-filter-utils.js'
 import {
+  createMagicStatusController,
+  isDeckFxAvailable,
+} from './magic-deck-ui-utils.js'
+import type {
+  MagicContentKind,
+  MagicStatusState,
+} from './magic-deck-ui-utils.js'
+import {
   createPerKeyTaskQueue,
   createUploadTimingRecorder,
   isCurrentSession,
@@ -787,9 +795,22 @@ function setStatus(state: 'idle' | 'connecting' | 'connected' | 'error', msg: st
   statusText.textContent = msg
   console.log(`[STATUS] ${state}: ${msg}`)
 }
-function setMagicStatus(state: 'idle' | 'generating' | 'error' | 'done' | 'warning', label: string) {
+const magicStatusController = createMagicStatusController(({ state, label }) => {
   magicDot.className = `status-dot-magic ${state}`
   magicStatusLabel.textContent = label
+})
+function setMagicStatus(state: MagicStatusState, label: string) {
+  magicStatusController.show({ state, label })
+}
+function setMagicRestingStatus(content: MagicContentKind, detail = '') {
+  magicStatusController.setResting(content, detail)
+}
+function setTemporaryMagicStatus(
+  state: MagicStatusState,
+  label: string,
+  durationMs: number,
+) {
+  magicStatusController.showTemporary({ state, label }, durationMs)
 }
 
 function placementDeckLabel(deckIndex: WaveformDeckIndex) {
@@ -1300,6 +1321,7 @@ function resetTempoMasterSession() {
   projectConnected = false
   currentProjectId = null
   currentProjectBpm = null
+  magicStatusController.clear()
   renderDeckFxAvailability()
   decks.forEach((_, deckIndex) => resetDeckTempoState(deckIndex as WaveformDeckIndex))
   pendingBpmResolutions.forEach((resolve, deckIndex) => {
@@ -2303,13 +2325,13 @@ async function restoreMagicDeckFromProject(
   void initializeDeckCues(2, sampleMeta)
   if (peaks) {
     drawMagicPeakWaveform(peaks)
-    setMagicStatus(
-      'done',
-      `RESTORED · ${magicDeck.fileName} · ${formatDuration(sampleMeta.durationSeconds)}`,
+    setMagicRestingStatus(
+      'restored',
+      `${magicDeck.fileName} · ${formatDuration(sampleMeta.durationSeconds)}`,
     )
   } else {
     drawMagicIdle(`[ RESTORED: ${magicDeck.fileName} — WAVEFORM UNAVAILABLE ]`)
-    setMagicStatus('warning', `RESTORED · ${magicDeck.fileName}`)
+    setMagicRestingStatus('restored', magicDeck.fileName)
   }
 }
 
@@ -4175,6 +4197,8 @@ function clearMagicDeckLocalMedia() {
   renderDeckTransport(2)
   renderCueControls(2)
   drawMagicIdle()
+  magicStatusController.clear()
+  renderDeckFxAvailability()
 }
 
 function normalizeBpm(value: number | null | undefined): number | null {
@@ -6437,14 +6461,18 @@ function handleExternalMagicContentRemoval() {
   if (suppressMagicProjectRemovalSync) return
   clearMagicDeckLocalMedia()
   clearDeckContentEntities(decks[2])
-  setMagicStatus('warning', 'PROJECT REGION REMOVED · MAGIC TRACK IS EMPTY')
+  setTemporaryMagicStatus('warning', 'PROJECT REGION REMOVED · MAGIC TRACK IS EMPTY', 5000)
 }
 
 function handleExternalMagicRoutingRemoval(removedEntity: 'track' | 'device') {
   if (suppressMagicProjectRemovalSync) return
   clearMagicDeckLocalMedia()
   clearDeckProjectEntities(decks[2])
-  setMagicStatus('warning', `PROJECT ${removedEntity.toUpperCase()} REMOVED · GENERATE TO REPLACE`)
+  setTemporaryMagicStatus(
+    'warning',
+    `PROJECT ${removedEntity.toUpperCase()} REMOVED · GENERATE TO REPLACE`,
+    5000,
+  )
 }
 
 function watchDeckRouting(
@@ -7958,7 +7986,11 @@ async function uploadToNexus(
     const deckIndex: WaveformDeckIndex = 2
     const placement = options.placement ?? await captureDeckInsertionPlacement(2)
     if (!placement) {
-      setMagicStatus('warning', 'PLACEMENT CANCELLED · PREVIOUS MAGIC DECK PRESERVED')
+      setTemporaryMagicStatus(
+        'warning',
+        'PLACEMENT CANCELLED · PREVIOUS MAGIC DECK PRESERVED',
+        5000,
+      )
       setStatus('connected', `${placementDeckLabel(deckIndex).toUpperCase()}: PLACEMENT CANCELLED — SAMPLE NOT INSERTED`)
       return false
     }
@@ -8925,11 +8957,20 @@ async function showDeckFxAssistant(deckIndex: WaveformDeckIndex) {
 function renderDeckFxAvailability() {
   document.querySelectorAll<HTMLButtonElement>('[data-deck-fx]').forEach((button) => {
     const deckIndex = Number(button.dataset.deckFx) as WaveformDeckIndex
-    button.disabled = !projectConnected
-      || nexus === null
-      || deckOperationStates[deckIndex].pendingCount > 0
-      || activeFxDeckIndex === deckIndex
-      || activeLibraryDeckIndex !== null
+    const operation = deckOperationStates[deckIndex]
+    const magicDeck = decks[2]
+    button.disabled = !isDeckFxAvailable({
+      projectConnected,
+      hasProjectDocument: nexus !== null,
+      deckIndex,
+      pendingCount: operation.pendingCount,
+      activeKind: operation.activeKind,
+      hasPlayableMagicContent: magicDeck.regionEntity !== null
+        && magicDeck.trackEntity !== null
+        && magicDeck.audioDeviceEntity !== null,
+      activeFxDeckIndex,
+      hasActiveLibrary: activeLibraryDeckIndex !== null,
+    })
   })
   if (!projectConnected && activeFxDeckIndex !== null) closeDeckFxAssistant()
   if (activeFxDeckIndex !== null) {
@@ -9748,15 +9789,17 @@ function setMagicStemRoleDisabled(disabled: boolean) {
 
 async function generateMagicAudio() {
   const promptText = magicPrompt.value.trim()
-  if (!promptText) { setMagicStatus('error', 'PROMPT REQUIRED'); setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000); return }
+  if (!promptText) {
+    setTemporaryMagicStatus('error', 'PROMPT REQUIRED', 3000)
+    return
+  }
 
   let generationBpm: number
   try {
     generationBpm = getMagicGenerationBpm()
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
-    setMagicStatus('error', message.toUpperCase())
-    setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
+    setTemporaryMagicStatus('error', message.toUpperCase(), 4000)
     return
   }
 
@@ -9765,6 +9808,7 @@ async function generateMagicAudio() {
   magicOperation.pendingCount += 1
   magicOperation.activeKind = 'generating'
   renderDeckTransport(2)
+  renderDeckFxAvailability()
   setMagicStatus('generating', 'PREPARING AUDIO CAPTURE')
   btnGenerate.disabled = true
   setMagicStemRoleDisabled(true)
@@ -9808,7 +9852,6 @@ async function generateMagicAudio() {
       sampleDescription: promptText,
     })
     if (!inserted) {
-      setTimeout(() => setMagicStatus('idle', 'IDLE'), 5000)
       return
     }
     magicDeck.audioBuffer = generatedBuffer
@@ -9817,15 +9860,18 @@ async function generateMagicAudio() {
     drawMagicWaveform(generatedBuffer)
     renderDeckTransport(2)
     void initializeDeckCues(2, magicDeck.sampleMeta!)
+    setMagicRestingStatus(
+      'generated',
+      `${MAGIC_DURATION_BARS} BARS · ${generationBpm} BPM`,
+    )
 
     if (timingWarning || timingStatus !== 'aligned') {
       const warning = timingWarning || `Timing status: ${timingStatus}`
-      setMagicStatus('warning', `⚠ ${warning.toUpperCase().slice(0, 72)}`)
-      setTimeout(() => setMagicStatus('idle', 'IDLE'), 8000)
-    } else {
-      const alignmentLabel = alignmentMs ? ` · ${alignmentMs}ms` : ''
-      setMagicStatus('done', `DONE ${Math.round(reference.seconds)}s REF${alignmentLabel}`)
-      setTimeout(() => setMagicStatus('idle', 'IDLE'), 3000)
+      setTemporaryMagicStatus(
+        'warning',
+        `⚠ ${warning.toUpperCase().slice(0, 72)}`,
+        8000,
+      )
     }
   } catch (e: unknown) {
     console.error('[MAGENTA] generate:', e)
@@ -9834,13 +9880,13 @@ async function generateMagicAudio() {
     if (e instanceof LiveAudioCaptureError) {
       setAudioCaptureStatus('error', message.toUpperCase())
     }
-    setMagicStatus('error', message.toUpperCase().slice(0, 48))
-    setTimeout(() => setMagicStatus('idle', 'IDLE'), 4000)
+    setTemporaryMagicStatus('error', message.toUpperCase().slice(0, 48), 4000)
   }
   finally {
     magicOperation.pendingCount = Math.max(0, magicOperation.pendingCount - 1)
     if (magicOperation.pendingCount === 0) magicOperation.activeKind = null
     renderDeckTransport(2)
+    renderDeckFxAvailability()
     btnGenerate.disabled = false
     setMagicStemRoleDisabled(false)
   }
