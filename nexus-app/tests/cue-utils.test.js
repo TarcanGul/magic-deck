@@ -7,10 +7,103 @@ import {
   cuePositionsFromSegments,
   planAudioRegionSplit,
   planLegacyCueChainCollapse,
+  planMagicCueLoopLaunch,
   planCueRegionDuplicate,
   planResizedCueOffsets,
   planSourceInstanceTimingResize,
 } from '../src/cue-utils.js'
+
+test('plans a loop-preserving Magic cue launch for the normal scheduled span', () => {
+  const source = {
+    region: {
+      positionTicks: 1_000,
+      durationTicks: 64_000,
+      collectionOffsetTicks: 0,
+      loopOffsetTicks: 100,
+      loopDurationTicks: 16_000,
+      isEnabled: false,
+      colorIndex: 4,
+      displayName: 'MAGIC DECK — prompt',
+    },
+    track: 'magic-track',
+    playbackAutomationCollection: 'magic-automation',
+    sample: 'magic-sample',
+    gain: 0.75,
+    fadeInDurationTicks: 500,
+    fadeInSlope: 0.25,
+    fadeOutDurationTicks: 750,
+    fadeOutSlope: 0.8,
+    timestretchMode: 2,
+    pitchShiftSemitones: -2,
+  }
+  const immutableSnapshot = structuredClone(source)
+  const plan = planMagicCueLoopLaunch({
+    source,
+    targetPositionTicks: 96_000,
+    loopDurationTicks: 16_000,
+    scheduledDurationTicks: 80_000,
+    cuePosition: 0.375,
+  })
+
+  assert.equal(plan.cueOffsetTicks, 6_000)
+  assert.equal(plan.firstLoopDurationTicks, 10_000)
+  assert.equal(plan.scheduledDurationTicks, 80_000)
+  assert.deepEqual(plan.region.region, {
+    ...source.region,
+    positionTicks: 96_000,
+    durationTicks: 80_000,
+    collectionOffsetTicks: 6_100,
+    loopDurationTicks: 16_000,
+    isEnabled: true,
+  })
+  assert.equal(plan.region.track, 'magic-track')
+  assert.equal(plan.region.playbackAutomationCollection, 'magic-automation')
+  assert.equal(plan.region.sample, 'magic-sample')
+  assert.equal(plan.region.gain, 0.75)
+  assert.equal(plan.region.timestretchMode, 2)
+  assert.equal(plan.region.pitchShiftSemitones, -2)
+  assert.deepEqual(source, immutableSnapshot)
+})
+
+test('validates Magic cue loop launch boundaries', () => {
+  const source = {
+    region: {
+      positionTicks: 0,
+      durationTicks: 16_000,
+      collectionOffsetTicks: 0,
+      loopOffsetTicks: 0,
+      loopDurationTicks: 16_000,
+      isEnabled: true,
+      colorIndex: 1,
+      displayName: 'Magic',
+    },
+    track: 'track',
+    playbackAutomationCollection: 'automation',
+    sample: 'sample',
+    gain: 1,
+    fadeInDurationTicks: 0,
+    fadeInSlope: 0,
+    fadeOutDurationTicks: 0,
+    fadeOutSlope: 0,
+    timestretchMode: 2,
+    pitchShiftSemitones: 0,
+  }
+  const plan = (overrides = {}) => planMagicCueLoopLaunch({
+    source,
+    targetPositionTicks: 0,
+    loopDurationTicks: 16_000,
+    scheduledDurationTicks: 64_000,
+    cuePosition: 0,
+    ...overrides,
+  })
+
+  assert.equal(plan().firstLoopDurationTicks, 16_000)
+  assert.throws(() => plan({ targetPositionTicks: -1 }), /target/)
+  assert.throws(() => plan({ loopDurationTicks: 0 }), /loop duration/)
+  assert.throws(() => plan({ scheduledDurationTicks: 0 }), /scheduled duration/)
+  assert.throws(() => plan({ cuePosition: 1 }), /\[0, 1\)/)
+  assert.throws(() => plan({ cuePosition: 0.999_99 }), /playable audio/)
+})
 
 test('plans adjacent audio regions without changing playback alignment', () => {
   const original = {

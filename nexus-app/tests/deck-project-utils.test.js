@@ -284,6 +284,23 @@ test('clear plans contain content only and never routing entities', () => {
   assert.equal(JSON.stringify(plan).includes('cable-a'), false)
 })
 
+test('clears all Magic generations while retaining shared dependencies and routing', () => {
+  const plan = planDeckTrackClear([
+    { id: 'magic-current', trackId: 'magic-track', sampleId: 'magic-current-sample', automationCollectionId: 'magic-current-automation' },
+    { id: 'magic-cue', trackId: 'magic-track', sampleId: 'magic-current-sample', automationCollectionId: 'magic-current-automation' },
+    { id: 'magic-history', trackId: 'magic-track', sampleId: 'shared-sample', automationCollectionId: 'shared-automation' },
+    { id: 'deck-a-shared', trackId: 'deck-a', sampleId: 'shared-sample', automationCollectionId: 'shared-automation' },
+  ], 'magic-track')
+
+  assert.deepEqual(plan, {
+    regionIds: ['magic-cue', 'magic-current', 'magic-history'],
+    sampleIds: ['magic-current-sample'],
+    automationCollectionIds: ['magic-current-automation'],
+  })
+  assert.equal('trackIds' in plan, false)
+  assert.equal('routingIds' in plan, false)
+})
+
 test('lets a scheduled cue take over its bar without overlapping existing deck regions', () => {
   const regions = [
     region('original', 0, 100),

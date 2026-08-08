@@ -505,6 +505,7 @@
           <div class="magic-status">
             <span class="status-dot-magic" id="magic-dot"></span>
             <span class="status-label-magic" id="magic-status-label">IDLE</span>
+            <button class="deck-clear is-hidden" id="deck3-clear" type="button" aria-label="Clear Magic Deck">CLEAR DECK</button>
           </div>
         </div>
         <div class="deck-body">
@@ -589,7 +590,14 @@
             <div class="magic-waveform-column">
               <canvas class="magic-waveform" id="magic-waveform" width="600" height="160"></canvas>
               <div class="cue-module is-disabled magic-cue-module" id="d3-cue-module">
-                <canvas class="cue-waveform" id="d3-cue-waveform" width="1200" height="96" role="img" aria-label="Magic Deck cue waveform"></canvas>
+                <div class="cue-waveform-row">
+                  <canvas class="cue-waveform" id="d3-cue-waveform" width="1200" height="96" role="img" tabindex="0" aria-label="Magic Deck cue waveform"></canvas>
+                  <div class="cue-zoom-controls" role="group" aria-label="Magic Deck cue waveform zoom">
+                    <button id="d3-cue-zoom-out" type="button" aria-label="Zoom out Magic Deck cue waveform">−</button>
+                    <button class="cue-zoom-level" id="d3-cue-zoom-reset" type="button" aria-label="Reset Magic Deck cue waveform zoom">1×</button>
+                    <button id="d3-cue-zoom-in" type="button" aria-label="Zoom in Magic Deck cue waveform">+</button>
+                  </div>
+                </div>
                 <div class="cue-position-row">
                   <span class="cue-title">CUE POINTS</span>
                   <input class="cue-position" id="d3-cue-position" type="range" min="0" max="999" step="1" value="0" aria-label="Magic Deck cue position">

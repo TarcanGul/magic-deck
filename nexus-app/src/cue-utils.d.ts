@@ -71,6 +71,21 @@ export function planCueRegionDuplicate<TPointer>(input: CueRegionDuplicateInput<
   automationTerminalTicks: number
 }
 
+export interface MagicCueLoopLaunchInput<TPointer = unknown> {
+  source: CueAudioRegionFields<TPointer>
+  targetPositionTicks: number
+  loopDurationTicks: number
+  scheduledDurationTicks: number
+  cuePosition: number
+}
+
+export function planMagicCueLoopLaunch<TPointer>(input: MagicCueLoopLaunchInput<TPointer>): {
+  region: CueAudioRegionFields<TPointer>
+  cueOffsetTicks: number
+  firstLoopDurationTicks: number
+  scheduledDurationTicks: number
+}
+
 export interface SourceInstanceTimingResizeInput {
   positionTicks: number
   durationTicks: number
