@@ -94,18 +94,22 @@ export function planForwardTimelineInsertion(regions, insertionTicks) {
   if (!Number.isSafeInteger(insertionTicks) || insertionTicks < 0) {
     throw new Error('Insertion position must be a non-negative safe integer')
   }
-  if (regions.some((region) => region.positionTicks === insertionTicks)) {
-    return { kind: 'reject', reason: 'region-starts-at-boundary' }
-  }
 
+  const overwritesFromBoundary = regions.some((region) =>
+    region.positionTicks === insertionTicks)
   const latest = selectLatestLogicalRegion(regions)
-  if (latest && insertionTicks < latest.positionTicks) {
+  if (!overwritesFromBoundary && latest && insertionTicks < latest.positionTicks) {
     return { kind: 'reject', reason: 'backward-placement' }
   }
 
   const truncate = []
   const removeIds = new Set()
   buildLogicalRegionChains(regions).forEach((chain) => {
+    if (overwritesFromBoundary) {
+      chain.forEach((region) => {
+        if (region.positionTicks >= insertionTicks) removeIds.add(region.id)
+      })
+    }
     const crossing = chain.find((region) =>
       region.positionTicks < insertionTicks
       && regionEnd(region) > insertionTicks)

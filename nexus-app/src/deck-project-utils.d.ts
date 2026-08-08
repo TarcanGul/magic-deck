@@ -61,7 +61,7 @@ export function planForwardTimelineInsertion(
   regions: TimelineRegionSnapshot[],
   insertionTicks: number,
 ):
-  | { kind: 'reject'; reason: 'region-starts-at-boundary' | 'backward-placement' }
+  | { kind: 'reject'; reason: 'backward-placement' }
   | { kind: 'insert'; truncate: RegionTruncation[]; removeRegionIds: string[] }
 export function planNonOverlappingCueTakeover(
   regions: TimelineRegionSnapshot[],

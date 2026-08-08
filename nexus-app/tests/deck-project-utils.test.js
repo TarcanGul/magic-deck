@@ -161,7 +161,30 @@ test('clamps fades after a short truncation without changing playback offsets', 
   assert.equal(crossing.loopOffsetTicks, 5)
 })
 
-test('rejects exact-start and backward placement without edit actions', () => {
+test('overwrites exact-start content from the selected boundary forward', () => {
+  const regions = [
+    region('old', 0, 100),
+    region('latest', 200, 100, {
+      sampleId: 'sample-b',
+      automationCollectionId: 'automation-b',
+    }),
+    region('latest-tail', 300, 100, {
+      sampleId: 'sample-b',
+      automationCollectionId: 'automation-b',
+    }),
+    region('later-insertion', 500, 100, {
+      sampleId: 'sample-c',
+      automationCollectionId: 'automation-c',
+    }),
+  ]
+  assert.deepEqual(planForwardTimelineInsertion(regions, 200), {
+    kind: 'insert',
+    truncate: [],
+    removeRegionIds: ['later-insertion', 'latest', 'latest-tail'],
+  })
+})
+
+test('rejects backward placement when no content starts at the selected boundary', () => {
   const regions = [
     region('old', 0, 100),
     region('latest', 200, 100, {
@@ -169,10 +192,6 @@ test('rejects exact-start and backward placement without edit actions', () => {
       automationCollectionId: 'automation-b',
     }),
   ]
-  assert.deepEqual(planForwardTimelineInsertion(regions, 200), {
-    kind: 'reject',
-    reason: 'region-starts-at-boundary',
-  })
   assert.deepEqual(planForwardTimelineInsertion(regions, 150), {
     kind: 'reject',
     reason: 'backward-placement',

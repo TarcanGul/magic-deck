@@ -403,6 +403,7 @@ const MAX_SUPPORTED_BPM = 240
 const AUBIO_AUTO_ACCEPT_CONFIDENCE = 0.8
 const DECK_PROMPT_IDLE_TEXT = 'YOUR DECK ASSISTANT IS READY'
 const DECK_PROJECT_NAMES = ['DECK 1', 'DECK 2', 'MAGIC DECK'] as const
+const BACKWARD_DECK_INSERTION_MESSAGE = 'The selected bar is before this deck’s latest insertion; choose a later bar'
 const CUE_STORAGE_PREFIX = 'magic-deck:cues:v1:'
 const MUSIC_LIBRARY_DB_NAME = 'magic-deck-library'
 const MUSIC_LIBRARY_STORE_NAME = 'settings'
@@ -424,6 +425,7 @@ const deckLoadQueues = createPerKeyTaskQueue(2)
 let deckTransportQueue: Promise<void> = Promise.resolve()
 let sourceTimingQueue: Promise<void> = Promise.resolve()
 let barAssistantQueue: Promise<void> = Promise.resolve()
+const activeBarAssistantCancels: Array<(() => void) | null> = [null, null, null]
 let activeFxDeckIndex: WaveformDeckIndex | null = null
 let activeFxTrigger: HTMLButtonElement | null = null
 let deckFxAssistantRequestId = 0
@@ -463,6 +465,7 @@ let liveAudioRecordingId = 0
 const pendingBpmResolutions: Array<((resolution: BpmResolution | null) => void) | null> = [null, null]
 const sourceLoadAbortControllers: [AbortController | null, AbortController | null] = [null, null]
 const sourceLoadSessionIds: [number, number] = [0, 0]
+const sourcePlacementRetryIds: [number, number] = [0, 0]
 const sourceChunkGroups: [SourceChunkGroup | null, SourceChunkGroup | null] = [null, null]
 let sourceUploadSettings: SourceUploadSettings = { ...loadSourceUploadSettings(localStorage) }
 const manualBpmReportStates: [ManualBpmReportState, ManualBpmReportState] = [
@@ -837,12 +840,18 @@ function requestExtensionTransportPosition(
   })
 }
 
-type BarAssistantPurpose = 'placement' | 'cue-launch' | 'reenter-launch' | 'stop' | 'cancel-check'
+type BarAssistantPurpose = 'placement' | 'placement-retry' | 'cue-launch' | 'reenter-launch' | 'stop' | 'cancel-check'
 
 interface BarAssistantContext {
   cueNumber?: number
   cuePosition?: number
   cueSourceBar?: number
+  initialBar?: number
+  initialError?: string
+}
+
+function cancelDeckBarAssistant(deckIndex: WaveformDeckIndex) {
+  activeBarAssistantCancels[deckIndex]?.()
 }
 
 function currentDeckRegionPositionTicks(deckIndex: WaveformDeckIndex) {
@@ -886,6 +895,12 @@ function showBarAssistantNow(
         confirm: 'PLACE AT BAR',
         cancel: 'CANCEL LOAD',
       },
+      'placement-retry': {
+        title: `Retry ${label} Insertion`,
+        copy: `The previous bar could not be used. Enter a different whole-number Audiotool bar for ${label}. Existing project content stays unchanged until insertion succeeds.`,
+        confirm: 'RETRY AT BAR',
+        cancel: 'CANCEL LOAD',
+      },
       'cue-launch': {
         title: `Schedule ${label} Cue ${context.cueNumber ?? ''}`.trim(),
         copy: `Cue ${context.cueNumber ?? ''} starts at source bar ${context.cueSourceBar ?? '—'} (${context.cuePosition === undefined ? '—' : formatCueTime(deckIndex, context.cuePosition)}). Enter the exact whole-number Audiotool bar where its remaining audio should begin.`,
@@ -916,8 +931,9 @@ function showBarAssistantNow(
     copy.textContent = content.copy
     confirm.textContent = content.confirm
     cancel.textContent = content.cancel
-    input.value = String(tickToBar(currentDeckRegionPositionTicks(deckIndex), Ticks.Bars(1)))
-    error.textContent = ''
+    input.value = String(context.initialBar
+      ?? tickToBar(currentDeckRegionPositionTicks(deckIndex), Ticks.Bars(1)))
+    error.textContent = context.initialError ?? ''
     assistant.classList.remove('is-hidden')
     assistant.classList.add('bar-assistant-active')
     form.classList.remove('is-hidden')
@@ -933,8 +949,12 @@ function showBarAssistantNow(
       cancel.onclick = null
       input.oninput = null
       document.removeEventListener('keydown', onKey)
+      if (activeBarAssistantCancels[deckIndex] === cancelAssistant) {
+        activeBarAssistantCancels[deckIndex] = null
+      }
       resolve(bar)
     }
+    const cancelAssistant = () => close(null)
     const submit = () => {
       const bar = Number(input.value.trim())
       if (!Number.isSafeInteger(bar) || bar < 1) {
@@ -954,7 +974,8 @@ function showBarAssistantNow(
     }
 
     confirm.onclick = submit
-    cancel.onclick = () => close(null)
+    activeBarAssistantCancels[deckIndex] = cancelAssistant
+    cancel.onclick = cancelAssistant
     input.oninput = () => { error.textContent = '' }
     document.addEventListener('keydown', onKey)
   })
@@ -972,6 +993,29 @@ function showBarAssistant(
 
 function showPlacementAssistant(deckIndex: WaveformDeckIndex) {
   return showBarAssistant(deckIndex, 'placement')
+}
+
+function manualDeckInsertionPlacement(
+  deckIndex: WaveformDeckIndex,
+  bar: number,
+): DeckInsertionPlacement {
+  return {
+    deckIndex,
+    bar,
+    positionTicks: barToPositionTicks(bar, Ticks.Bars(1)),
+    source: 'manual',
+    capturedAt: Date.now(),
+  }
+}
+
+function showPlacementRetryAssistant(
+  deckIndex: 0 | 1,
+  failedPlacement: DeckInsertionPlacement,
+) {
+  return showBarAssistant(deckIndex, 'placement-retry', {
+    initialBar: failedPlacement.bar,
+    initialError: BACKWARD_DECK_INSERTION_MESSAGE.toUpperCase(),
+  })
 }
 
 function projectHasTimelineContent(entities: EntityQuery) {
@@ -1032,14 +1076,14 @@ async function captureDeckInsertionPlacement(
   if (nexus !== projectDocument || !projectConnected) {
     throw new Error('Project connection changed during manual placement')
   }
-  const placement: DeckInsertionPlacement = {
+  if (!extensionCapture) return manualDeckInsertionPlacement(deckIndex, bar)
+  return {
     deckIndex,
     bar,
     positionTicks: barToPositionTicks(bar, Ticks.Bars(1)),
-    source: extensionCapture ? 'extension' : 'manual',
-    capturedAt: extensionCapture?.capturedAt ?? Date.now(),
+    source: 'extension',
+    capturedAt: extensionCapture.capturedAt,
   }
-  return placement
 }
 
 // ── AUTH — based on the minimal example ──────────────────────────────────────
@@ -6992,9 +7036,7 @@ async function insertSampleIntoProject(
           placement.positionTicks,
         )
         if (collisionPlan.kind === 'reject') {
-          throw new Error(collisionPlan.reason === 'region-starts-at-boundary'
-            ? 'A deck region already starts at the selected bar; choose a later bar'
-            : 'The selected bar is before this deck’s latest insertion; choose a later bar')
+          throw new Error(BACKWARD_DECK_INSERTION_MESSAGE)
         }
 
         collisionPlan.truncate.forEach((truncation) => {
@@ -7228,9 +7270,7 @@ function applyForwardInsertionCollisionPlan(
     positionTicks,
   )
   if (collisionPlan.kind === 'reject') {
-    throw new Error(collisionPlan.reason === 'region-starts-at-boundary'
-      ? 'A deck region already starts at the selected bar; choose a later bar'
-      : 'The selected bar is before this deck’s latest insertion; choose a later bar')
+    throw new Error(BACKWARD_DECK_INSERTION_MESSAGE)
   }
   collisionPlan.truncate.forEach((truncation) => {
     const region = t.entities.ofTypes('audioRegion').getEntity(truncation.id)
@@ -9100,26 +9140,134 @@ async function loadAudioFile(
   updateSourceDeckUi(deckIndex)
 }
 
-function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPlacement) {
+function sourceDeckPlacementConflict(
+  deckIndex: 0 | 1,
+  placement: DeckInsertionPlacement,
+) {
+  const projectDocument = nexus
+  const deck = decks[deckIndex]
+  const trackId = deck.trackEntity?.id
+  if (!projectDocument || !trackId) return null
+
+  const entities = projectDocument.queryEntities
+  const replacementRegion = deck.regionEntity
+    ? entities.ofTypes('audioRegion').getEntity(deck.regionEntity.id)
+    : undefined
+  const existingChunkGroup = sourceChunkGroups[deckIndex]
+  const replacesChunkGroup = Boolean(replacementRegion
+    && existingChunkGroup?.chunks.some((chunk) => chunk.region?.id === replacementRegion.id))
+  const replacementIds = new Set((replacementRegion
+    ? replacesChunkGroup
+      ? existingChunkGroup!.chunks.flatMap((chunk) => chunk.region ? [chunk.region.id] : [])
+      : sourceDeckInstanceRegions(entities, deckIndex, replacementRegion).map((region) => region.id)
+    : []))
+  const destinationRegions = entities
+    .ofTypes('audioRegion')
+    .get()
+    .filter((region) =>
+      region.fields.track.value.entityId === trackId
+      && !replacementIds.has(region.id))
+  const collisionPlan = planForwardTimelineInsertion(
+    destinationRegions.map(regionSnapshot),
+    placement.positionTicks,
+  )
+  return collisionPlan.kind === 'reject'
+    ? new Error(BACKWARD_DECK_INSERTION_MESSAGE)
+    : null
+}
+
+function isRetryableDeckPlacementError(error: unknown) {
+  return error instanceof Error && error.message === BACKWARD_DECK_INSERTION_MESSAGE
+}
+
+async function runDeckLoadAttempt(
+  deckIndex: 0 | 1,
+  file: File,
+  placement: DeckInsertionPlacement,
+  expectedSession: number,
+) {
   const operation = deckOperationStates[deckIndex]
-  const expectedSession = tempoSessionId
-  resetDeckCuePosition(deckIndex)
   operation.pendingCount += 1
   updateSourceDeckUi(deckIndex)
-  void deckLoadQueues.enqueue(deckIndex, async () => {
-    if (expectedSession !== tempoSessionId) return
-    await loadAudioFile(deckIndex, file, expectedSession, placement)
-  })
-    .catch((error: unknown) => {
+  try {
+    await deckLoadQueues.enqueue(deckIndex, async () => {
       if (expectedSession !== tempoSessionId) return
-      const message = error instanceof Error ? error.message : String(error)
-      setStatus('error', `DECK ${deckIndex + 1}: LOAD OR REPLACEMENT FAILED — ${message}`)
+      await loadAudioFile(deckIndex, file, expectedSession, placement)
     })
-    .finally(() => {
-      operation.pendingCount = Math.max(0, operation.pendingCount - 1)
-      if (operation.pendingCount === 0) operation.activeKind = null
-      updateSourceDeckUi(deckIndex)
-    })
+    return null
+  } catch (error) {
+    return error
+  } finally {
+    operation.pendingCount = Math.max(0, operation.pendingCount - 1)
+    if (operation.pendingCount === 0) operation.activeKind = null
+    updateSourceDeckUi(deckIndex)
+  }
+}
+
+function resetFailedDeckLoadUi(deckIndex: 0 | 1) {
+  pendingBpmResolutions[deckIndex]?.(null)
+  sourceLoadAbortControllers[deckIndex]?.abort(new Error('Waiting for replacement bar'))
+  sourceLoadAbortControllers[deckIndex] = null
+  sourceLoadSessionIds[deckIndex] += 1
+  const operation = deckOperationStates[deckIndex]
+  operation.uploadProgress = null
+  operation.chunkProgress = null
+  operation.bpmStatus = ''
+  resetBpmDialogue(deckIndex)
+  updateSourceDeckUi(deckIndex)
+}
+
+async function loadDeckWithPlacementRetry(
+  deckIndex: 0 | 1,
+  file: File,
+  initialPlacement: DeckInsertionPlacement,
+  expectedSession: number,
+  retryId: number,
+) {
+  let placement = initialPlacement
+  while (
+    expectedSession === tempoSessionId
+    && retryId === sourcePlacementRetryIds[deckIndex]
+  ) {
+    const preflightConflict = sourceDeckPlacementConflict(deckIndex, placement)
+    const error = preflightConflict
+      ?? await runDeckLoadAttempt(deckIndex, file, placement, expectedSession)
+    if (!error) return
+
+    const message = error instanceof Error ? error.message : String(error)
+    setStatus('error', `DECK ${deckIndex + 1}: LOAD OR REPLACEMENT FAILED — ${message}`)
+    if (!isRetryableDeckPlacementError(error)) return
+
+    resetFailedDeckLoadUi(deckIndex)
+    const bar = await showPlacementRetryAssistant(deckIndex, placement)
+    if (
+      expectedSession !== tempoSessionId
+      || retryId !== sourcePlacementRetryIds[deckIndex]
+    ) return
+    if (bar === null) {
+      setStatus('connected', `DECK ${deckIndex + 1}: PLACEMENT RETRY CANCELLED — PROJECT CONTENT PRESERVED`)
+      return
+    }
+    placement = manualDeckInsertionPlacement(deckIndex, bar)
+  }
+}
+
+function queueDeckLoad(deckIndex: 0 | 1, file: File, placement: DeckInsertionPlacement) {
+  const expectedSession = tempoSessionId
+  const retryId = sourcePlacementRetryIds[deckIndex] + 1
+  sourcePlacementRetryIds[deckIndex] = retryId
+  resetDeckCuePosition(deckIndex)
+  void loadDeckWithPlacementRetry(
+    deckIndex,
+    file,
+    placement,
+    expectedSession,
+    retryId,
+  ).catch((error: unknown) => {
+    if (expectedSession !== tempoSessionId) return
+    const message = error instanceof Error ? error.message : String(error)
+    setStatus('error', `DECK ${deckIndex + 1}: LOAD OR REPLACEMENT FAILED — ${message}`)
+  })
 }
 
 async function clearSourceDeck(deckIndex: 0 | 1) {
@@ -9138,6 +9286,8 @@ async function clearSourceDeck(deckIndex: 0 | 1) {
 function queueDeckClear(deckIndex: 0 | 1) {
   const operation = deckOperationStates[deckIndex]
   if (operation.pendingCount > 0 || !isSourceDeckSynchronized(deckIndex)) return
+  sourcePlacementRetryIds[deckIndex] += 1
+  cancelDeckBarAssistant(deckIndex)
   const expectedSession = tempoSessionId
   operation.pendingCount += 1
   operation.activeKind = 'clearing'
@@ -9867,7 +10017,9 @@ function setupDropZone(zoneId: string, deckIndex: 0 | 1) {
   zone.addEventListener('dragleave', (e) => { e.stopPropagation(); if (!zone.contains(e.relatedTarget as Node)) zone.classList.remove('drag-over') })
   zone.addEventListener('drop', async (e) => {
     e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag-over')
-    if (deckOperationStates[deckIndex].pendingCount > 0) {
+    const barAssistantOpen = el<HTMLDivElement>(`deck${deckIndex + 1}-bpm-dialogue`)
+      .classList.contains('bar-assistant-active')
+    if (deckOperationStates[deckIndex].pendingCount > 0 || barAssistantOpen) {
       setStatus('connecting', `${placementDeckLabel(deckIndex).toUpperCase()}: TRACK OPERATION ALREADY IN PROGRESS`)
       return
     }
