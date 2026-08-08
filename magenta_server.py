@@ -387,6 +387,22 @@ def replace_beat_wording(prompt: str) -> str:
     return re.sub(r"\bbeat\b", "rhythm", prompt, flags=re.IGNORECASE)
 
 
+def stem_prompt_constraint(stem_role: str | None) -> str:
+    if stem_role in {"melody", "bass", "texture"}:
+        role_name = {
+            "melody": "solo monophonic synthesizer melody",
+            "bass": "bass",
+            "texture": "texture",
+        }[stem_role]
+        return f"isolated {role_name} stem, drumless, no percussion"
+    if stem_role == "drums":
+        return (
+            "isolated drum stem, drums and percussion only, "
+            "no pitched or melodic instruments"
+        )
+    return ""
+
+
 def build_mrt_style_prompt(
     prompt: str,
     bpm: float,
@@ -404,13 +420,8 @@ def build_mrt_style_prompt(
             f"{rhythmic_prompt}, strict straight quarter-note grid"
         )
 
-    stem_prefix = ""
-    if stem_role:
-        role_name = {
-            "drums": "drum",
-            "melody": "solo monophonic synthesizer melody",
-        }.get(stem_role, stem_role)
-        stem_prefix = f"{role_name} stem, "
+    stem_constraint = stem_prompt_constraint(stem_role)
+    stem_prefix = f"{stem_constraint}, " if stem_constraint else ""
     grid_prompt = ""
     if stem_role == "drums":
         grid_prompt = ", tightly quantized to a straight 4/4 project grid"
@@ -455,6 +466,12 @@ def embed_musiccoca_text_style(style_model: Any, text_prompt: str) -> np.ndarray
             f"with shape (1, embedding_dim); got {styles.shape}."
         )
     return styles[0]
+
+
+def should_use_isolated_text_style(requested_role: str, resolved_role: str) -> bool:
+    """Exclude full-mix timbre for explicit stems and isolated percussion routing."""
+    normalized_requested_role = requested_role.lower().strip()
+    return normalized_requested_role in STEM_ROLES or resolved_role == PERCUSSION_ROLE
 
 
 def blend_style_vectors(audio_style: Any, text_style: Any) -> np.ndarray:
@@ -1897,7 +1914,17 @@ async def generate(
             resolved_instrument,
         )
         print(f"MRT style prompt: {mrt_style_prompt}")
-        if resolved_stem_role == PERCUSSION_ROLE:
+        isolated_text_style = should_use_isolated_text_style(
+            requested_role,
+            resolved_stem_role,
+        )
+        conditioning_description = (
+            "isolated text-only"
+            if isolated_text_style
+            else "blended reference-audio and text"
+        )
+        print(f"Style conditioning: {conditioning_description}")
+        if isolated_text_style:
             generation_style = embed_musiccoca_text_style(style_model, mrt_style_prompt)
             print(
                 "MusicCoCa text-only embedding norm: "

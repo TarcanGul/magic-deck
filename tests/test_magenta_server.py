@@ -44,6 +44,8 @@ from magenta_server import (
     resolve_duration_seconds,
     resolve_sampling_parameters,
     resolve_stem_role,
+    should_use_isolated_text_style,
+    stem_prompt_constraint,
     timing_response_headers,
     validate_sampling_parameters,
 )
@@ -271,7 +273,7 @@ class MagentaServerHelperTests(unittest.TestCase):
             "128 bpm tech house in A minor",
         )
 
-    def test_build_mrt_style_prompt_can_include_stem_role(self):
+    def test_build_mrt_style_prompt_isolates_bass_stem(self):
         detected_key = DetectedKey(
             root_pitch_class=9,
             mode="minor",
@@ -282,8 +284,27 @@ class MagentaServerHelperTests(unittest.TestCase):
 
         self.assertEqual(
             build_mrt_style_prompt("tech house", 128.0, detected_key, "bass"),
-            "128 bpm bass stem, tech house in A minor",
+            "128 bpm isolated bass stem, drumless, no percussion, tech house in A minor",
         )
+
+    def test_non_drum_style_prompts_are_drumless_and_percussion_free(self):
+        detected_key = DetectedKey(9, "minor", 0.0, 1.0, 1.0)
+
+        for role in ("melody", "bass", "texture"):
+            with self.subTest(role=role):
+                prompt = build_mrt_style_prompt(
+                    "warm analog house",
+                    128.0,
+                    detected_key,
+                    role,
+                )
+
+                self.assertIn("isolated", prompt)
+                self.assertIn(f"{role if role != 'melody' else 'melody'} stem", prompt)
+                self.assertIn("drumless", prompt)
+                self.assertIn("no percussion", prompt)
+                self.assertIn("warm analog house", prompt)
+                self.assertIn("A minor", prompt)
 
     def test_drum_style_prompt_requests_straight_project_grid(self):
         detected_key = DetectedKey(
@@ -302,6 +323,11 @@ class MagentaServerHelperTests(unittest.TestCase):
         )
 
         self.assertIn("tightly quantized to a straight 4/4 project grid", prompt)
+        self.assertIn("isolated drum stem", prompt)
+        self.assertIn("drums and percussion only", prompt)
+        self.assertIn("no pitched or melodic instruments", prompt)
+        self.assertIn("tech house", prompt)
+        self.assertIn("A minor", prompt)
 
     def test_melody_style_prompt_requests_solo_monophonic_synthesizer(self):
         detected_key = DetectedKey(
@@ -320,6 +346,25 @@ class MagentaServerHelperTests(unittest.TestCase):
         )
 
         self.assertIn("solo monophonic synthesizer melody stem", prompt)
+
+    def test_standard_explicit_roles_use_text_only_style_conditioning(self):
+        for role in ("melody", "bass", "texture", "drums"):
+            with self.subTest(role=role):
+                self.assertTrue(should_use_isolated_text_style(role, role))
+
+    def test_auto_role_resolution_retains_blended_style_conditioning(self):
+        for resolved_role in ("melody", "bass", "texture", "drums"):
+            with self.subTest(resolved_role=resolved_role):
+                self.assertFalse(
+                    should_use_isolated_text_style("auto", resolved_role)
+                )
+
+    def test_percussion_routing_retains_text_only_style_conditioning(self):
+        self.assertTrue(should_use_isolated_text_style("auto", "percussion"))
+        self.assertTrue(should_use_isolated_text_style("percussion", "percussion"))
+
+    def test_unknown_role_has_no_standard_stem_constraint(self):
+        self.assertEqual(stem_prompt_constraint("auto"), "")
 
     def test_low_confidence_key_prompt_omits_mode_claim(self):
         detected_key = DetectedKey(
